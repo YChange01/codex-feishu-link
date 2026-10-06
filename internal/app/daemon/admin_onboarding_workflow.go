@@ -1,0 +1,655 @@
+package daemon
+
+import (
+	"context"
+	"net/http"
+	"strings"
+	"time"
+
+	"github.com/YChange01/codex-feishu-link/internal/adapter/editor"
+	"github.com/YChange01/codex-feishu-link/internal/adapter/feishu"
+	"github.com/YChange01/codex-feishu-link/internal/app/install"
+	"github.com/YChange01/codex-feishu-link/internal/config"
+	"github.com/YChange01/codex-feishu-link/internal/xutil"
+)
+
+const (
+	onboardingStageRuntimeRequirements = "runtime_requirements"
+	onboardingStageConnect             = "connect"
+	onboardingStageAutoConfig          = "auto_config"
+	onboardingStageMenu                = "menu"
+	onboardingStageAutostart           = "autostart"
+	onboardingStageVSCode              = "vscode"
+	onboardingStageDone                = "done"
+
+	onboardingStageStatusBlocked       = "blocked"
+	onboardingStageStatusPending       = "pending"
+	onboardingStageStatusComplete      = "complete"
+	onboardingStageStatusDeferred      = "deferred"
+	onboardingStageStatusNotApplicable = "not_applicable"
+
+	onboardingMachineStateBlocked                = "blocked"
+	onboardingMachineStateUsable                 = "usable"
+	onboardingMachineStateUsableWithPendingItems = "usable_with_pending_items"
+	onboardingMachineStateCompleted              = "completed"
+
+	onboardingDecisionAutostartEnabled = "enabled"
+	onboardingDecisionDeferred         = "deferred"
+	onboardingDecisionVSCodeRemoteOnly = "remote_only"
+	onboardingDecisionMenuConfirmed    = "confirmed"
+)
+
+type onboardingWorkflowResponse struct {
+	Apps                []adminFeishuAppSummary           `json:"apps"`
+	SelectedAppID       string                            `json:"selectedAppId,omitempty"`
+	CurrentStage        string                            `json:"currentStage"`
+	MachineState        string                            `json:"machineState"`
+	Completion          onboardingWorkflowCompletionView  `json:"completion"`
+	RuntimeRequirements runtimeRequirementsResponse       `json:"runtimeRequirements"`
+	App                 *onboardingWorkflowAppView        `json:"app,omitempty"`
+	Autostart           onboardingWorkflowMachineStepView `json:"autostart"`
+	VSCode              onboardingWorkflowMachineStepView `json:"vscode"`
+	Guide               onboardingWorkflowGuideView       `json:"guide,omitempty"`
+	Stages              []onboardingWorkflowStageView     `json:"stages,omitempty"`
+}
+
+type onboardingWorkflowCompletionView struct {
+	SetupRequired  bool   `json:"setupRequired"`
+	CanComplete    bool   `json:"canComplete"`
+	Summary        string `json:"summary"`
+	BlockingReason string `json:"blockingReason,omitempty"`
+}
+
+type onboardingWorkflowGuideView struct {
+	AutoConfiguredSummary  string   `json:"autoConfiguredSummary,omitempty"`
+	RemainingManualActions []string `json:"remainingManualActions,omitempty"`
+	RecommendedNextStep    string   `json:"recommendedNextStep,omitempty"`
+}
+
+type onboardingWorkflowDecisionView struct {
+	Value     string     `json:"value,omitempty"`
+	DecidedAt *time.Time `json:"decidedAt,omitempty"`
+}
+
+type onboardingWorkflowStageView struct {
+	ID             string   `json:"id"`
+	Title          string   `json:"title"`
+	Status         string   `json:"status"`
+	Summary        string   `json:"summary"`
+	Blocking       bool     `json:"blocking,omitempty"`
+	Optional       bool     `json:"optional,omitempty"`
+	AllowedActions []string `json:"allowedActions,omitempty"`
+}
+
+type onboardingWorkflowMachineStepView struct {
+	onboardingWorkflowStageView
+	Decision  *onboardingWorkflowDecisionView `json:"decision,omitempty"`
+	Autostart *autostartResponse              `json:"autostart,omitempty"`
+	VSCode    *vscodeDetectResponse           `json:"vscode,omitempty"`
+	Error     string                          `json:"error,omitempty"`
+}
+
+type onboardingWorkflowAutoConfigView struct {
+	onboardingWorkflowStageView
+	Decision       *onboardingWorkflowDecisionView `json:"decision,omitempty"`
+	Plan           *feishu.AutoConfigPlan          `json:"plan,omitempty"`
+	LongConnection *feishu.LongConnectionStatus    `json:"longConnection,omitempty"`
+	Error          string                          `json:"error,omitempty"`
+}
+
+type onboardingWorkflowAppView struct {
+	App        adminFeishuAppSummary            `json:"app"`
+	Connection onboardingWorkflowStageView      `json:"connection"`
+	AutoConfig onboardingWorkflowAutoConfigView `json:"autoConfig"`
+	Menu       onboardingWorkflowStageView      `json:"menu"`
+}
+
+func (a *App) handleOnboardingWorkflow(w http.ResponseWriter, r *http.Request) {
+	payload, err := a.buildOnboardingWorkflow(strings.TrimSpace(r.URL.Query().Get("app")))
+	if err != nil {
+		writeAPIError(w, http.StatusInternalServerError, apiError{
+			Code:    "onboarding_workflow_unavailable",
+			Message: "failed to build onboarding workflow",
+			Details: err.Error(),
+		})
+		return
+	}
+	writeJSON(w, http.StatusOK, payload)
+}
+
+func (a *App) buildOnboardingWorkflow(preferredAppID string) (onboardingWorkflowResponse, error) {
+	loaded, err := a.loadAdminConfig()
+	if err != nil {
+		return onboardingWorkflowResponse{}, err
+	}
+	apps, err := a.adminFeishuApps(loaded)
+	if err != nil {
+		return onboardingWorkflowResponse{}, err
+	}
+	runtimeReqs, err := a.buildRuntimeRequirementsResponse()
+	if err != nil {
+		return onboardingWorkflowResponse{}, err
+	}
+
+	selectedAppID, selectedApp := selectOnboardingApp(apps, preferredAppID)
+	appState := onboardingAppState(loaded.Config, selectedAppID)
+	connection := buildOnboardingConnectionStage(selectedApp)
+	autoConfig := buildBlockedOnboardingAutoConfigStage("请先完成连接验证。")
+	if connection.Status == onboardingStageStatusComplete && selectedApp != nil {
+		autoConfig = a.buildOnboardingAutoConfigStage(selectedAppID, appState)
+	}
+	menu := buildBlockedOnboardingMenuStage("请先完成飞书自动配置。")
+	if selectedApp != nil {
+		menu = buildOnboardingMenuStage(selectedApp, autoConfig, appState)
+	}
+
+	autostartStage := a.buildOnboardingAutostartStage(loaded.Config)
+	vscodeStage := a.buildOnboardingVSCodeStage(loaded.Config)
+
+	stages := []onboardingWorkflowStageView{
+		stageView(onboardingStageRuntimeRequirements, "环境检查", runtimeRequirementsSummaryStatus(runtimeReqs.Ready), runtimeReqs.Summary, !runtimeReqs.Ready, false, []string{"retry"}),
+		connection,
+		autoConfig.onboardingWorkflowStageView,
+		menu,
+		autostartStage.onboardingWorkflowStageView,
+		vscodeStage.onboardingWorkflowStageView,
+	}
+
+	canComplete := runtimeReqs.Ready &&
+		connection.Status == onboardingStageStatusComplete &&
+		onboardingStageResolved(autoConfig.Status) &&
+		onboardingStageResolved(menu.Status) &&
+		onboardingStageResolved(autostartStage.Status) &&
+		onboardingStageResolved(vscodeStage.Status)
+
+	machinePending := !onboardingStageResolved(autostartStage.Status) || !onboardingStageResolved(vscodeStage.Status)
+	machineState := onboardingMachineStateBlocked
+	switch {
+	case !runtimeReqs.Ready || connection.Status != onboardingStageStatusComplete || !onboardingStageResolved(autoConfig.Status) || !onboardingStageResolved(menu.Status):
+		machineState = onboardingMachineStateBlocked
+	case canComplete && !machinePending:
+		machineState = onboardingMachineStateCompleted
+	case machinePending:
+		machineState = onboardingMachineStateUsableWithPendingItems
+	default:
+		machineState = onboardingMachineStateUsable
+	}
+
+	currentStage := firstPendingStageID(stages)
+	if currentStage == "" && !loaded.Config.Admin.Onboarding.MachineIntegrationReviewed {
+		currentStage = onboardingStageAutostart
+	}
+	if currentStage == "" {
+		currentStage = onboardingStageDone
+	}
+	if canComplete && currentStage == onboardingStageDone {
+		stages = append(stages, stageView(onboardingStageDone, "完成", onboardingStageStatusComplete, "当前 setup 已经可以完成。", false, false, []string{"complete_setup"}))
+	}
+
+	guide := buildOnboardingGuide(currentStage, connection, autoConfig, menu, autostartStage, vscodeStage, canComplete)
+	completion := buildOnboardingCompletion(canComplete, runtimeReqs.Ready, connection, autoConfig, menu, autostartStage, vscodeStage)
+
+	response := onboardingWorkflowResponse{
+		Apps:                apps,
+		SelectedAppID:       selectedAppID,
+		CurrentStage:        currentStage,
+		MachineState:        machineState,
+		Completion:          completion,
+		RuntimeRequirements: runtimeReqs,
+		Autostart:           autostartStage,
+		VSCode:              vscodeStage,
+		Guide:               guide,
+		Stages:              stages,
+	}
+	if selectedApp != nil {
+		response.App = &onboardingWorkflowAppView{
+			App:        *selectedApp,
+			Connection: connection,
+			AutoConfig: autoConfig,
+			Menu:       menu,
+		}
+	}
+	return response, nil
+}
+
+func selectOnboardingApp(apps []adminFeishuAppSummary, preferredAppID string) (string, *adminFeishuAppSummary) {
+	if preferred := canonicalGatewayID(preferredAppID); preferred != "" {
+		for i := range apps {
+			if canonicalGatewayID(apps[i].ID) == preferred {
+				return apps[i].ID, &apps[i]
+			}
+		}
+	}
+	if len(apps) == 0 {
+		return "", nil
+	}
+	return apps[0].ID, &apps[0]
+}
+
+func buildOnboardingConnectionStage(app *adminFeishuAppSummary) onboardingWorkflowStageView {
+	if app == nil {
+		return stageView(onboardingStageConnect, "飞书连接", onboardingStageStatusBlocked, "还没有接入可用的飞书应用。", true, false, []string{"start_qr", "submit_manual"})
+	}
+	if app.RuntimeApply != nil && app.RuntimeApply.Pending {
+		return stageView(onboardingStageConnect, "飞书连接", onboardingStageStatusBlocked, "当前飞书应用还在同步运行态配置，请稍后刷新。", true, false, nil)
+	}
+	if app.ReadOnly && app.RuntimeOnly && app.HasSecret && strings.TrimSpace(app.AppID) != "" {
+		return stageView(onboardingStageConnect, "飞书连接", onboardingStageStatusComplete, "当前飞书应用由运行时接管，可直接继续后续联调。", false, false, []string{"verify"})
+	}
+	if app.Status != nil {
+		switch app.Status.State {
+		case feishu.GatewayStateConnected:
+			return stageView(onboardingStageConnect, "飞书连接", onboardingStageStatusComplete, "当前飞书应用已连通运行态。", false, false, []string{"verify"})
+		case feishu.GatewayStateDisabled:
+			return stageView(onboardingStageConnect, "飞书连接", onboardingStageStatusBlocked, "当前飞书应用未启用，请先启用后继续。", true, false, nil)
+		}
+	}
+	if app.VerifiedAt != nil {
+		return stageView(onboardingStageConnect, "飞书连接", onboardingStageStatusComplete, "当前飞书应用连接验证已通过。", false, false, []string{"verify"})
+	}
+	if strings.TrimSpace(app.AppID) != "" && app.HasSecret {
+		return stageView(onboardingStageConnect, "飞书连接", onboardingStageStatusBlocked, "当前飞书应用还没有完成连接验证。", true, false, []string{"verify", "submit_manual"})
+	}
+	return stageView(onboardingStageConnect, "飞书连接", onboardingStageStatusBlocked, "当前飞书应用信息还不完整。", true, false, []string{"submit_manual"})
+}
+
+func (a *App) buildOnboardingAutoConfigStage(gatewayID string, state config.FeishuAppOnboardingState) onboardingWorkflowAutoConfigView {
+	decision := onboardingDecisionViewFromConfig(state.AutoConfigDecision)
+	_, runtimeCfg, err := a.loadFeishuLiveGatewayTarget(gatewayID)
+	if err != nil {
+		summary := "暂时无法读取飞书自动配置状态，请稍后重试。"
+		switch {
+		case strings.HasPrefix(err.Error(), "feishu_app_runtime_unavailable:"):
+			summary = "当前机器人还在同步运行设置，请稍后再检查自动配置。"
+		case strings.HasPrefix(err.Error(), "feishu_app_not_found:"):
+			summary = "当前飞书应用暂时不可用，请重新连接后再继续。"
+		}
+		if onboardingAutoConfigDeferred(state.AutoConfigDecision) && onboardingAutoConfigPreserveDeferredOnReadError(err) {
+			return onboardingWorkflowAutoConfigView{
+				onboardingWorkflowStageView: stageView(onboardingStageAutoConfig, "飞书自动配置", onboardingStageStatusDeferred, onboardingAutoConfigDeferredRetrySummary(summary), false, true, []string{"retry"}),
+				Decision:                    decision,
+				Error:                       err.Error(),
+			}
+		}
+		actions := []string{"retry"}
+		canContinue := onboardingAutoConfigPreserveDeferredOnReadError(err)
+		if canContinue {
+			actions = append(actions, "defer")
+		}
+		return onboardingWorkflowAutoConfigView{
+			onboardingWorkflowStageView: stageView(onboardingStageAutoConfig, "飞书自动配置", onboardingStageStatusPending, summary, !canContinue, canContinue, actions),
+			Decision:                    decision,
+			Error:                       err.Error(),
+		}
+	}
+	longConnection, longConnectionErr := a.readOnboardingLongConnectionStatus(runtimeCfg)
+
+	planCtx, cancel := context.WithTimeout(context.Background(), defaultFeishuAutoConfigPlanTimeout)
+	defer cancel()
+	plan, err := feishuSetupFacade.PlanAutoConfig(planCtx, runtimeCfg)
+	if err != nil {
+		if onboardingAutoConfigDeferred(state.AutoConfigDecision) {
+			return onboardingWorkflowAutoConfigView{
+				onboardingWorkflowStageView: stageView(onboardingStageAutoConfig, "飞书自动配置", onboardingStageStatusDeferred, onboardingAutoConfigDeferredRetrySummary("暂时无法读取飞书自动配置状态，请稍后重试。"), false, true, []string{"retry"}),
+				Decision:                    decision,
+				Error:                       err.Error(),
+			}
+		}
+		return onboardingWorkflowAutoConfigView{
+			onboardingWorkflowStageView: stageView(onboardingStageAutoConfig, "飞书自动配置", onboardingStageStatusPending, "暂时无法读取飞书自动配置状态，请稍后重试。", false, true, []string{"retry", "defer"}),
+			Decision:                    decision,
+			Error:                       err.Error(),
+		}
+	}
+
+	view := onboardingWorkflowAutoConfigView{
+		Decision:       decision,
+		Plan:           &plan,
+		LongConnection: longConnection,
+	}
+	if longConnectionErr != nil {
+		view.Error = longConnectionErr.Error()
+	}
+	canContinueDegraded := onboardingAutoConfigCanContinueDegraded(plan)
+	switch plan.Status {
+	case feishu.AutoConfigStatusClean:
+		view.onboardingWorkflowStageView = stageView(onboardingStageAutoConfig, "飞书自动配置", onboardingStageStatusComplete, xutil.FirstNonEmpty(strings.TrimSpace(plan.Summary), "当前飞书应用配置已收敛。"), false, false, []string{"retry"})
+	case feishu.AutoConfigStatusDegraded:
+		view.onboardingWorkflowStageView = stageView(onboardingStageAutoConfig, "飞书自动配置", onboardingStageStatusComplete, xutil.FirstNonEmpty(strings.TrimSpace(plan.Summary), "飞书应用已可用，但仍有可降级缺失项。"), false, false, []string{"retry"})
+	case feishu.AutoConfigStatusApplyRequired:
+		if canContinueDegraded && onboardingAutoConfigDeferred(state.AutoConfigDecision) {
+			view.onboardingWorkflowStageView = stageView(onboardingStageAutoConfig, "飞书自动配置", onboardingStageStatusDeferred, "你已选择先按降级继续，后续仍可回到这里查看差异。", false, true, []string{"retry"})
+			break
+		}
+		actions := []string{"retry"}
+		if canContinueDegraded {
+			actions = append(actions, "defer")
+		}
+		view.onboardingWorkflowStageView = stageView(onboardingStageAutoConfig, "飞书自动配置", onboardingStageStatusPending, xutil.FirstNonEmpty(strings.TrimSpace(plan.Summary), "当前还有飞书配置差异需要处理。"), false, canContinueDegraded, actions)
+	case feishu.AutoConfigStatusAwaitingReview:
+		if !canContinueDegraded {
+			view.onboardingWorkflowStageView = stageView(onboardingStageAutoConfig, "飞书自动配置", onboardingStageStatusBlocked, xutil.FirstNonEmpty(strings.TrimSpace(plan.Summary), "飞书应用变更正在等待管理员处理，当前还不能继续。"), true, false, []string{"retry"})
+			break
+		}
+		if onboardingAutoConfigDeferred(state.AutoConfigDecision) {
+			view.onboardingWorkflowStageView = stageView(onboardingStageAutoConfig, "飞书自动配置", onboardingStageStatusDeferred, "你已选择先按降级继续，后续仍可回到这里查看审核结果。", false, true, []string{"retry"})
+			break
+		}
+		view.onboardingWorkflowStageView = stageView(onboardingStageAutoConfig, "飞书自动配置", onboardingStageStatusPending, xutil.FirstNonEmpty(strings.TrimSpace(plan.Summary), "当前变更正在等待管理员处理。若只影响可选能力，你也可以先按降级继续。"), false, true, []string{"defer", "retry"})
+	case feishu.AutoConfigStatusVerificationFailed:
+		actions := []string{"retry"}
+		if canContinueDegraded {
+			actions = append(actions, "defer")
+		}
+		view.onboardingWorkflowStageView = stageView(onboardingStageAutoConfig, "飞书自动配置", onboardingStageStatusPending, xutil.FirstNonEmpty(strings.TrimSpace(plan.Summary), "暂时无法确认飞书配置状态，请重新检查或稍后再试。"), false, canContinueDegraded, actions)
+	case feishu.AutoConfigStatusBlocked:
+		if canContinueDegraded {
+			if onboardingAutoConfigDeferred(state.AutoConfigDecision) {
+				view.onboardingWorkflowStageView = stageView(onboardingStageAutoConfig, "飞书自动配置", onboardingStageStatusDeferred, "你已选择先按降级继续，后续仍可回到这里查看差异。", false, true, []string{"retry"})
+				break
+			}
+			view.onboardingWorkflowStageView = stageView(onboardingStageAutoConfig, "飞书自动配置", onboardingStageStatusPending, xutil.FirstNonEmpty(strings.TrimSpace(plan.Summary), "当前仍有飞书配置缺失，你可以先继续，后续再回来处理。"), false, true, []string{"retry", "defer"})
+			break
+		}
+		view.onboardingWorkflowStageView = stageView(onboardingStageAutoConfig, "飞书自动配置", onboardingStageStatusBlocked, xutil.FirstNonEmpty(strings.TrimSpace(plan.Summary), "当前飞书自动配置还不能继续。"), true, false, []string{"retry"})
+	default:
+		view.onboardingWorkflowStageView = stageView(onboardingStageAutoConfig, "飞书自动配置", onboardingStageStatusPending, xutil.FirstNonEmpty(strings.TrimSpace(plan.Summary), "暂时无法读取飞书自动配置状态，请稍后重试。"), false, false, []string{"retry"})
+	}
+	view.onboardingWorkflowStageView.Summary = appendLongConnectionSummary(view.onboardingWorkflowStageView.Summary, longConnection, longConnectionErr)
+	return view
+}
+
+func (a *App) readOnboardingLongConnectionStatus(runtimeCfg feishu.LiveGatewayConfig) (*feishu.LongConnectionStatus, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	status, err := feishuSetupFacade.LongConnectionStatus(ctx, runtimeCfg)
+	if err != nil {
+		return nil, err
+	}
+	return &status, nil
+}
+
+func appendLongConnectionSummary(summary string, status *feishu.LongConnectionStatus, err error) string {
+	summary = strings.TrimSpace(summary)
+	switch {
+	case status != nil && status.OnlineInstanceCount > 0:
+		return summary
+	case status != nil && status.OnlineInstanceCount == 0:
+		return xutil.FirstNonEmpty(summary, "飞书应用配置已收敛。") + " 暂未确认本机长连接在线。"
+	case err != nil:
+		return xutil.FirstNonEmpty(summary, "飞书应用配置已收敛。") + " 暂未确认长连接在线状态。"
+	default:
+		return summary
+	}
+}
+
+func buildBlockedOnboardingAutoConfigStage(summary string) onboardingWorkflowAutoConfigView {
+	return onboardingWorkflowAutoConfigView{
+		onboardingWorkflowStageView: stageView(onboardingStageAutoConfig, "飞书自动配置", onboardingStageStatusBlocked, summary, true, false, nil),
+	}
+}
+
+func buildOnboardingMenuStage(app *adminFeishuAppSummary, autoConfig onboardingWorkflowAutoConfigView, state config.FeishuAppOnboardingState) onboardingWorkflowStageView {
+	if app == nil {
+		return buildBlockedOnboardingMenuStage("请先接入可用的飞书应用。")
+	}
+	if !onboardingStageResolved(autoConfig.Status) {
+		return buildBlockedOnboardingMenuStage("请先完成飞书自动配置。")
+	}
+	if onboardingMenuConfirmed(state.MenuDecision) {
+		return stageView(onboardingStageMenu, "菜单确认", onboardingStageStatusComplete, "你已确认机器人菜单配置完成。", false, false, []string{"open_bot"})
+	}
+	return stageView(onboardingStageMenu, "菜单确认", onboardingStageStatusPending, "请在飞书后台确认机器人菜单配置完成，然后回到这里继续。", false, false, []string{"open_bot", "confirm"})
+}
+
+func buildBlockedOnboardingMenuStage(summary string) onboardingWorkflowStageView {
+	return stageView(onboardingStageMenu, "菜单确认", onboardingStageStatusBlocked, summary, true, false, nil)
+}
+
+func (a *App) buildOnboardingAutostartStage(cfg config.AppConfig) onboardingWorkflowMachineStepView {
+	status, err := detectAutostart(a.installStatePath())
+	if err != nil {
+		stage := stageView(onboardingStageAutostart, "自动启动", onboardingStageStatusPending, "暂时无法确认自动启动状态，请稍后重试。", false, true, nil)
+		return onboardingWorkflowMachineStepView{
+			onboardingWorkflowStageView: stage,
+			Error:                       err.Error(),
+		}
+	}
+	view := onboardingWorkflowMachineStepView{
+		Autostart: &status,
+	}
+	switch {
+	case !status.Supported:
+		view.onboardingWorkflowStageView = stageView(onboardingStageAutostart, "自动启动", onboardingStageStatusNotApplicable, "当前系统不支持自动启动。", false, true, nil)
+	case status.Enabled:
+		view.onboardingWorkflowStageView = stageView(onboardingStageAutostart, "自动启动", onboardingStageStatusComplete, "自动启动已启用。", false, true, autostartStageActions(status))
+	default:
+		view.onboardingWorkflowStageView = stageView(onboardingStageAutostart, "自动启动", onboardingStageStatusComplete, "自动启动未启用。", false, true, autostartStageActions(status))
+	}
+	return view
+}
+
+func autostartStageActions(status install.AutostartStatus) []string {
+	actions := []string{}
+	if status.CanApply && !status.Enabled {
+		actions = append(actions, "apply")
+	}
+	if status.Enabled {
+		actions = append(actions, "disable")
+	}
+	return actions
+}
+
+func (a *App) buildOnboardingVSCodeStage(cfg config.AppConfig) onboardingWorkflowMachineStepView {
+	status, err := a.buildVSCodeDetectResponse()
+	if err != nil {
+		stage := stageView(onboardingStageVSCode, "VS Code 集成", onboardingStageStatusPending, "暂时无法确认 VS Code 集成状态，请稍后重试。", false, true, nil)
+		return onboardingWorkflowMachineStepView{
+			onboardingWorkflowStageView: stage,
+			Error:                       err.Error(),
+		}
+	}
+	ready := workflowVSCodeReady(status)
+	view := onboardingWorkflowMachineStepView{
+		VSCode: &status,
+	}
+	if ready {
+		view.onboardingWorkflowStageView = stageView(onboardingStageVSCode, "VS Code 集成", onboardingStageStatusComplete, "VS Code 集成已启用。", false, true, []string{"disable"})
+	} else {
+		view.onboardingWorkflowStageView = stageView(onboardingStageVSCode, "VS Code 集成", onboardingStageStatusComplete, "VS Code 集成未启用。", false, true, []string{"apply"})
+	}
+	return view
+}
+
+func workflowVSCodeReady(status vscodeDetectResponse) bool {
+	return status.LatestShim.Kind == editor.ManagedShimKindTiny &&
+		status.LatestShim.Installed &&
+		status.LatestShim.SidecarValid &&
+		!status.NeedsShimReinstall &&
+		!status.Settings.MatchesBinary
+}
+
+func buildOnboardingGuide(
+	currentStage string,
+	connection onboardingWorkflowStageView,
+	autoConfig onboardingWorkflowAutoConfigView,
+	menu onboardingWorkflowStageView,
+	autostart onboardingWorkflowMachineStepView,
+	vscode onboardingWorkflowMachineStepView,
+	canComplete bool,
+) onboardingWorkflowGuideView {
+	remaining := make([]string, 0, 5)
+	appendRemaining := func(status string, text string) {
+		if status == onboardingStageStatusPending || status == onboardingStageStatusBlocked {
+			remaining = append(remaining, text)
+		}
+	}
+	appendRemaining(connection.Status, "接入并验证一个可用的飞书应用。")
+	appendRemaining(autoConfig.Status, "完成飞书自动配置，确认缺失项与后果。")
+	appendRemaining(menu.Status, "在飞书后台确认机器人菜单配置。")
+	appendRemaining(autostart.Status, "决定是否在这台机器上启用自动启动。")
+	appendRemaining(vscode.Status, "决定如何处理这台机器上的 VS Code 集成。")
+	summary := ""
+	switch {
+	case canComplete && len(remaining) > 0:
+		summary = "当前 setup 已经可以完成，但仍有建议补齐项。"
+	case canComplete:
+		summary = "当前机器的 onboarding 已经收口完成。"
+	case !onboardingStageResolved(autoConfig.Status):
+		summary = "当前飞书应用已经接入，下面请先完成飞书自动配置。"
+	case !onboardingStageResolved(menu.Status):
+		summary = "飞书自动配置已经收口，下面请完成菜单确认。"
+	case onboardingStageResolved(menu.Status):
+		summary = "当前基础接入已经完成，下面请继续处理这台机器上的可选设置。"
+	case connection.Status == onboardingStageStatusComplete:
+		summary = "当前飞书应用已经接入，下面请先完成飞书自动配置。"
+	default:
+		summary = "请先让这台机器和一个可用飞书应用进入可继续联调的状态。"
+	}
+	return onboardingWorkflowGuideView{
+		AutoConfiguredSummary:  summary,
+		RemainingManualActions: remaining,
+		RecommendedNextStep:    currentStage,
+	}
+}
+
+func buildOnboardingCompletion(
+	canComplete bool,
+	runtimeReady bool,
+	connection onboardingWorkflowStageView,
+	autoConfig onboardingWorkflowAutoConfigView,
+	menu onboardingWorkflowStageView,
+	autostart onboardingWorkflowMachineStepView,
+	vscode onboardingWorkflowMachineStepView,
+) onboardingWorkflowCompletionView {
+	if canComplete {
+		return onboardingWorkflowCompletionView{
+			SetupRequired: false,
+			CanComplete:   true,
+			Summary:       "当前 setup 已可完成。",
+		}
+	}
+	blockingReason := blockingReasonForCompletion(runtimeReady, connection, autoConfig, menu, autostart, vscode)
+	return onboardingWorkflowCompletionView{
+		SetupRequired:  true,
+		CanComplete:    false,
+		Summary:        "当前 setup 还不能完成，请先处理阻塞项。",
+		BlockingReason: blockingReason,
+	}
+}
+
+func blockingReasonForCompletion(
+	runtimeReady bool,
+	connection onboardingWorkflowStageView,
+	autoConfig onboardingWorkflowAutoConfigView,
+	menu onboardingWorkflowStageView,
+	autostart onboardingWorkflowMachineStepView,
+	vscode onboardingWorkflowMachineStepView,
+) string {
+	switch {
+	case !runtimeReady:
+		return "基础运行环境还没有通过。"
+	case connection.Status != onboardingStageStatusComplete:
+		return "还没有完成飞书连接验证。"
+	case !onboardingStageResolved(autoConfig.Status):
+		if strings.TrimSpace(autoConfig.Summary) != "" {
+			return autoConfig.Summary
+		}
+		return "飞书自动配置还没有完成。"
+	case !onboardingStageResolved(menu.Status):
+		return "还没有确认机器人菜单配置。"
+	case !onboardingStageResolved(autostart.Status):
+		return autostart.Summary
+	case !onboardingStageResolved(vscode.Status):
+		return vscode.Summary
+	default:
+		return ""
+	}
+}
+
+func onboardingStageResolved(status string) bool {
+	switch status {
+	case onboardingStageStatusComplete, onboardingStageStatusDeferred, onboardingStageStatusNotApplicable:
+		return true
+	default:
+		return false
+	}
+}
+
+func firstPendingStageID(stages []onboardingWorkflowStageView) string {
+	for _, stage := range stages {
+		if stage.Status == onboardingStageStatusBlocked || stage.Status == onboardingStageStatusPending {
+			return stage.ID
+		}
+	}
+	return ""
+}
+
+func runtimeRequirementsSummaryStatus(ready bool) string {
+	if ready {
+		return onboardingStageStatusComplete
+	}
+	return onboardingStageStatusBlocked
+}
+
+func stageView(id, title, status, summary string, blocking bool, optional bool, allowedActions []string) onboardingWorkflowStageView {
+	return onboardingWorkflowStageView{
+		ID:             id,
+		Title:          title,
+		Status:         status,
+		Summary:        summary,
+		Blocking:       blocking,
+		Optional:       optional,
+		AllowedActions: append([]string(nil), allowedActions...),
+	}
+}
+
+func onboardingDecisionViewFromConfig(decision *config.OnboardingDecision) *onboardingWorkflowDecisionView {
+	if decision == nil || strings.TrimSpace(decision.Value) == "" {
+		return nil
+	}
+	return &onboardingWorkflowDecisionView{
+		Value:     strings.TrimSpace(decision.Value),
+		DecidedAt: decision.DecidedAt,
+	}
+}
+
+func onboardingAutoConfigDeferred(decision *config.OnboardingDecision) bool {
+	return decision != nil && strings.TrimSpace(decision.Value) == onboardingDecisionDeferred
+}
+
+func onboardingAutoConfigCanContinueDegraded(plan feishu.AutoConfigPlan) bool {
+	switch strings.TrimSpace(plan.Status) {
+	case feishu.AutoConfigStatusApplyRequired,
+		feishu.AutoConfigStatusAwaitingReview,
+		feishu.AutoConfigStatusBlocked,
+		feishu.AutoConfigStatusVerificationFailed:
+	default:
+		return false
+	}
+	return true
+}
+
+func onboardingAutoConfigPreserveDeferredOnReadError(err error) bool {
+	return err != nil && !strings.HasPrefix(err.Error(), "feishu_app_not_found:")
+}
+
+func onboardingAutoConfigDeferredRetrySummary(summary string) string {
+	base := strings.TrimSpace(summary)
+	if base == "" {
+		return "暂时无法刷新飞书自动配置状态，但会保留你已选择的降级继续。"
+	}
+	return base + " 当前会保留你已选择的降级继续。"
+}
+
+func onboardingMenuConfirmed(decision *config.OnboardingDecision) bool {
+	return decision != nil && strings.TrimSpace(decision.Value) == onboardingDecisionMenuConfirmed
+}
+
+func onboardingAppState(cfg config.AppConfig, gatewayID string) config.FeishuAppOnboardingState {
+	gatewayID = canonicalGatewayID(gatewayID)
+	if gatewayID == "" || cfg.Admin.Onboarding.Apps == nil {
+		return config.FeishuAppOnboardingState{}
+	}
+	return cfg.Admin.Onboarding.Apps[gatewayID]
+}

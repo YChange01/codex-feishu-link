@@ -1,0 +1,189 @@
+package control
+
+import "testing"
+
+func TestResolveFeishuCommandBindingFromActionClassifiesEntryKinds(t *testing.T) {
+	tests := []struct {
+		name              string
+		action            Action
+		wantFamily        string
+		wantKind          FeishuCommandBindingKind
+		wantLauncher      FeishuFrontstageLauncherDisposition
+		wantDirectDaemon  DaemonCommandKind
+		wantContinuation  DaemonCommandKind
+		wantHasFollowup   bool
+		wantPropagateCard bool
+	}{
+		{
+			name:         "config flow",
+			action:       Action{Kind: ActionModeCommand, Text: "/mode"},
+			wantFamily:   FeishuCommandMode,
+			wantKind:     FeishuCommandBindingConfigFlow,
+			wantLauncher: FeishuFrontstageLauncherKeep,
+		},
+		{
+			name:       "admin root inline page",
+			action:     Action{Kind: ActionAdminRoot, Text: "/admin"},
+			wantFamily: FeishuCommandAdmin,
+			wantKind:   FeishuCommandBindingInlinePage,
+		},
+		{
+			name:       "inline page",
+			action:     Action{Kind: ActionWorkspaceRoot, Text: "/workspace"},
+			wantFamily: FeishuCommandWorkspace,
+			wantKind:   FeishuCommandBindingInlinePage,
+		},
+		{
+			name:       "workspace session provenance override",
+			action:     Action{Kind: ActionShowThreads, CatalogFamilyID: FeishuCommandUseAll, CatalogVariantID: "useall.default"},
+			wantFamily: FeishuCommandUseAll,
+			wantKind:   FeishuCommandBindingWorkspaceSession,
+		},
+		{
+			name:            "terminal page",
+			action:          Action{Kind: ActionShowCommandHelp, Text: "/help"},
+			wantFamily:      FeishuCommandHelp,
+			wantKind:        FeishuCommandBindingTerminalPage,
+			wantLauncher:    FeishuFrontstageLauncherEnterTerminal,
+			wantHasFollowup: true,
+		},
+		{
+			name:            "coworkers terminal command",
+			action:          Action{Kind: ActionCoworkersCommand, Text: "/coworkers status"},
+			wantFamily:      FeishuCommandCoworkers,
+			wantKind:        FeishuCommandBindingTerminalPage,
+			wantLauncher:    FeishuFrontstageLauncherEnterTerminal,
+			wantHasFollowup: true,
+		},
+		{
+			name:              "daemon command",
+			action:            Action{Kind: ActionUpgradeCommand, Text: "/upgrade"},
+			wantFamily:        FeishuCommandUpgrade,
+			wantKind:          FeishuCommandBindingDaemonCommand,
+			wantDirectDaemon:  DaemonCommandUpgrade,
+			wantContinuation:  DaemonCommandUpgrade,
+			wantPropagateCard: true,
+		},
+		{
+			name:             "admin subcommand daemon command",
+			action:           Action{Kind: ActionAdminCommand, Text: "/admin web"},
+			wantFamily:       FeishuCommandAdminSubcommand,
+			wantKind:         FeishuCommandBindingDaemonCommand,
+			wantDirectDaemon: DaemonCommandAdmin,
+			wantContinuation: DaemonCommandAdmin,
+		},
+		{
+			name:       "owner entry",
+			action:     Action{Kind: ActionTurnPatchCommand, Text: "/bendtomywill"},
+			wantFamily: FeishuCommandPatch,
+			wantKind:   FeishuCommandBindingOwnerEntry,
+		},
+		{
+			name:       "review owner entry",
+			action:     Action{Kind: ActionReviewCommand, Text: "/review uncommitted"},
+			wantFamily: FeishuCommandReview,
+			wantKind:   FeishuCommandBindingOwnerEntry,
+		},
+		{
+			name:            "workspace detach owner entry",
+			action:          Action{Kind: ActionWorkspaceDetach, Text: "/workspace detach"},
+			wantFamily:      FeishuCommandWorkspaceDetach,
+			wantKind:        FeishuCommandBindingOwnerEntry,
+			wantHasFollowup: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			binding, ok := ResolveFeishuCommandBindingFromAction(tt.action)
+			if !ok {
+				t.Fatalf("expected binding for %#v", tt.action)
+			}
+			if binding.FamilyID != tt.wantFamily {
+				t.Fatalf("FamilyID = %q, want %q", binding.FamilyID, tt.wantFamily)
+			}
+			if binding.Kind != tt.wantKind {
+				t.Fatalf("Kind = %q, want %q", binding.Kind, tt.wantKind)
+			}
+			if binding.LauncherDisposition != tt.wantLauncher {
+				t.Fatalf("LauncherDisposition = %q, want %q", binding.LauncherDisposition, tt.wantLauncher)
+			}
+			if binding.DirectDaemonCommand != tt.wantDirectDaemon {
+				t.Fatalf("DirectDaemonCommand = %q, want %q", binding.DirectDaemonCommand, tt.wantDirectDaemon)
+			}
+			if binding.ContinuationDaemonCommand != tt.wantContinuation {
+				t.Fatalf("ContinuationDaemonCommand = %q, want %q", binding.ContinuationDaemonCommand, tt.wantContinuation)
+			}
+			if binding.PropagateCardActionToDaemon != tt.wantPropagateCard {
+				t.Fatalf("PropagateCardActionToDaemon = %v, want %v", binding.PropagateCardActionToDaemon, tt.wantPropagateCard)
+			}
+			if got := !binding.FollowupPolicy.Empty(); got != tt.wantHasFollowup {
+				t.Fatalf("has followup policy = %v, want %v", got, tt.wantHasFollowup)
+			}
+		})
+	}
+}
+
+func TestResolveFeishuCommandDisplayFromActionUsesBindingDefinition(t *testing.T) {
+	display, ok := ResolveFeishuCommandDisplayFromAction(Action{Kind: ActionStop})
+	if !ok {
+		t.Fatal("expected stop action to resolve command display")
+	}
+	if display.Title != "停止推理" || display.CanonicalSlash != "/stop" || display.FamilyID != FeishuCommandStop {
+		t.Fatalf("unexpected stop display: %#v", display)
+	}
+}
+
+func TestResolveFeishuCommandDisplayFromActionUsesRouteTitle(t *testing.T) {
+	display, ok := ResolveFeishuCommandDisplayFromAction(Action{Kind: ActionTurnPatchRollback})
+	if !ok {
+		t.Fatal("expected turn patch rollback action to resolve command display")
+	}
+	if display.Title != "回滚最近一次修补" || display.CanonicalSlash != "/bendtomywill rollback" || display.FamilyID != FeishuCommandPatch {
+		t.Fatalf("unexpected rollback display: %#v", display)
+	}
+}
+
+func TestResolveFeishuCommandDisplayFromActionRejectsLocalOwnerCardAction(t *testing.T) {
+	if display, ok := ResolveFeishuCommandDisplayFromAction(Action{Kind: ActionReviewApply}); ok {
+		t.Fatalf("local review apply action resolved as catalog display: %#v", display)
+	}
+}
+
+func TestResolveFeishuCommandBindingIntentBuilder(t *testing.T) {
+	tests := []struct {
+		name   string
+		action Action
+		want   FeishuUIIntentKind
+		ok     bool
+	}{
+		{name: "admin bare command", action: Action{Kind: ActionAdminRoot, Text: "/admin"}, want: FeishuUIIntentShowAdminRoot, ok: true},
+		{name: "history bare command", action: Action{Kind: ActionShowHistory, Text: "/history"}, want: FeishuUIIntentShowHistory, ok: true},
+		{name: "review bare command", action: Action{Kind: ActionReviewCommand, Text: "/review"}, want: FeishuUIIntentShowReviewRoot, ok: true},
+		{name: "review subcommand stays product owned", action: Action{Kind: ActionReviewCommand, Text: "/review commit"}, ok: false},
+		{name: "history non-bare stays product owned", action: Action{Kind: ActionShowHistory, Text: "/history latest"}, ok: false},
+		{name: "sendfile opens picker", action: Action{Kind: ActionSendFile, Text: "/sendfile"}, want: FeishuUIIntentOpenSendFilePicker, ok: true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			binding, ok := ResolveFeishuCommandBindingFromAction(tt.action)
+			if !ok {
+				t.Fatalf("expected binding for %#v", tt.action)
+			}
+			intent, got := binding.IntentFromAction(tt.action)
+			if got != tt.ok {
+				t.Fatalf("IntentFromAction(%#v) ok = %v, want %v", tt.action, got, tt.ok)
+			}
+			if !tt.ok {
+				if intent != nil {
+					t.Fatalf("expected nil intent, got %#v", intent)
+				}
+				return
+			}
+			if intent == nil || intent.Kind != tt.want {
+				t.Fatalf("intent = %#v, want kind %q", intent, tt.want)
+			}
+		})
+	}
+}

@@ -1,0 +1,33 @@
+package orchestrator
+
+import (
+	"strings"
+
+	"github.com/YChange01/codex-feishu-link/internal/core/control"
+)
+
+func pathPickerEntryIndexByKind(entries []control.FeishuPathPickerEntry, kind control.PathPickerEntryKind, selectedPath string) int {
+	selectedPath = strings.TrimSpace(selectedPath)
+	index := 0
+	for _, entry := range entries {
+		if entry.Disabled || entry.Kind != kind {
+			continue
+		}
+		if entry.Selected && selectedPath != "" {
+			return index
+		}
+		index++
+	}
+	return -1
+}
+
+func pathPickerEntriesByKind(entries []control.FeishuPathPickerEntry, kind control.PathPickerEntryKind) []control.FeishuPathPickerEntry {
+	filtered := make([]control.FeishuPathPickerEntry, 0, len(entries))
+	for _, entry := range entries {
+		if entry.Disabled || entry.Kind != kind {
+			continue
+		}
+		filtered = append(filtered, entry)
+	}
+	return filtered
+}

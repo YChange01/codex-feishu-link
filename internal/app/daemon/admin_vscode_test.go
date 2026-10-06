@@ -1,0 +1,781 @@
+package daemon
+
+import (
+	"encoding/json"
+	"net/http"
+	"os"
+	"path/filepath"
+	"runtime"
+	"testing"
+	"time"
+
+	"github.com/YChange01/codex-feishu-link/internal/adapter/editor"
+	"github.com/YChange01/codex-feishu-link/internal/adapter/feishu"
+	"github.com/YChange01/codex-feishu-link/internal/app/install"
+	"github.com/YChange01/codex-feishu-link/internal/config"
+	"github.com/YChange01/codex-feishu-link/internal/core/agentproto"
+	relayruntime "github.com/YChange01/codex-feishu-link/internal/runtime"
+)
+
+func TestVSCodeDetectApplyAndReinstallManagedShim(t *testing.T) {
+	home := t.TempDir()
+	setTestHome(t, home)
+	t.Setenv("VSCODE_SERVER_EXTENSIONS_DIR", filepath.Join(home, ".vscode-server", "extensions"))
+
+	binaryPath := filepath.Join(home, "bin", "codex-feishu-relay")
+	writeExecutableFile(t, binaryPath, "wrapper-binary")
+
+	entrypointV1 := testVSCodeBundleEntrypoint(home, ".vscode-server", "1")
+	windowsSibling := testNonCurrentPlatformBundleEntrypoint(home, ".vscode-server", "1")
+	writeExecutableFile(t, entrypointV1, "orig-v1")
+	writeExecutableFile(t, windowsSibling, "orig-win-v1")
+
+	app, configPath, installStatePath := newVSCodeAdminTestApp(t, home, binaryPath, true)
+
+	rec := performAdminRequest(t, app, http.MethodGet, "/api/admin/vscode/detect", "")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("detect status = %d, want 200 body=%s", rec.Code, rec.Body.String())
+	}
+	var detect vscodeDetectResponse
+	if err := json.NewDecoder(rec.Body).Decode(&detect); err != nil {
+		t.Fatalf("decode detect: %v", err)
+	}
+	if detect.RecommendedMode != "managed_shim" {
+		t.Fatalf("recommended mode = %q, want managed_shim", detect.RecommendedMode)
+	}
+	if detect.LatestBundleEntrypoint != entrypointV1 {
+		t.Fatalf("latest bundle entrypoint = %q, want %q", detect.LatestBundleEntrypoint, entrypointV1)
+	}
+
+	rec = performAdminRequest(t, app, http.MethodPost, "/api/admin/vscode/apply", `{"mode":"managed_shim"}`)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("apply status = %d, want 200 body=%s", rec.Code, rec.Body.String())
+	}
+	if _, err := os.Stat(editor.ManagedShimRealBinaryPath(entrypointV1)); err != nil {
+		t.Fatalf("expected .real backup after shim install: %v", err)
+	}
+	if readFileString(t, entrypointV1) == "wrapper-binary" {
+		t.Fatalf("expected entrypoint to be tiny shim, not copied main binary")
+	}
+
+	loaded, err := config.LoadAppConfigAtPath(configPath)
+	if err != nil {
+		t.Fatalf("LoadAppConfigAtPath: %v", err)
+	}
+	if loaded.Config.Wrapper.IntegrationMode != "managed_shim" {
+		t.Fatalf("wrapper integration mode = %q, want managed_shim", loaded.Config.Wrapper.IntegrationMode)
+	}
+	if loaded.Config.Wrapper.CodexRealBinary != "codex" {
+		t.Fatalf("expected shared codex path to stay unchanged, got %q", loaded.Config.Wrapper.CodexRealBinary)
+	}
+
+	writeExecutableFile(t, entrypointV1, "older-managed-entrypoint")
+	rec = performAdminRequest(t, app, http.MethodGet, "/api/admin/vscode/detect", "")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("detect old managed entrypoint status = %d, want 200 body=%s", rec.Code, rec.Body.String())
+	}
+	if err := json.NewDecoder(rec.Body).Decode(&detect); err != nil {
+		t.Fatalf("decode old managed entrypoint detect: %v", err)
+	}
+	if detect.NeedsShimReinstall {
+		t.Fatalf("old but valid VS Code integration should not require repair, got %#v", detect)
+	}
+	if !detect.LatestShim.Installed || !detect.LatestShim.SidecarValid || detect.LatestShim.MatchesBinary {
+		t.Fatalf("expected old valid integration with hash mismatch, got %#v", detect.LatestShim)
+	}
+
+	entrypointV2 := testVSCodeBundleEntrypoint(home, ".vscode-server", "2")
+	windowsSiblingV2 := testNonCurrentPlatformBundleEntrypoint(home, ".vscode-server", "2")
+	writeExecutableFile(t, entrypointV2, "orig-v2")
+	writeExecutableFile(t, windowsSiblingV2, "orig-win-v2")
+	now := time.Now().Add(time.Minute)
+	if err := os.Chtimes(filepath.Dir(filepath.Dir(filepath.Dir(entrypointV2))), now, now); err != nil {
+		t.Fatalf("Chtimes(new extension dir): %v", err)
+	}
+
+	rec = performAdminRequest(t, app, http.MethodGet, "/api/admin/vscode/detect", "")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("detect after upgrade status = %d, want 200 body=%s", rec.Code, rec.Body.String())
+	}
+	if err := json.NewDecoder(rec.Body).Decode(&detect); err != nil {
+		t.Fatalf("decode detect after upgrade: %v", err)
+	}
+	if detect.LatestBundleEntrypoint != entrypointV2 {
+		t.Fatalf("latest bundle entrypoint after upgrade = %q, want %q", detect.LatestBundleEntrypoint, entrypointV2)
+	}
+	if !detect.NeedsShimReinstall {
+		t.Fatalf("expected repair to be required after extension overwrote the latest entrypoint, got %#v", detect)
+	}
+
+	rec = performAdminRequest(t, app, http.MethodPost, "/api/admin/vscode/apply", `{"mode":"managed_shim"}`)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("re-apply status = %d, want 200 body=%s", rec.Code, rec.Body.String())
+	}
+	if _, err := os.Stat(editor.ManagedShimRealBinaryPath(entrypointV2)); err != nil {
+		t.Fatalf("expected .real backup on latest entrypoint: %v", err)
+	}
+	if readFileString(t, entrypointV2) == "wrapper-binary" {
+		t.Fatalf("expected latest entrypoint to be tiny shim, not copied main binary")
+	}
+	if err := json.NewDecoder(rec.Body).Decode(&detect); err != nil {
+		t.Fatalf("decode re-apply detect: %v", err)
+	}
+	if detect.NeedsShimReinstall {
+		t.Fatalf("did not expect reinstall flag after re-apply, got %#v", detect)
+	}
+
+	loaded, err = config.LoadAppConfigAtPath(configPath)
+	if err != nil {
+		t.Fatalf("LoadAppConfigAtPath after re-apply: %v", err)
+	}
+	if loaded.Config.Wrapper.CodexRealBinary != "codex" {
+		t.Fatalf("expected shared codex path to remain unchanged, got %q", loaded.Config.Wrapper.CodexRealBinary)
+	}
+
+	rec = performAdminRequest(t, app, http.MethodPost, "/api/admin/vscode/reinstall-shim", "")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("reinstall status = %d, want 200 body=%s", rec.Code, rec.Body.String())
+	}
+
+	state, err := install.LoadState(installStatePath)
+	if err != nil {
+		t.Fatalf("LoadState: %v", err)
+	}
+	if state.BundleEntrypoint != entrypointV2 {
+		t.Fatalf("expected install-state to record latest bundle entrypoint, got %#v", state)
+	}
+	if _, err := os.Stat(editor.ManagedShimRealBinaryPath(windowsSiblingV2)); !os.IsNotExist(err) {
+		t.Fatalf("expected non-current-platform sibling to stay untouched, stat err=%v", err)
+	}
+}
+
+func TestVSCodeDisableUninstallsManagedShim(t *testing.T) {
+	home := t.TempDir()
+	setTestHome(t, home)
+	t.Setenv("VSCODE_SERVER_EXTENSIONS_DIR", filepath.Join(home, ".vscode-server", "extensions"))
+
+	binaryPath := filepath.Join(home, "bin", "codex-feishu-relay")
+	writeExecutableFile(t, binaryPath, "wrapper-binary")
+
+	entrypoint := testVSCodeBundleEntrypoint(home, ".vscode-server", "1")
+	writeExecutableFile(t, entrypoint, "orig")
+
+	app, _, installStatePath := newVSCodeAdminTestApp(t, home, binaryPath, true)
+
+	rec := performAdminRequest(t, app, http.MethodPost, "/api/admin/vscode/apply", `{"mode":"managed_shim"}`)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("apply status = %d, want 200 body=%s", rec.Code, rec.Body.String())
+	}
+	if _, err := os.Stat(editor.ManagedShimSidecarPath(entrypoint)); err != nil {
+		t.Fatalf("expected sidecar after apply: %v", err)
+	}
+
+	rec = performAdminRequest(t, app, http.MethodPost, "/api/admin/vscode/disable", "")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("disable status = %d, want 200 body=%s", rec.Code, rec.Body.String())
+	}
+
+	if readFileString(t, entrypoint) != "orig" {
+		t.Fatalf("expected original binary restored after disable, got %q", readFileString(t, entrypoint))
+	}
+	if _, err := os.Stat(editor.ManagedShimRealBinaryPath(entrypoint)); !os.IsNotExist(err) {
+		t.Fatalf("expected .real backup removed after disable, err=%v", err)
+	}
+	if _, err := os.Stat(editor.ManagedShimSidecarPath(entrypoint)); !os.IsNotExist(err) {
+		t.Fatalf("expected sidecar removed after disable, err=%v", err)
+	}
+
+	var detect vscodeDetectResponse
+	if err := json.NewDecoder(rec.Body).Decode(&detect); err != nil {
+		t.Fatalf("decode disable detect: %v", err)
+	}
+	if workflowVSCodeReady(detect) {
+		t.Fatalf("expected workflow to report vscode not ready after disable, got %#v", detect)
+	}
+	if detect.LatestShim.Kind != "" || detect.LatestShim.Installed {
+		t.Fatalf("expected latest shim gone after disable, got %#v", detect.LatestShim)
+	}
+
+	state, err := install.LoadState(installStatePath)
+	if err != nil {
+		t.Fatalf("LoadState after disable: %v", err)
+	}
+	if state.BundleEntrypoint != "" {
+		t.Fatalf("expected state bundle entrypoint cleared, got %q", state.BundleEntrypoint)
+	}
+	if len(state.Integrations) != 0 {
+		t.Fatalf("expected state integrations cleared, got %#v", state.Integrations)
+	}
+}
+
+func TestVSCodeDisableWithoutInstallStateUninstallsManagedShim(t *testing.T) {
+	home := t.TempDir()
+	setTestHome(t, home)
+	t.Setenv("VSCODE_SERVER_EXTENSIONS_DIR", filepath.Join(home, ".vscode-server", "extensions"))
+
+	binaryPath := filepath.Join(home, "bin", "codex-feishu-relay")
+	writeExecutableFile(t, binaryPath, "wrapper-binary")
+
+	entrypoint := testVSCodeBundleEntrypoint(home, ".vscode-server", "1")
+	writeExecutableFile(t, entrypoint, "orig")
+
+	app, _, installStatePath := newVSCodeAdminTestApp(t, home, binaryPath, true)
+
+	rec := performAdminRequest(t, app, http.MethodPost, "/api/admin/vscode/apply", `{"mode":"managed_shim"}`)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("apply status = %d, want 200 body=%s", rec.Code, rec.Body.String())
+	}
+	if _, err := os.Stat(editor.ManagedShimSidecarPath(entrypoint)); err != nil {
+		t.Fatalf("expected sidecar after apply: %v", err)
+	}
+
+	// Simulate the reported Windows bug: the managed shim is installed on disk
+	// but install-state.json is missing. Disable must still uninstall the shim
+	// instead of silently reporting success.
+	if err := os.Remove(installStatePath); err != nil {
+		t.Fatalf("remove install-state.json: %v", err)
+	}
+
+	rec = performAdminRequest(t, app, http.MethodPost, "/api/admin/vscode/disable", "")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("disable status = %d, want 200 body=%s", rec.Code, rec.Body.String())
+	}
+
+	if readFileString(t, entrypoint) != "orig" {
+		t.Fatalf("expected original binary restored after disable, got %q", readFileString(t, entrypoint))
+	}
+	if _, err := os.Stat(editor.ManagedShimRealBinaryPath(entrypoint)); !os.IsNotExist(err) {
+		t.Fatalf("expected .real backup removed after disable, err=%v", err)
+	}
+	if _, err := os.Stat(editor.ManagedShimSidecarPath(entrypoint)); !os.IsNotExist(err) {
+		t.Fatalf("expected sidecar removed after disable, err=%v", err)
+	}
+
+	var detect vscodeDetectResponse
+	if err := json.NewDecoder(rec.Body).Decode(&detect); err != nil {
+		t.Fatalf("decode disable detect: %v", err)
+	}
+	if workflowVSCodeReady(detect) {
+		t.Fatalf("expected workflow to report vscode not ready after disable, got %#v", detect)
+	}
+	if detect.LatestShim.Kind != "" || detect.LatestShim.Installed {
+		t.Fatalf("expected latest shim gone after disable, got %#v", detect.LatestShim)
+	}
+}
+
+func TestVSCodeDetectAndApplyManagedShimUseWindowsEntrypoint(t *testing.T) {
+	home := t.TempDir()
+	setTestHome(t, home)
+
+	binaryPath := filepath.Join(home, "bin", "codex-feishu-relay.exe")
+	writeExecutableFile(t, binaryPath, "wrapper-binary")
+
+	linuxEntrypoint := filepath.Join(home, ".vscode", "extensions", "openai.chatgpt-1", "bin", "linux-x86_64", "codex")
+	windowsEntrypoint := filepath.Join(home, ".vscode", "extensions", "openai.chatgpt-1", "bin", "windows-x86_64", "codex.exe")
+	writeExecutableFile(t, linuxEntrypoint, "wrapper-binary")
+	writeExecutableFile(t, linuxEntrypoint+".real", "orig-linux")
+	writeExecutableFile(t, windowsEntrypoint, "orig-windows")
+
+	app, configPath, installStatePath := newVSCodeAdminTestApp(t, home, binaryPath, true)
+	settingsPath := filepath.Join(home, "AppData", "Roaming", "Code", "User", "settings.json")
+	app.detectPlatformDefaults = func() (install.PlatformDefaults, error) {
+		return install.PlatformDefaults{
+			GOOS:                       "windows",
+			HomeDir:                    home,
+			BaseDir:                    home,
+			VSCodeSettingsPath:         settingsPath,
+			CandidateBundleEntrypoints: []string{windowsEntrypoint},
+			DefaultIntegrations:        install.DefaultIntegrations("windows"),
+		}, nil
+	}
+	if err := install.WriteState(installStatePath, install.InstallState{
+		StatePath:          installStatePath,
+		VSCodeSettingsPath: settingsPath,
+		BundleEntrypoint:   linuxEntrypoint,
+		Integrations:       []install.WrapperIntegrationMode{install.IntegrationManagedShim},
+		CurrentBinaryPath:  binaryPath,
+	}); err != nil {
+		t.Fatalf("WriteState: %v", err)
+	}
+
+	rec := performAdminRequest(t, app, http.MethodGet, "/api/admin/vscode/detect", "")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("detect status = %d, want 200 body=%s", rec.Code, rec.Body.String())
+	}
+	var detect vscodeDetectResponse
+	if err := json.NewDecoder(rec.Body).Decode(&detect); err != nil {
+		t.Fatalf("decode detect: %v", err)
+	}
+	if detect.LatestBundleEntrypoint != windowsEntrypoint {
+		t.Fatalf("latest bundle entrypoint = %q, want %q", detect.LatestBundleEntrypoint, windowsEntrypoint)
+	}
+	// Recorded entrypoint comes from disk now: no candidate entrypoint carries
+	// a shim yet, so recorded must be empty even though install state still
+	// records the linux entrypoint from an earlier cross-platform run.
+	if detect.RecordedBundleEntrypoint != "" {
+		t.Fatalf("recorded bundle entrypoint = %q, want empty (disk has no candidate shim)", detect.RecordedBundleEntrypoint)
+	}
+	if !detect.NeedsShimReinstall {
+		t.Fatalf("expected detect to require reinstall when latest candidate entrypoint is not shimmed, got %#v", detect)
+	}
+
+	rec = performAdminRequest(t, app, http.MethodPost, "/api/admin/vscode/apply", `{"mode":"managed_shim"}`)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("apply status = %d, want 200 body=%s", rec.Code, rec.Body.String())
+	}
+	windowsRealBinary := editor.ManagedShimRealBinaryPath(windowsEntrypoint)
+	if _, err := os.Stat(windowsRealBinary); err != nil {
+		t.Fatalf("expected .real.exe backup after windows shim apply: %v", err)
+	}
+	if readFileString(t, windowsEntrypoint) == "wrapper-binary" {
+		t.Fatalf("expected windows entrypoint to be tiny shim, not copied main binary")
+	}
+	// The recorded linux entrypoint is still used as a migration target by
+	// apply (it is the "last chosen" hint), so it must become a tiny shim.
+	if readFileString(t, linuxEntrypoint) == "wrapper-binary" {
+		t.Fatalf("expected recorded linux entrypoint to be migrated to tiny shim")
+	}
+
+	loaded, err := config.LoadAppConfigAtPath(configPath)
+	if err != nil {
+		t.Fatalf("LoadAppConfigAtPath: %v", err)
+	}
+	if loaded.Config.Wrapper.CodexRealBinary != "codex" {
+		t.Fatalf("expected shared codex path to stay unchanged, got %q", loaded.Config.Wrapper.CodexRealBinary)
+	}
+
+	state, err := install.LoadState(installStatePath)
+	if err != nil {
+		t.Fatalf("LoadState: %v", err)
+	}
+	if state.BundleEntrypoint != windowsEntrypoint {
+		t.Fatalf("expected install-state to move to windows entrypoint, got %q", state.BundleEntrypoint)
+	}
+}
+
+func TestVSCodeApplyEditorSettingsRejected(t *testing.T) {
+	home := t.TempDir()
+	setTestHome(t, home)
+	binaryPath := filepath.Join(home, "bin", "codex-feishu-relay")
+	writeExecutableFile(t, binaryPath, "wrapper-binary")
+
+	app, _, _ := newVSCodeAdminTestApp(t, home, binaryPath, false)
+
+	rec := performAdminRequest(t, app, http.MethodPost, "/api/admin/vscode/apply", `{"mode":"editor_settings"}`)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("apply status = %d, want 400 body=%s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestVSCodeDetectRecommendsManagedShimOutsideSSH(t *testing.T) {
+	home := t.TempDir()
+	setTestHome(t, home)
+	binaryPath := filepath.Join(home, "bin", "codex-feishu-relay")
+	writeExecutableFile(t, binaryPath, "wrapper-binary")
+
+	app, _, _ := newVSCodeAdminTestApp(t, home, binaryPath, false)
+
+	rec := performAdminRequest(t, app, http.MethodGet, "/api/admin/vscode/detect", "")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("detect status = %d, want 200 body=%s", rec.Code, rec.Body.String())
+	}
+	var detect vscodeDetectResponse
+	if err := json.NewDecoder(rec.Body).Decode(&detect); err != nil {
+		t.Fatalf("decode detect: %v", err)
+	}
+	if detect.RecommendedMode != "managed_shim" {
+		t.Fatalf("recommended mode = %q, want managed_shim", detect.RecommendedMode)
+	}
+}
+
+func TestVSCodeApplyAllAliasRejected(t *testing.T) {
+	home := t.TempDir()
+	setTestHome(t, home)
+	t.Setenv("VSCODE_SERVER_EXTENSIONS_DIR", filepath.Join(home, ".vscode-server", "extensions"))
+	binaryPath := filepath.Join(home, "bin", "codex-feishu-relay")
+	writeExecutableFile(t, binaryPath, "wrapper-binary")
+
+	entrypoint := testVSCodeBundleEntrypoint(home, ".vscode-server", "1")
+	writeExecutableFile(t, entrypoint, "orig")
+
+	app, _, _ := newVSCodeAdminTestApp(t, home, binaryPath, false)
+
+	rec := performAdminRequest(t, app, http.MethodPost, "/api/admin/vscode/apply", `{"mode":"all"}`)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("apply all status = %d, want 400 body=%s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestVSCodeDetectSupportsJSONCSettings(t *testing.T) {
+	home := t.TempDir()
+	setTestHome(t, home)
+	binaryPath := filepath.Join(home, "bin", "codex-feishu-relay")
+	writeExecutableFile(t, binaryPath, "wrapper-binary")
+
+	defaults, err := install.DetectPlatformDefaults()
+	if err != nil {
+		t.Fatalf("DetectPlatformDefaults: %v", err)
+	}
+	settingsPath := defaults.VSCodeSettingsPath
+	if err := os.MkdirAll(filepath.Dir(settingsPath), 0o755); err != nil {
+		t.Fatalf("MkdirAll(settings dir): %v", err)
+	}
+	quotedBinaryPath, err := json.Marshal(binaryPath)
+	if err != nil {
+		t.Fatalf("Marshal(binaryPath): %v", err)
+	}
+	rawSettings := "{\n  // existing vscode config\n  \"chatgpt.cliExecutable\": " + string(quotedBinaryPath) + ",\n}\n"
+	if err := os.WriteFile(settingsPath, []byte(rawSettings), 0o644); err != nil {
+		t.Fatalf("WriteFile(settings): %v", err)
+	}
+
+	app, _, _ := newVSCodeAdminTestApp(t, home, binaryPath, false)
+
+	rec := performAdminRequest(t, app, http.MethodGet, "/api/admin/vscode/detect", "")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("detect status = %d, want 200 body=%s", rec.Code, rec.Body.String())
+	}
+	var detect vscodeDetectResponse
+	if err := json.NewDecoder(rec.Body).Decode(&detect); err != nil {
+		t.Fatalf("decode detect: %v", err)
+	}
+	if detect.Settings.CLIExecutable != binaryPath {
+		t.Fatalf("settings cli executable = %q, want %q", detect.Settings.CLIExecutable, binaryPath)
+	}
+	if !detect.Settings.MatchesBinary {
+		t.Fatalf("expected settings to match current binary, got %#v", detect.Settings)
+	}
+}
+
+func TestVSCodeDetectAndReinstallMigrateRecordedHistoricalManagedShim(t *testing.T) {
+	home := t.TempDir()
+	setTestHome(t, home)
+	t.Setenv("VSCODE_SERVER_EXTENSIONS_DIR", filepath.Join(home, ".vscode-server", "extensions"))
+
+	binaryPath := filepath.Join(home, "bin", "codex-feishu-relay")
+	writeExecutableFile(t, binaryPath, "wrapper-binary")
+
+	entrypointV1 := testVSCodeBundleEntrypoint(home, ".vscode-server", "1")
+	writeExecutableFile(t, entrypointV1, "orig-v1")
+
+	app, configPath, installStatePath := newVSCodeAdminTestApp(t, home, binaryPath, true)
+
+	rec := performAdminRequest(t, app, http.MethodPost, "/api/admin/vscode/apply", `{"mode":"managed_shim"}`)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("apply v1 status = %d, want 200 body=%s", rec.Code, rec.Body.String())
+	}
+
+	entrypointV2 := testVSCodeBundleEntrypoint(home, ".vscode-server", "2")
+	writeExecutableFile(t, entrypointV2, "orig-v2")
+	now := time.Now().Add(time.Minute)
+	if err := os.Chtimes(filepath.Dir(filepath.Dir(filepath.Dir(entrypointV2))), now, now); err != nil {
+		t.Fatalf("Chtimes(v2 extension dir): %v", err)
+	}
+	if err := editor.PatchBundleEntrypoint(editor.PatchBundleEntrypointOptions{
+		EntrypointPath:   entrypointV2,
+		InstallStatePath: installStatePath,
+		ConfigPath:       configPath,
+		InstanceID:       "stable",
+	}); err != nil {
+		t.Fatalf("PatchBundleEntrypoint(v2): %v", err)
+	}
+
+	if err := os.Remove(editor.ManagedShimSidecarPath(entrypointV1)); err != nil {
+		t.Fatalf("remove v1 sidecar: %v", err)
+	}
+	writeExecutableFile(t, entrypointV1, "wrapper-binary")
+
+	rec = performAdminRequest(t, app, http.MethodGet, "/api/admin/vscode/detect", "")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("detect status = %d, want 200 body=%s", rec.Code, rec.Body.String())
+	}
+	var detect vscodeDetectResponse
+	if err := json.NewDecoder(rec.Body).Decode(&detect); err != nil {
+		t.Fatalf("decode detect: %v", err)
+	}
+	if detect.LatestBundleEntrypoint != entrypointV2 {
+		t.Fatalf("latest bundle entrypoint = %q, want %q", detect.LatestBundleEntrypoint, entrypointV2)
+	}
+	if !detect.NeedsShimReinstall {
+		t.Fatalf("expected historical recorded legacy shim to require reinstall, got %#v", detect)
+	}
+
+	rec = performAdminRequest(t, app, http.MethodPost, "/api/admin/vscode/reinstall-shim", "")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("reinstall status = %d, want 200 body=%s", rec.Code, rec.Body.String())
+	}
+
+	statusV1, err := editor.DetectManagedShim(entrypointV1, binaryPath)
+	if err != nil {
+		t.Fatalf("DetectManagedShim(v1): %v", err)
+	}
+	if statusV1.Kind != editor.ManagedShimKindTiny || !statusV1.SidecarValid || !statusV1.MatchesBinary {
+		t.Fatalf("expected recorded historical shim to migrate back to tiny shim, got %#v", statusV1)
+	}
+}
+
+func TestVSCodeDetectWithoutInstallStateDerivesRecordedFromDisk(t *testing.T) {
+	home := t.TempDir()
+	setTestHome(t, home)
+	t.Setenv("VSCODE_SERVER_EXTENSIONS_DIR", filepath.Join(home, ".vscode-server", "extensions"))
+
+	binaryPath := filepath.Join(home, "bin", "codex-feishu-relay")
+	writeExecutableFile(t, binaryPath, "wrapper-binary")
+
+	entrypoint := testVSCodeBundleEntrypoint(home, ".vscode-server", "1")
+	writeExecutableFile(t, entrypoint, "orig")
+
+	app, _, installStatePath := newVSCodeAdminTestApp(t, home, binaryPath, true)
+
+	rec := performAdminRequest(t, app, http.MethodPost, "/api/admin/vscode/apply", `{"mode":"managed_shim"}`)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("apply status = %d, want 200 body=%s", rec.Code, rec.Body.String())
+	}
+	// Simulate the reported Windows bug: the managed shim stays on disk but
+	// install-state.json is lost. Detect must derive the recorded entrypoint
+	// from disk and still report the integration as ready.
+	if err := os.Remove(installStatePath); err != nil {
+		t.Fatalf("remove install-state.json: %v", err)
+	}
+
+	rec = performAdminRequest(t, app, http.MethodGet, "/api/admin/vscode/detect", "")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("detect status = %d, want 200 body=%s", rec.Code, rec.Body.String())
+	}
+	var detect vscodeDetectResponse
+	if err := json.NewDecoder(rec.Body).Decode(&detect); err != nil {
+		t.Fatalf("decode detect: %v", err)
+	}
+	if detect.RecordedBundleEntrypoint != entrypoint {
+		t.Fatalf("recorded bundle entrypoint = %q, want %q (derived from disk)", detect.RecordedBundleEntrypoint, entrypoint)
+	}
+	if detect.RecordedShim == nil || !detect.RecordedShim.Installed || !detect.RecordedShim.SidecarValid {
+		t.Fatalf("expected recorded shim from disk, got %#v", detect.RecordedShim)
+	}
+	if !workflowVSCodeReady(detect) {
+		t.Fatalf("expected workflow to report vscode ready from disk state, got %#v", detect)
+	}
+}
+
+func TestVSCodeDetectDoesNotClaimForeignShimAsEnabled(t *testing.T) {
+	home := t.TempDir()
+	setTestHome(t, home)
+	t.Setenv("VSCODE_SERVER_EXTENSIONS_DIR", filepath.Join(home, ".vscode-server", "extensions"))
+
+	binaryPath := filepath.Join(home, "bin", "codex-feishu-relay")
+	writeExecutableFile(t, binaryPath, "wrapper-binary")
+
+	entrypoint := testVSCodeBundleEntrypoint(home, ".vscode-server", "1")
+	writeExecutableFile(t, entrypoint, "orig")
+
+	app, _, _ := newVSCodeAdminTestApp(t, home, binaryPath, true)
+
+	// Simulate the reported Windows bug: a managed shim is on disk, but its
+	// sidecar points at a DIFFERENT install (stale data dir from an old
+	// version, another instance, or leftover test state), and install-state.json
+	// is missing so nothing records the entrypoint. Detect must not claim the
+	// integration is enabled for a shim that disable cannot manage.
+	if err := editor.PatchBundleEntrypoint(editor.PatchBundleEntrypointOptions{
+		EntrypointPath:   entrypoint,
+		InstallStatePath: filepath.Join(home, "stale", "install-state.json"),
+		ConfigPath:       filepath.Join(home, "stale", "config.json"),
+		InstanceID:       "stable",
+	}); err != nil {
+		t.Fatalf("PatchBundleEntrypoint: %v", err)
+	}
+
+	rec := performAdminRequest(t, app, http.MethodGet, "/api/admin/vscode/detect", "")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("detect status = %d, want 200 body=%s", rec.Code, rec.Body.String())
+	}
+	var detect vscodeDetectResponse
+	if err := json.NewDecoder(rec.Body).Decode(&detect); err != nil {
+		t.Fatalf("decode detect: %v", err)
+	}
+	if detect.RecordedBundleEntrypoint != "" {
+		t.Fatalf("recorded bundle entrypoint = %q, want empty (foreign shim is not this install's)", detect.RecordedBundleEntrypoint)
+	}
+	if detect.RecordedShim != nil {
+		t.Fatalf("recorded shim = %#v, want nil for foreign shim", detect.RecordedShim)
+	}
+	if detect.LatestShim.Kind != "" || detect.LatestShim.Installed || detect.LatestShim.SidecarValid {
+		t.Fatalf("expected foreign shim not to look like this install's managed shim, got %#v", detect.LatestShim)
+	}
+	if workflowVSCodeReady(detect) {
+		t.Fatalf("expected workflow to report vscode not ready for foreign shim, got %#v", detect)
+	}
+
+	// Disable must stay consistent with detect: it reports success without
+	// touching a shim that was never claimed as this install's.
+	rec = performAdminRequest(t, app, http.MethodPost, "/api/admin/vscode/disable", "")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("disable status = %d, want 200 body=%s", rec.Code, rec.Body.String())
+	}
+	if _, err := os.Stat(editor.ManagedShimSidecarPath(entrypoint)); err != nil {
+		t.Fatalf("expected foreign sidecar untouched by disable, stat err=%v", err)
+	}
+	if _, err := os.Stat(editor.ManagedShimRealBinaryPath(entrypoint)); err != nil {
+		t.Fatalf("expected foreign real binary untouched by disable, stat err=%v", err)
+	}
+}
+
+// setTestHome isolates the user home for tests on every platform. Go's
+// os.UserHomeDir reads %USERPROFILE% on Windows (not $HOME), so tests that only
+// set HOME silently ran against the real user home on Windows: vscode apply /
+// migration flows would discover the real ~/.vscode/extensions and patch the
+// real extension bundle with a test sidecar. This helper makes both variables
+// point at the throwaway dir.
+func setTestHome(t *testing.T, home string) {
+	t.Helper()
+	t.Setenv("HOME", home)
+	t.Setenv("USERPROFILE", home)
+}
+
+func TestVSCodeDetectIgnoresStaleInstallState(t *testing.T) {
+	home := t.TempDir()
+	setTestHome(t, home)
+	t.Setenv("VSCODE_SERVER_EXTENSIONS_DIR", filepath.Join(home, ".vscode-server", "extensions"))
+
+	binaryPath := filepath.Join(home, "bin", "codex-feishu-relay")
+	writeExecutableFile(t, binaryPath, "wrapper-binary")
+
+	entrypoint := testVSCodeBundleEntrypoint(home, ".vscode-server", "1")
+	writeExecutableFile(t, entrypoint, "orig")
+
+	app, _, installStatePath := newVSCodeAdminTestApp(t, home, binaryPath, true)
+
+	// Stale state claims the integration is enabled, but no shim is on disk.
+	if err := install.WriteState(installStatePath, install.InstallState{
+		StatePath:        installStatePath,
+		BundleEntrypoint: entrypoint,
+		Integrations:     []install.WrapperIntegrationMode{install.IntegrationManagedShim},
+	}); err != nil {
+		t.Fatalf("WriteState: %v", err)
+	}
+
+	rec := performAdminRequest(t, app, http.MethodGet, "/api/admin/vscode/detect", "")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("detect status = %d, want 200 body=%s", rec.Code, rec.Body.String())
+	}
+	var detect vscodeDetectResponse
+	if err := json.NewDecoder(rec.Body).Decode(&detect); err != nil {
+		t.Fatalf("decode detect: %v", err)
+	}
+	if detect.RecordedBundleEntrypoint != "" {
+		t.Fatalf("recorded bundle entrypoint = %q, want empty (no shim on disk)", detect.RecordedBundleEntrypoint)
+	}
+	if workflowVSCodeReady(detect) {
+		t.Fatalf("expected workflow to report vscode not ready with stale state and no shim on disk, got %#v", detect)
+	}
+
+	// Now install the shim for real, then wipe the recorded entrypoint from
+	// state (state says disabled). Detect must still report ready because the
+	// disk carries the shim.
+	rec = performAdminRequest(t, app, http.MethodPost, "/api/admin/vscode/apply", `{"mode":"managed_shim"}`)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("apply status = %d, want 200 body=%s", rec.Code, rec.Body.String())
+	}
+	if err := install.WriteState(installStatePath, install.InstallState{StatePath: installStatePath}); err != nil {
+		t.Fatalf("WriteState(cleared): %v", err)
+	}
+
+	rec = performAdminRequest(t, app, http.MethodGet, "/api/admin/vscode/detect", "")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("detect status = %d, want 200 body=%s", rec.Code, rec.Body.String())
+	}
+	if err := json.NewDecoder(rec.Body).Decode(&detect); err != nil {
+		t.Fatalf("decode detect: %v", err)
+	}
+	if detect.RecordedBundleEntrypoint != entrypoint {
+		t.Fatalf("recorded bundle entrypoint = %q, want %q (derived from disk)", detect.RecordedBundleEntrypoint, entrypoint)
+	}
+	if !workflowVSCodeReady(detect) {
+		t.Fatalf("expected workflow to report vscode ready with shim on disk despite cleared state, got %#v", detect)
+	}
+}
+
+func newVSCodeAdminTestApp(t *testing.T, home, binaryPath string, sshSession bool) (*App, string, string) {
+	t.Helper()
+	return newVSCodeAdminTestAppWithGateway(t, &recordingGateway{}, home, binaryPath, sshSession)
+}
+
+func newVSCodeAdminTestAppWithGateway(t *testing.T, gateway feishu.Gateway, home, binaryPath string, sshSession bool) (*App, string, string) {
+	t.Helper()
+
+	cfg := config.DefaultAppConfig()
+	configPath := filepath.Join(t.TempDir(), "config.json")
+	if err := config.WriteAppConfig(configPath, cfg); err != nil {
+		t.Fatalf("WriteAppConfig: %v", err)
+	}
+	dataDir := filepath.Join(home, ".local", "share", "codex-feishu-relay")
+	installStatePath := filepath.Join(dataDir, "install-state.json")
+
+	app := New(":0", ":0", gateway, agentproto.ServerIdentity{
+		BinaryIdentity: agentproto.BinaryIdentity{Version: "dev"},
+	})
+	app.SetHeadlessRuntime(HeadlessRuntimeConfig{
+		BinaryPath: binaryPath,
+		Paths: relayruntime.Paths{
+			DataDir:  dataDir,
+			StateDir: filepath.Join(home, ".local", "state", "codex-feishu-relay"),
+		},
+	})
+	app.ConfigureAdmin(AdminRuntimeOptions{
+		ConfigPath:      configPath,
+		Services:        defaultFeishuServices(),
+		AdminListenHost: "127.0.0.1",
+		AdminListenPort: "9501",
+		AdminURL:        "http://localhost:9501/admin/",
+		SetupURL:        "http://localhost:9501/setup",
+		SSHSession:      sshSession,
+	})
+	return app, configPath, installStatePath
+}
+
+func testVSCodeBundleEntrypoint(home, extensionRoot, version string) string {
+	return filepath.Join(home, extensionRoot, "extensions", "openai.chatgpt-"+version, "bin", testCurrentPlatformBundleDir(), executableName("codex"))
+}
+
+func testNonCurrentPlatformBundleEntrypoint(home, extensionRoot, version string) string {
+	if runtime.GOOS == "windows" {
+		return filepath.Join(home, extensionRoot, "extensions", "openai.chatgpt-"+version, "bin", "linux-x86_64", "codex")
+	}
+	return filepath.Join(home, extensionRoot, "extensions", "openai.chatgpt-"+version, "bin", "windows-x86_64", "codex.exe")
+}
+
+func testCurrentPlatformBundleDir() string {
+	switch runtime.GOOS {
+	case "windows":
+		return "windows-" + testBundleArchSuffix()
+	case "darwin":
+		return "darwin-" + testBundleArchSuffix()
+	default:
+		return "linux-" + testBundleArchSuffix()
+	}
+}
+
+func testBundleArchSuffix() string {
+	if runtime.GOARCH == "arm64" {
+		return "arm64"
+	}
+	return "x86_64"
+}
+
+func writeExecutableFile(t *testing.T, path, content string) {
+	t.Helper()
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		t.Fatalf("MkdirAll(%s): %v", path, err)
+	}
+	if err := os.WriteFile(path, []byte(content), 0o755); err != nil {
+		t.Fatalf("WriteFile(%s): %v", path, err)
+	}
+}
+
+func readFileString(t *testing.T, path string) string {
+	t.Helper()
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("ReadFile(%s): %v", path, err)
+	}
+	return string(raw)
+}

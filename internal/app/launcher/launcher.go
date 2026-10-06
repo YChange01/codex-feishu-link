@@ -1,0 +1,200 @@
+package launcher
+
+import (
+	"context"
+	"fmt"
+	"io"
+	"os"
+
+	"github.com/YChange01/codex-feishu-link/internal/adapter/editor"
+	"github.com/YChange01/codex-feishu-link/internal/app/daemon"
+	"github.com/YChange01/codex-feishu-link/internal/app/install"
+	"github.com/YChange01/codex-feishu-link/internal/app/installshim"
+	"github.com/YChange01/codex-feishu-link/internal/app/wrapper"
+)
+
+type Options struct {
+	Args    []string
+	Stdin   io.Reader
+	Stdout  io.Writer
+	Stderr  io.Writer
+	Version string
+	Branch  string
+
+	Runners RunnerSet
+}
+
+type RunnerSet struct {
+	RunDaemon               func(context.Context, []string, string, string) error
+	RunInstall              func([]string, io.Reader, io.Writer, io.Writer, string) error
+	RunPackagedInstall      func([]string, io.Reader, io.Writer, io.Writer, string) error
+	RunPackagedInstallProbe func([]string, io.Reader, io.Writer, io.Writer, string) error
+	RunLocalUpgrade         func([]string, io.Reader, io.Writer, io.Writer, string) error
+	RunService              func([]string, io.Reader, io.Writer, io.Writer, string) error
+	RunUpgradeHelper        func([]string, io.Reader, io.Writer, io.Writer, string) error
+	RunWrapper              func(context.Context, []string, io.Reader, io.Writer, io.Writer, string, string) (int, error)
+}
+
+func Main(opts Options) int {
+	opts = withDefaults(opts)
+
+	// Register the editor integration used by install flows (bundle entrypoint
+	// detection + managed-shim patching). The unified shim binary does not go
+	// through launcher and never registers these, which keeps shim/embed
+	// out of the shim's link graph.
+	install.RegisterEditorHooks(editor.DetectBundleEntrypoints, func(p install.BundleEntrypointPatchOptions) error {
+		return editor.PatchBundleEntrypoint(editor.PatchBundleEntrypointOptions{
+			EntrypointPath:   p.EntrypointPath,
+			InstallStatePath: p.InstallStatePath,
+			ConfigPath:       p.ConfigPath,
+			InstanceID:       p.InstanceID,
+		})
+	})
+	install.RegisterUpgradeHelperShimHook(installshim.PrepareUpgradeHelperShim)
+
+	decision, err := Detect(opts.Args)
+	if err != nil {
+		_, _ = fmt.Fprintf(opts.Stderr, "error: %v\n\n%s", err, usageText())
+		return 2
+	}
+
+	switch decision.Role {
+	case RoleHelp:
+		_, _ = io.WriteString(opts.Stdout, usageText())
+		return 0
+	case RoleVersion:
+		_, _ = fmt.Fprintf(opts.Stdout, "%s\n", opts.Version)
+		return 0
+	}
+
+	ctx, stop, err := newMainContext(context.Background())
+	if err != nil {
+		_, _ = fmt.Fprintf(opts.Stderr, "signal setup error: %v\n", err)
+		return 1
+	}
+	defer stop()
+
+	switch decision.Role {
+	case RoleDaemon:
+		if err := opts.Runners.RunDaemon(ctx, decision.Args, opts.Version, opts.Branch); err != nil && err != context.Canceled {
+			_, _ = fmt.Fprintf(opts.Stderr, "service error: %v\n", err)
+			return 1
+		}
+		return 0
+	case RoleInstall:
+		if err := opts.Runners.RunInstall(decision.Args, opts.Stdin, opts.Stdout, opts.Stderr, opts.Version); err != nil {
+			_, _ = fmt.Fprintf(opts.Stderr, "install error: %v\n", err)
+			return 1
+		}
+		return 0
+	case RolePackagedInstall:
+		if err := opts.Runners.RunPackagedInstall(decision.Args, opts.Stdin, opts.Stdout, opts.Stderr, opts.Version); err != nil {
+			_, _ = fmt.Fprintf(opts.Stderr, "packaged install error: %v\n", err)
+			return 1
+		}
+		return 0
+	case RolePackagedInstallProbe:
+		if err := opts.Runners.RunPackagedInstallProbe(decision.Args, opts.Stdin, opts.Stdout, opts.Stderr, opts.Version); err != nil {
+			_, _ = fmt.Fprintf(opts.Stderr, "packaged install probe error: %v\n", err)
+			return 1
+		}
+		return 0
+	case RoleLocalUpgrade:
+		if err := opts.Runners.RunLocalUpgrade(decision.Args, opts.Stdin, opts.Stdout, opts.Stderr, opts.Version); err != nil {
+			_, _ = fmt.Fprintf(opts.Stderr, "local upgrade error: %v\n", err)
+			return 1
+		}
+		return 0
+	case RoleService:
+		if err := opts.Runners.RunService(decision.Args, opts.Stdin, opts.Stdout, opts.Stderr, opts.Version); err != nil {
+			_, _ = fmt.Fprintf(opts.Stderr, "service error: %v\n", err)
+			return 1
+		}
+		return 0
+	case RoleUpgradeHelper:
+		if err := opts.Runners.RunUpgradeHelper(decision.Args, opts.Stdin, opts.Stdout, opts.Stderr, opts.Version); err != nil {
+			_, _ = fmt.Fprintf(opts.Stderr, "upgrade helper error: %v\n", err)
+			return 1
+		}
+		return 0
+	case RoleWrapper:
+		exitCode, err := opts.Runners.RunWrapper(ctx, decision.Args, opts.Stdin, opts.Stdout, opts.Stderr, opts.Version, opts.Branch)
+		if err != nil && err != context.Canceled {
+			_, _ = fmt.Fprintf(opts.Stderr, "wrapper error: %v\n", err)
+			if exitCode == 0 {
+				return 1
+			}
+			return exitCode
+		}
+		return exitCode
+	default:
+		_, _ = fmt.Fprintf(opts.Stderr, "error: unhandled role %q\n", decision.Role)
+		return 1
+	}
+}
+
+func withDefaults(opts Options) Options {
+	if opts.Stdin == nil {
+		opts.Stdin = os.Stdin
+	}
+	if opts.Stdout == nil {
+		opts.Stdout = os.Stdout
+	}
+	if opts.Stderr == nil {
+		opts.Stderr = os.Stderr
+	}
+	if opts.Version == "" {
+		opts.Version = "dev"
+	}
+	if opts.Branch == "" {
+		opts.Branch = "dev"
+	}
+	if opts.Runners.RunDaemon == nil {
+		opts.Runners.RunDaemon = daemon.RunMainWithArgs
+	}
+	if opts.Runners.RunInstall == nil {
+		opts.Runners.RunInstall = install.RunMain
+	}
+	if opts.Runners.RunPackagedInstall == nil {
+		opts.Runners.RunPackagedInstall = install.RunPackagedInstall
+	}
+	if opts.Runners.RunPackagedInstallProbe == nil {
+		opts.Runners.RunPackagedInstallProbe = install.RunPackagedInstallProbe
+	}
+	if opts.Runners.RunLocalUpgrade == nil {
+		opts.Runners.RunLocalUpgrade = install.RunLocalUpgrade
+	}
+	if opts.Runners.RunService == nil {
+		opts.Runners.RunService = install.RunService
+	}
+	if opts.Runners.RunUpgradeHelper == nil {
+		opts.Runners.RunUpgradeHelper = install.RunUpgradeHelper
+	}
+	if opts.Runners.RunWrapper == nil {
+		opts.Runners.RunWrapper = wrapper.RunMain
+	}
+	return opts
+}
+
+func usageText() string {
+	return `Usage:
+  codex-feishu-relay
+  codex-feishu-relay daemon [flags]
+  codex-feishu-relay install [flags]
+  codex-feishu-relay packaged-install [flags]
+  codex-feishu-relay packaged-install-probe [flags]
+  codex-feishu-relay local-upgrade [flags]
+  codex-feishu-relay service <subcommand> [flags]
+  codex-feishu-relay app-server [codex app-server args...]
+  codex-feishu-relay claude-app-server [claude app-server args...]
+  codex-feishu-relay wrapper app-server [codex app-server args...]
+  codex-feishu-relay wrapper claude-app-server [claude app-server args...]
+  codex-feishu-relay version
+  codex-feishu-relay help
+
+Notes:
+  - no arguments defaults to service mode
+  - wrapper role supports Codex and Claude app-server modes
+  - unknown top-level commands do not fall through to wrapper
+`
+}

@@ -1,0 +1,157 @@
+package orchestrator
+
+import (
+	"strings"
+	"time"
+
+	"github.com/YChange01/codex-feishu-link/internal/core/agentproto"
+	"github.com/YChange01/codex-feishu-link/internal/core/eventcontract"
+	"github.com/YChange01/codex-feishu-link/internal/core/state"
+)
+
+func (s *Service) clearSurfaceDispatchWaits(surface *state.SurfaceConsoleRecord) {
+	if surface == nil {
+		return
+	}
+	delete(s.handoffUntil, surface.SurfaceSessionID)
+	delete(s.pausedUntil, surface.SurfaceSessionID)
+}
+
+func (s *Service) resetSurfaceExecutionGates(surface *state.SurfaceConsoleRecord) {
+	if surface == nil {
+		return
+	}
+	surface.ActiveTurnOrigin = ""
+	s.restoreSurfaceDispatchNormal(surface)
+	surface.Abandoning = false
+	delete(s.abandoningUntil, surface.SurfaceSessionID)
+}
+
+func (s *Service) enterPromptDispatchRestartPendingRoute(surface *state.SurfaceConsoleRecord, workspaceKey string) bool {
+	workspaceKey = normalizeWorkspaceClaimKey(workspaceKey)
+	if surface == nil || workspaceKey == "" {
+		return false
+	}
+	if !s.transitionSurfaceRouteCore(surface, nil, surfaceRouteCoreState{WorkspaceKey: workspaceKey}) {
+		return false
+	}
+	if s.surfaceUsesWorkspaceClaims(surface) {
+		s.bindWorkspaceClaim(surface, workspaceKey)
+	}
+	return true
+}
+
+func (s *Service) finishPromptDispatchRestartPendingRoute(surface *state.SurfaceConsoleRecord, pending *state.HeadlessLaunchRecord) {
+	if surface == nil || pending == nil || pending.Purpose != state.HeadlessLaunchPurposePromptDispatchRestart {
+		return
+	}
+	workspaceKey := pendingHeadlessWorkspaceClaimKey(pending)
+	if workspaceKey == "" {
+		workspaceKey = normalizeWorkspaceClaimKey(surface.ClaimedWorkspaceKey)
+	}
+	if workspaceKey == "" {
+		_ = s.transitionSurfaceRouteCore(surface, nil, surfaceRouteCoreState{})
+		return
+	}
+	_ = s.enterPromptDispatchRestartPendingRoute(surface, workspaceKey)
+}
+
+func (s *Service) finishWorkspaceRouteRestartPendingRoute(surface *state.SurfaceConsoleRecord, pending *state.HeadlessLaunchRecord) {
+	if surface == nil || pending == nil || pending.Purpose != state.HeadlessLaunchPurposeWorkspaceRouteRestart {
+		return
+	}
+	workspaceKey := pendingHeadlessWorkspaceClaimKey(pending)
+	if workspaceKey == "" {
+		_ = s.transitionSurfaceRouteCore(surface, nil, surfaceRouteCoreState{})
+		return
+	}
+	_ = s.transitionSurfaceRouteCore(surface, nil, surfaceRouteCoreState{WorkspaceKey: workspaceKey})
+	if s.surfaceUsesWorkspaceClaims(surface) {
+		s.bindWorkspaceClaim(surface, workspaceKey)
+	}
+}
+
+func (s *Service) prepareSurfaceForExecutionReattachWithOverlayCleanup(surface *state.SurfaceConsoleRecord, cleanup surfaceOverlayRouteCleanupOptions) []eventcontract.Event {
+	if surface == nil {
+		return nil
+	}
+	preservedOpenCodeRuntimeOverride := state.ModelConfigRecord{}
+	if agentproto.NormalizeBackend(state.SurfaceDesiredBackendContract(surface).Backend) == agentproto.BackendOpenCode {
+		preservedOpenCodeRuntimeOverride = state.NormalizePromptOverrideForBackend(agentproto.BackendOpenCode, surface.PromptOverride)
+	}
+	events := s.discardDrafts(surface)
+	if strings.TrimSpace(surface.AttachedInstanceID) != "" {
+		events = append(events, s.finalizeDetachedSurfaceWithOverlayCleanup(surface, cleanup)...)
+	} else {
+		events = append(events, s.cleanupContextBoundSurfaceOverlays(surface, "当前工作目标已变化", surfaceOverlayRouteCleanupOptions{
+			PreserveTargetPicker:  cleanup.PreserveTargetPicker,
+			ForceClearReviewState: true,
+		})...)
+		clearAutoContinueRuntime(surface)
+		clearSurfaceRequests(surface)
+		s.clearPreparedNewThreadRouteCore(surface)
+	}
+	surface.PromptOverride = preservedOpenCodeRuntimeOverride
+	s.consumeSurfacePendingHeadlessLaunch(surface, "")
+	s.clearSurfaceActiveQueueItem(surface, "")
+	s.resetSurfaceExecutionGates(surface)
+	return events
+}
+
+func (s *Service) pendingSurfaceHeadlessLaunch(surface *state.SurfaceConsoleRecord, instanceID string) *state.HeadlessLaunchRecord {
+	if surface == nil || surface.PendingHeadless == nil {
+		return nil
+	}
+	instanceID = strings.TrimSpace(instanceID)
+	if instanceID != "" && strings.TrimSpace(surface.PendingHeadless.InstanceID) != instanceID {
+		return nil
+	}
+	return surface.PendingHeadless
+}
+
+func (s *Service) adoptSurfacePendingHeadlessLaunch(surface *state.SurfaceConsoleRecord, pending *state.HeadlessLaunchRecord) {
+	if surface == nil {
+		return
+	}
+	s.resetSurfaceExecutionGates(surface)
+	surface.PendingHeadless = pending
+}
+
+func (s *Service) consumeSurfacePendingHeadlessLaunch(surface *state.SurfaceConsoleRecord, instanceID string) *state.HeadlessLaunchRecord {
+	pending := s.pendingSurfaceHeadlessLaunch(surface, instanceID)
+	if pending == nil {
+		return nil
+	}
+	surface.PendingHeadless = nil
+	return pending
+}
+
+func (s *Service) RecordPendingHeadlessCodexRuntime(surfaceID, instanceID string, admissionRef *state.CodexAdmissionRef, connection *state.CodexConnectionContract, threadPolicy *state.CodexThreadPolicy) {
+	surface := s.root.Surfaces[strings.TrimSpace(surfaceID)]
+	pending := s.pendingSurfaceHeadlessLaunch(surface, instanceID)
+	if pending == nil {
+		return
+	}
+	pending.CodexAdmissionRef = state.NormalizeCodexAdmissionRef(admissionRef)
+	pending.CodexConnectionContract = state.CloneCodexConnectionContract(connection)
+	pending.CodexThreadPolicy = state.CloneCodexThreadPolicy(threadPolicy)
+}
+
+func (s *Service) RecordPendingHeadlessOpenCodeRuntime(surfaceID, instanceID string, admissionRef *state.OpenCodeAdmissionRef) {
+	surface := s.root.Surfaces[strings.TrimSpace(surfaceID)]
+	pending := s.pendingSurfaceHeadlessLaunch(surface, instanceID)
+	if pending == nil {
+		return
+	}
+	pending.OpenCodeAdmissionRef = state.NormalizeOpenCodeAdmissionRef(admissionRef)
+}
+
+func (s *Service) setSurfaceDetachAbandoning(surface *state.SurfaceConsoleRecord, until time.Time) {
+	if surface == nil {
+		return
+	}
+	surface.Abandoning = true
+	if !until.IsZero() {
+		s.abandoningUntil[surface.SurfaceSessionID] = until
+	}
+}

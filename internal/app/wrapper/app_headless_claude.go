@@ -1,0 +1,87 @@
+package wrapper
+
+import (
+	"bufio"
+	"bytes"
+	"encoding/json"
+	"fmt"
+	"io"
+	"os"
+	"strings"
+
+	"github.com/YChange01/codex-feishu-link/internal/config"
+	"github.com/YChange01/codex-feishu-link/internal/core/agentproto"
+	"github.com/YChange01/codex-feishu-link/internal/debuglog"
+)
+
+func (a *App) bootstrapClaude(childStdin io.Writer, childStdout io.Reader, rawLogger *debuglog.RawLogger, reportProblem func(agentproto.ErrorInfo)) (io.Reader, error) {
+	frame, err := a.claudeBootstrapInitializeFrame()
+	if err != nil {
+		return nil, err
+	}
+	if err := writeChildFrameForRuntime(childStdin, frame, a.runtime, a.debugf, rawLogger, reportProblem); err != nil {
+		return nil, err
+	}
+
+	reader := bufio.NewReader(childStdout)
+	var replay bytes.Buffer
+	for {
+		line, readErr := reader.ReadBytes('\n')
+		if len(line) > 0 {
+			logRawFrame(rawLogger, "codex.stdout", "in", line, "", "")
+			a.debugf("claude bootstrap: stdout from child: %s", summarizeFrame(line))
+			matched, err := matchClaudeBootstrapInitializeResponse(line)
+			if err != nil {
+				return nil, err
+			}
+			if matched {
+				return io.MultiReader(bytes.NewReader(replay.Bytes()), reader), nil
+			}
+			replay.Write(line)
+		}
+		if readErr == nil {
+			continue
+		}
+		if readErr == io.EOF {
+			return nil, fmt.Errorf("claude bootstrap: initialize response %q not received before stdout closed", relayBootstrapInitializeID)
+		}
+		return nil, readErr
+	}
+}
+
+func (a *App) claudeBootstrapInitializeFrame() ([]byte, error) {
+	request := map[string]any{
+		"subtype": "initialize",
+		"hooks":   map[string]any{},
+	}
+	if instruction := strings.TrimSpace(os.Getenv(config.ClaudeAppendSystemPromptEnv)); instruction != "" {
+		request["appendSystemPrompt"] = instruction
+	}
+	bytes, err := json.Marshal(map[string]any{
+		"type":       "control_request",
+		"request_id": relayBootstrapInitializeID,
+		"request":    request,
+	})
+	if err != nil {
+		return nil, err
+	}
+	return append(bytes, '\n'), nil
+}
+
+func matchClaudeBootstrapInitializeResponse(line []byte) (bool, error) {
+	var message map[string]any
+	if err := json.Unmarshal(line, &message); err != nil {
+		return false, nil
+	}
+	if strings.TrimSpace(lookupStringFromMap(message, "type")) != "control_response" {
+		return false, nil
+	}
+	response, _ := message["response"].(map[string]any)
+	if strings.TrimSpace(lookupStringFromMap(response, "request_id")) != relayBootstrapInitializeID {
+		return false, nil
+	}
+	if subtype := strings.TrimSpace(lookupStringFromMap(response, "subtype")); subtype != "success" {
+		return true, fmt.Errorf("claude bootstrap initialize failed: %s", strings.TrimSpace(lookupStringFromMap(response, "error")))
+	}
+	return true, nil
+}

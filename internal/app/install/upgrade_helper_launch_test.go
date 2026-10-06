@@ -1,0 +1,229 @@
+package install
+
+import (
+	"context"
+	"path/filepath"
+	"runtime"
+	"strings"
+	"testing"
+
+	relayruntime "github.com/YChange01/codex-feishu-link/internal/runtime"
+	"github.com/YChange01/codex-feishu-link/internal/testutil"
+)
+
+func TestStartUpgradeHelperProcessUsesServiceRuntimeGOOSForSystemdEligibility(t *testing.T) {
+	originalGOOS := serviceRuntimeGOOS
+	serviceRuntimeGOOS = "darwin"
+	t.Cleanup(func() { serviceRuntimeGOOS = originalGOOS })
+
+	originalDetached := upgradeHelperStartDetachedCommandFunc
+	originalSystemd := upgradeHelperStartSystemdUserTransientFunc
+	t.Cleanup(func() {
+		upgradeHelperStartDetachedCommandFunc = originalDetached
+		upgradeHelperStartSystemdUserTransientFunc = originalSystemd
+	})
+
+	var detached relayruntime.DetachedCommandOptions
+	upgradeHelperStartDetachedCommandFunc = func(opts relayruntime.DetachedCommandOptions) (int, error) {
+		detached = opts
+		return 123, nil
+	}
+	upgradeHelperStartSystemdUserTransientFunc = func(context.Context, systemdUserTransientCommandOptions) (string, error) {
+		t.Fatal("unexpected systemd-run launcher for non-linux service runtime")
+		return "", nil
+	}
+
+	result, err := StartUpgradeHelperProcess(context.Background(), UpgradeHelperLaunchOptions{
+		State:        InstallState{ServiceManager: ServiceManagerSystemdUser},
+		HelperBinary: testutil.WorkspacePath("tmp", "helper"),
+		StatePath:    testutil.WorkspacePath("tmp", "install-state.json"),
+	})
+	if err != nil {
+		t.Fatalf("StartUpgradeHelperProcess: %v", err)
+	}
+	if result.UnitName != "" {
+		t.Fatalf("unit name = %q, want empty for non-linux service runtime", result.UnitName)
+	}
+	if !testutil.SamePath(detached.BinaryPath, testutil.WorkspacePath("tmp", "helper")) {
+		t.Fatalf("detached binary = %q, want helper path", detached.BinaryPath)
+	}
+}
+
+func TestStartUpgradeHelperProcessUsesDetachedCommandForDetachedService(t *testing.T) {
+	originalDetached := upgradeHelperStartDetachedCommandFunc
+	originalSystemd := upgradeHelperStartSystemdUserTransientFunc
+	defer func() {
+		upgradeHelperStartDetachedCommandFunc = originalDetached
+		upgradeHelperStartSystemdUserTransientFunc = originalSystemd
+	}()
+
+	var detached relayruntime.DetachedCommandOptions
+	upgradeHelperStartDetachedCommandFunc = func(opts relayruntime.DetachedCommandOptions) (int, error) {
+		detached = opts
+		return 123, nil
+	}
+	upgradeHelperStartSystemdUserTransientFunc = func(context.Context, systemdUserTransientCommandOptions) (string, error) {
+		t.Fatal("unexpected systemd-run launcher")
+		return "", nil
+	}
+
+	result, err := StartUpgradeHelperProcess(context.Background(), UpgradeHelperLaunchOptions{
+		State: InstallState{
+			ServiceManager: ServiceManagerDetached,
+		},
+		HelperBinary: testutil.WorkspacePath("tmp", "helper"),
+		StatePath:    testutil.WorkspacePath("tmp", "install-state.json"),
+		LogPath:      testutil.WorkspacePath("tmp", "helper.log"),
+		Env:          []string{"A=B"},
+		WorkDir:      testutil.WorkspacePath("tmp", "work"),
+	})
+	if err != nil {
+		t.Fatalf("StartUpgradeHelperProcess: %v", err)
+	}
+	if result.UnitName != "" {
+		t.Fatalf("unit name = %q, want empty for detached helper", result.UnitName)
+	}
+	if !testutil.SamePath(detached.BinaryPath, testutil.WorkspacePath("tmp", "helper")) {
+		t.Fatalf("binary = %q, want %q", detached.BinaryPath, testutil.WorkspacePath("tmp", "helper"))
+	}
+	if len(detached.Args) != 3 || detached.Args[0] != "upgrade-helper" || detached.Args[1] != "-state-path" || !testutil.SamePath(detached.Args[2], testutil.WorkspacePath("tmp", "install-state.json")) {
+		t.Fatalf("args = %#v, want upgrade-helper -state-path <state-path>", detached.Args)
+	}
+	if !testutil.SamePath(detached.WorkDir, testutil.WorkspacePath("tmp", "work")) {
+		t.Fatalf("workdir = %q, want %q", detached.WorkDir, testutil.WorkspacePath("tmp", "work"))
+	}
+	if !testutil.SamePath(detached.StdoutPath, testutil.WorkspacePath("tmp", "helper.log")) || !testutil.SamePath(detached.StderrPath, testutil.WorkspacePath("tmp", "helper.log")) {
+		t.Fatalf("stdout/stderr = %q %q, want helper log", detached.StdoutPath, detached.StderrPath)
+	}
+}
+
+func TestStartUpgradeHelperProcessCanonicalizesExtendedLaunchPaths(t *testing.T) {
+	originalDetached := upgradeHelperStartDetachedCommandFunc
+	originalSystemd := upgradeHelperStartSystemdUserTransientFunc
+	defer func() {
+		upgradeHelperStartDetachedCommandFunc = originalDetached
+		upgradeHelperStartSystemdUserTransientFunc = originalSystemd
+	}()
+
+	var detached relayruntime.DetachedCommandOptions
+	upgradeHelperStartDetachedCommandFunc = func(opts relayruntime.DetachedCommandOptions) (int, error) {
+		detached = opts
+		return 123, nil
+	}
+	upgradeHelperStartSystemdUserTransientFunc = func(context.Context, systemdUserTransientCommandOptions) (string, error) {
+		t.Fatal("unexpected systemd-run launcher")
+		return "", nil
+	}
+
+	_, err := StartUpgradeHelperProcess(context.Background(), UpgradeHelperLaunchOptions{
+		State:        InstallState{ServiceManager: ServiceManagerDetached},
+		HelperBinary: `//?/C:/repo/helper.exe`,
+		StatePath:    `\\?\C:\repo\install-state.json`,
+		LogPath:      `//?/C:/repo/helper.log`,
+		WorkDir:      `\\?\C:\repo`,
+	})
+	if err != nil {
+		t.Fatalf("StartUpgradeHelperProcess: %v", err)
+	}
+	if detached.BinaryPath != `C:\repo\helper.exe` {
+		t.Fatalf("BinaryPath = %q, want native extended-prefix-free path", detached.BinaryPath)
+	}
+	if len(detached.Args) != 3 || detached.Args[2] != `C:\repo\install-state.json` {
+		t.Fatalf("Args = %#v, want canonical state path", detached.Args)
+	}
+	if detached.WorkDir != `C:\repo` {
+		t.Fatalf("WorkDir = %q, want native extended-prefix-free path", detached.WorkDir)
+	}
+	if detached.StdoutPath != `C:\repo\helper.log` || detached.StderrPath != `C:\repo\helper.log` {
+		t.Fatalf("stdout/stderr = %q/%q, want native extended-prefix-free log path", detached.StdoutPath, detached.StderrPath)
+	}
+}
+
+func TestStartUpgradeHelperProcessUsesSystemdRunForSystemdUser(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("systemd user service is linux-only")
+	}
+
+	originalDetached := upgradeHelperStartDetachedCommandFunc
+	originalSystemd := upgradeHelperStartSystemdUserTransientFunc
+	defer func() {
+		upgradeHelperStartDetachedCommandFunc = originalDetached
+		upgradeHelperStartSystemdUserTransientFunc = originalSystemd
+	}()
+
+	var transient systemdUserTransientCommandOptions
+	upgradeHelperStartDetachedCommandFunc = func(relayruntime.DetachedCommandOptions) (int, error) {
+		t.Fatal("unexpected detached launcher")
+		return 0, nil
+	}
+	upgradeHelperStartSystemdUserTransientFunc = func(_ context.Context, opts systemdUserTransientCommandOptions) (string, error) {
+		transient = opts
+		return "codex-feishu-relay-upgrade-helper-test.service", nil
+	}
+
+	result, err := StartUpgradeHelperProcess(context.Background(), UpgradeHelperLaunchOptions{
+		State: InstallState{
+			ServiceManager: ServiceManagerSystemdUser,
+		},
+		HelperBinary: testutil.WorkspacePath("tmp", "helper"),
+		StatePath:    testutil.WorkspacePath("tmp", "install-state.json"),
+		LogPath:      testutil.WorkspacePath("tmp", "helper.log"),
+		Env:          []string{"A=B"},
+		WorkDir:      testutil.WorkspacePath("tmp", "work"),
+	})
+	if err != nil {
+		t.Fatalf("StartUpgradeHelperProcess: %v", err)
+	}
+	if result.UnitName != transient.UnitName {
+		t.Fatalf("result unit name = %q, want %q", result.UnitName, transient.UnitName)
+	}
+	if !testutil.SamePath(transient.BinaryPath, testutil.WorkspacePath("tmp", "helper")) {
+		t.Fatalf("binary = %q, want %q", transient.BinaryPath, testutil.WorkspacePath("tmp", "helper"))
+	}
+	if len(transient.Args) != 3 || transient.Args[0] != "upgrade-helper" || transient.Args[1] != "-state-path" || !testutil.SamePath(transient.Args[2], testutil.WorkspacePath("tmp", "install-state.json")) {
+		t.Fatalf("args = %#v, want upgrade-helper -state-path <state-path>", transient.Args)
+	}
+	if !testutil.SamePath(transient.WorkDir, testutil.WorkspacePath("tmp", "work")) {
+		t.Fatalf("workdir = %q, want %q", transient.WorkDir, testutil.WorkspacePath("tmp", "work"))
+	}
+	if !testutil.SamePath(transient.LogPath, testutil.WorkspacePath("tmp", "helper.log")) {
+		t.Fatalf("log path = %q, want %q", transient.LogPath, testutil.WorkspacePath("tmp", "helper.log"))
+	}
+	if !strings.HasPrefix(transient.UnitName, "codex-feishu-relay-upgrade-helper-") || filepath.Ext(transient.UnitName) != ".service" {
+		t.Fatalf("unit name = %q, want codex-feishu-relay-upgrade-helper-*.service", transient.UnitName)
+	}
+}
+
+func TestStartUpgradeHelperProcessDirectExecUsesNoSubcommandArgs(t *testing.T) {
+	originalDetached := upgradeHelperStartDetachedCommandFunc
+	originalSystemd := upgradeHelperStartSystemdUserTransientFunc
+	defer func() {
+		upgradeHelperStartDetachedCommandFunc = originalDetached
+		upgradeHelperStartSystemdUserTransientFunc = originalSystemd
+	}()
+
+	var detached relayruntime.DetachedCommandOptions
+	upgradeHelperStartDetachedCommandFunc = func(opts relayruntime.DetachedCommandOptions) (int, error) {
+		detached = opts
+		return 123, nil
+	}
+	upgradeHelperStartSystemdUserTransientFunc = func(context.Context, systemdUserTransientCommandOptions) (string, error) {
+		t.Fatal("unexpected systemd-run launcher")
+		return "", nil
+	}
+
+	_, err := StartUpgradeHelperProcess(context.Background(), UpgradeHelperLaunchOptions{
+		State: InstallState{
+			ServiceManager: ServiceManagerDetached,
+		},
+		HelperBinary: testutil.WorkspacePath("tmp", "upgrade-shim"),
+		StatePath:    testutil.WorkspacePath("tmp", "install-state.json"),
+		DirectExec:   true,
+	})
+	if err != nil {
+		t.Fatalf("StartUpgradeHelperProcess: %v", err)
+	}
+	if len(detached.Args) != 0 {
+		t.Fatalf("args = %#v, want empty for direct shim", detached.Args)
+	}
+}

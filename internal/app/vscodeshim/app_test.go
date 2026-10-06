@@ -1,0 +1,264 @@
+package vscodeshim
+
+import (
+	"encoding/json"
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+
+	"github.com/YChange01/codex-feishu-link/internal/shim"
+)
+
+func TestResolveLaunchPlanUsesStateBinding(t *testing.T) {
+	dir := t.TempDir()
+	entrypoint := filepath.Join(dir, "bundle", "codex")
+	realPath := shim.RealBinaryPath(entrypoint)
+	sidecarPath := shim.SidecarPath(entrypoint)
+	statePath := filepath.Join(dir, "install-state.json")
+	configPath := filepath.Join(dir, "config.json")
+	targetBinary := filepath.Join(dir, "bin", "codex-feishu-relay")
+
+	writeExecutable(t, realPath, "real-codex")
+	writeExecutable(t, targetBinary, "codex-feishu-relay")
+	writeConfigFile(t, configPath)
+	writeInstallStateFile(t, statePath, map[string]string{
+		"configPath":        configPath,
+		"currentBinaryPath": targetBinary,
+	})
+	if err := shim.WriteSidecar(sidecarPath, shim.Sidecar{
+		InstallStatePath: statePath,
+		ConfigPath:       configPath,
+		InstanceID:       "stable",
+	}, shim.ModeManaged); err != nil {
+		t.Fatalf("WriteSidecar: %v", err)
+	}
+
+	plan, err := resolveLaunchPlan(entrypoint, []string{"PATH=/bin"})
+	if err != nil {
+		t.Fatalf("resolveLaunchPlan: %v", err)
+	}
+	if plan.Fallback {
+		t.Fatal("did not expect fallback plan")
+	}
+	if plan.BinaryPath != targetBinary {
+		t.Fatalf("BinaryPath = %q, want %q", plan.BinaryPath, targetBinary)
+	}
+	if envValue(plan.Env, "CODEX_FEISHU_RELAY_CONFIG") != configPath {
+		t.Fatalf("CODEX_FEISHU_RELAY_CONFIG = %q", envValue(plan.Env, "CODEX_FEISHU_RELAY_CONFIG"))
+	}
+	if envValue(plan.Env, "CODEX_REAL_BINARY") != realPath {
+		t.Fatalf("CODEX_REAL_BINARY = %q", envValue(plan.Env, "CODEX_REAL_BINARY"))
+	}
+}
+
+func TestLoadInstallStateCanonicalizesWindowsExtendedPaths(t *testing.T) {
+	dir := t.TempDir()
+	statePath := filepath.Join(dir, "install-state.json")
+	writeInstallStateFile(t, statePath, map[string]string{
+		"configPath":             `//?/C:/repo/config/config.json`,
+		"currentBinaryPath":      `\\?\C:\repo\bin\codex-feishu-relay.exe`,
+		"installedBinary":        `//?/C:/legacy/bin/codex-feishu-relay.exe`,
+		"installedWrapperBinary": `\\?\C:\legacy\wrapper\codex-feishu-relay.exe`,
+	})
+
+	state, err := loadInstallState(statePath)
+	if err != nil {
+		t.Fatalf("loadInstallState: %v", err)
+	}
+	if state.ConfigPath != `C:\repo\config\config.json` {
+		t.Fatalf("ConfigPath = %q, want native extended-prefix-free path", state.ConfigPath)
+	}
+	if state.CurrentBinaryPath != `C:\repo\bin\codex-feishu-relay.exe` {
+		t.Fatalf("CurrentBinaryPath = %q, want native extended-prefix-free path", state.CurrentBinaryPath)
+	}
+	if state.InstalledBinary != `C:\legacy\bin\codex-feishu-relay.exe` {
+		t.Fatalf("InstalledBinary = %q, want native extended-prefix-free path", state.InstalledBinary)
+	}
+	if state.InstalledWrapperBinary != `C:\legacy\wrapper\codex-feishu-relay.exe` {
+		t.Fatalf("InstalledWrapperBinary = %q, want native extended-prefix-free path", state.InstalledWrapperBinary)
+	}
+}
+
+func TestManagedShimEnvCanonicalizesWindowsExtendedPaths(t *testing.T) {
+	env := withManagedShimEnv([]string{"PATH=/bin"}, `//?/C:/repo/config/config.json`, `\\?\C:\repo\bin\codex.real.exe`)
+	if got := envValue(env, "CODEX_FEISHU_RELAY_CONFIG"); got != `C:\repo\config\config.json` {
+		t.Fatalf("CODEX_FEISHU_RELAY_CONFIG = %q, want native extended-prefix-free path", got)
+	}
+	if got := envValue(env, "CODEX_REAL_BINARY"); got != `C:\repo\bin\codex.real.exe` {
+		t.Fatalf("CODEX_REAL_BINARY = %q, want native extended-prefix-free path", got)
+	}
+}
+
+func TestResolveLaunchPlanFallsBackWhenConfigIsMissing(t *testing.T) {
+	dir := t.TempDir()
+	entrypoint := filepath.Join(dir, "bundle", "codex")
+	realPath := shim.RealBinaryPath(entrypoint)
+	sidecarPath := shim.SidecarPath(entrypoint)
+	statePath := filepath.Join(dir, "install-state.json")
+	targetBinary := filepath.Join(dir, "bin", "codex-feishu-relay")
+
+	writeExecutable(t, realPath, "real-codex")
+	writeExecutable(t, targetBinary, "codex-feishu-relay")
+	writeInstallStateFile(t, statePath, map[string]string{
+		"configPath":        filepath.Join(dir, "missing-config.json"),
+		"currentBinaryPath": targetBinary,
+	})
+	if err := shim.WriteSidecar(sidecarPath, shim.Sidecar{
+		InstallStatePath: statePath,
+		ConfigPath:       filepath.Join(dir, "missing-config.json"),
+	}, shim.ModeManaged); err != nil {
+		t.Fatalf("WriteSidecar: %v", err)
+	}
+
+	plan, err := resolveLaunchPlan(entrypoint, []string{"PATH=/bin"})
+	if err != nil {
+		t.Fatalf("resolveLaunchPlan: %v", err)
+	}
+	if !plan.Fallback {
+		t.Fatal("expected fallback plan")
+	}
+	if plan.BinaryPath != realPath {
+		t.Fatalf("BinaryPath = %q, want %q", plan.BinaryPath, realPath)
+	}
+}
+
+func TestResolveLaunchPlanRejectsRecursiveTargetAndFallsBack(t *testing.T) {
+	dir := t.TempDir()
+	entrypoint := filepath.Join(dir, "bundle", "codex")
+	realPath := shim.RealBinaryPath(entrypoint)
+	sidecarPath := shim.SidecarPath(entrypoint)
+	statePath := filepath.Join(dir, "install-state.json")
+	configPath := filepath.Join(dir, "config.json")
+
+	writeExecutable(t, realPath, "real-codex")
+	writeConfigFile(t, configPath)
+	writeInstallStateFile(t, statePath, map[string]string{
+		"configPath":        configPath,
+		"currentBinaryPath": entrypoint,
+	})
+	if err := shim.WriteSidecar(sidecarPath, shim.Sidecar{
+		InstallStatePath: statePath,
+		ConfigPath:       configPath,
+	}, shim.ModeManaged); err != nil {
+		t.Fatalf("WriteSidecar: %v", err)
+	}
+
+	plan, err := resolveLaunchPlan(entrypoint, []string{"PATH=/bin"})
+	if err != nil {
+		t.Fatalf("resolveLaunchPlan: %v", err)
+	}
+	if !plan.Fallback {
+		t.Fatal("expected recursive target to fall back")
+	}
+	if plan.BinaryPath != realPath {
+		t.Fatalf("BinaryPath = %q, want %q", plan.BinaryPath, realPath)
+	}
+}
+
+func TestResolveLaunchPlanKeepsPerEntrypointBindingsSeparate(t *testing.T) {
+	dir := t.TempDir()
+
+	entrypointA := filepath.Join(dir, "bundle-a", "codex")
+	entrypointB := filepath.Join(dir, "bundle-b", "codex")
+	realA := shim.RealBinaryPath(entrypointA)
+	realB := shim.RealBinaryPath(entrypointB)
+	stateA := filepath.Join(dir, "instance-a", "install-state.json")
+	stateB := filepath.Join(dir, "instance-b", "install-state.json")
+	configA := filepath.Join(dir, "instance-a", "config.json")
+	configB := filepath.Join(dir, "instance-b", "config.json")
+	targetA := filepath.Join(dir, "instance-a", "bin", "codex-feishu-relay")
+	targetB := filepath.Join(dir, "instance-b", "bin", "codex-feishu-relay")
+
+	writeExecutable(t, realA, "real-a")
+	writeExecutable(t, realB, "real-b")
+	writeExecutable(t, targetA, "codex-feishu-relay-a")
+	writeExecutable(t, targetB, "codex-feishu-relay-b")
+	writeConfigFile(t, configA)
+	writeConfigFile(t, configB)
+	writeInstallStateFile(t, stateA, map[string]string{
+		"configPath":        configA,
+		"currentBinaryPath": targetA,
+	})
+	writeInstallStateFile(t, stateB, map[string]string{
+		"configPath":        configB,
+		"currentBinaryPath": targetB,
+	})
+	if err := shim.WriteSidecar(shim.SidecarPath(entrypointA), shim.Sidecar{
+		InstallStatePath: stateA,
+		ConfigPath:       configA,
+		InstanceID:       "instance-a",
+	}, shim.ModeManaged); err != nil {
+		t.Fatalf("WriteSidecar(a): %v", err)
+	}
+	if err := shim.WriteSidecar(shim.SidecarPath(entrypointB), shim.Sidecar{
+		InstallStatePath: stateB,
+		ConfigPath:       configB,
+		InstanceID:       "instance-b",
+	}, shim.ModeManaged); err != nil {
+		t.Fatalf("WriteSidecar(b): %v", err)
+	}
+
+	planA, err := resolveLaunchPlan(entrypointA, nil)
+	if err != nil {
+		t.Fatalf("resolveLaunchPlan(a): %v", err)
+	}
+	planB, err := resolveLaunchPlan(entrypointB, nil)
+	if err != nil {
+		t.Fatalf("resolveLaunchPlan(b): %v", err)
+	}
+
+	if planA.BinaryPath != targetA || planB.BinaryPath != targetB {
+		t.Fatalf("unexpected target binaries: a=%q b=%q", planA.BinaryPath, planB.BinaryPath)
+	}
+	if envValue(planA.Env, "CODEX_FEISHU_RELAY_CONFIG") != configA || envValue(planB.Env, "CODEX_FEISHU_RELAY_CONFIG") != configB {
+		t.Fatalf("unexpected config bindings: a=%q b=%q", envValue(planA.Env, "CODEX_FEISHU_RELAY_CONFIG"), envValue(planB.Env, "CODEX_FEISHU_RELAY_CONFIG"))
+	}
+	if envValue(planA.Env, "CODEX_REAL_BINARY") != realA || envValue(planB.Env, "CODEX_REAL_BINARY") != realB {
+		t.Fatalf("unexpected real binary bindings: a=%q b=%q", envValue(planA.Env, "CODEX_REAL_BINARY"), envValue(planB.Env, "CODEX_REAL_BINARY"))
+	}
+}
+
+func envValue(env []string, key string) string {
+	prefix := key + "="
+	for _, item := range env {
+		if strings.HasPrefix(item, prefix) {
+			return strings.TrimPrefix(item, prefix)
+		}
+	}
+	return ""
+}
+
+func writeExecutable(t *testing.T, path, contents string) {
+	t.Helper()
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		t.Fatalf("mkdir %s: %v", path, err)
+	}
+	if err := os.WriteFile(path, []byte(contents), 0o755); err != nil {
+		t.Fatalf("write %s: %v", path, err)
+	}
+}
+
+func writeConfigFile(t *testing.T, path string) {
+	t.Helper()
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		t.Fatalf("mkdir config dir: %v", err)
+	}
+	if err := os.WriteFile(path, []byte("{\"version\":1}\n"), 0o644); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+}
+
+func writeInstallStateFile(t *testing.T, path string, payload any) {
+	t.Helper()
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		t.Fatalf("mkdir state dir: %v", err)
+	}
+	raw, err := json.Marshal(payload)
+	if err != nil {
+		t.Fatalf("marshal state: %v", err)
+	}
+	if err := os.WriteFile(path, raw, 0o644); err != nil {
+		t.Fatalf("write state: %v", err)
+	}
+}

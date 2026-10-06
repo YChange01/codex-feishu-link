@@ -1,0 +1,62 @@
+package testutil
+
+import (
+	"os"
+	"path/filepath"
+	"runtime"
+	"strings"
+)
+
+func RootedPath(parts ...string) string {
+	all := make([]string, 0, len(parts)+1)
+	all = append(all, string(filepath.Separator))
+	all = append(all, parts...)
+	return filepath.Join(all...)
+}
+
+func WorkspacePath(parts ...string) string {
+	return filepath.ToSlash(RootedPath(parts...))
+}
+
+func CanonicalPath(path string) string {
+	path = filepath.Clean(strings.TrimSpace(path))
+	if path == "" || path == "." {
+		return ""
+	}
+	if resolved, err := filepath.EvalSymlinks(path); err == nil {
+		path = filepath.Clean(resolved)
+	} else if resolved, ok := resolveExistingPrefix(path); ok {
+		path = filepath.Clean(resolved)
+	}
+	if runtime.GOOS == "windows" {
+		path = strings.ToLower(path)
+	}
+	return path
+}
+
+func resolveExistingPrefix(path string) (string, bool) {
+	var tail []string
+	current := path
+	for {
+		if current == "" || current == "." {
+			return "", false
+		}
+		if resolved, err := filepath.EvalSymlinks(current); err == nil {
+			for i := len(tail) - 1; i >= 0; i-- {
+				resolved = filepath.Join(resolved, tail[i])
+			}
+			return resolved, true
+		}
+		parent := filepath.Dir(current)
+		base := filepath.Base(current)
+		if parent == current || base == "." || base == string(os.PathSeparator) {
+			return "", false
+		}
+		tail = append(tail, base)
+		current = parent
+	}
+}
+
+func SamePath(left, right string) bool {
+	return CanonicalPath(left) == CanonicalPath(right)
+}

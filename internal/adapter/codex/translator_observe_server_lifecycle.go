@@ -1,0 +1,322 @@
+package codex
+
+import (
+	"strings"
+
+	"github.com/YChange01/codex-feishu-link/internal/core/agentproto"
+	"github.com/YChange01/codex-feishu-link/internal/pathcanon"
+	"github.com/YChange01/codex-feishu-link/internal/xutil"
+)
+
+func (t *Translator) observeThreadStarted(message map[string]any) Result {
+	threadRecord := parseThreadRecord(lookupAny(message, "params", "thread"))
+	t.applyPendingReviewThread(&threadRecord)
+	threadID := threadRecord.ThreadID
+	if threadID == "" {
+		threadID = lookupString(message, "params", "threadId")
+	}
+	if t.sharedAppServer && threadID != t.sharedThreadID {
+		return Result{}
+	}
+	cwd := threadRecord.CWD
+	if cwd == "" {
+		cwd = lookupString(message, "params", "cwd")
+	}
+	name := threadRecord.Name
+	runtimeStatus := agentproto.CloneThreadRuntimeStatus(threadRecord.RuntimeStatus)
+	status := ""
+	loaded := false
+	if runtimeStatus != nil {
+		status = runtimeStatus.LegacyState()
+		loaded = runtimeStatus.IsLoaded()
+	}
+	if t.suppressedThreadStarted[threadID] {
+		delete(t.suppressedThreadStarted, threadID)
+		t.currentThreadID = threadID
+		if cwd != "" {
+			t.knownThreadCWD[threadID] = pathcanon.Native(cwd)
+		}
+		t.mergeObservedThread(threadID, threadRecord.ModelProviderID, threadRecord.Model, threadRecord.ReasoningEffort)
+		t.Debugf("observe server suppressed thread/started after child restart: thread=%s cwd=%s", threadID, cwd)
+		return Result{Suppress: true}
+	}
+	if t.internalThreadIDs[threadID] {
+		if cwd != "" {
+			t.knownThreadCWD[threadID] = pathcanon.Native(cwd)
+		}
+		t.mergeObservedThread(threadID, threadRecord.ModelProviderID, threadRecord.Model, threadRecord.ReasoningEffort)
+		event := buildThreadDiscoveredEvent(threadRecord, threadID, cwd, name, status, loaded, runtimeStatus)
+		event.TrafficClass = agentproto.TrafficClassInternalHelper
+		event.Initiator = agentproto.Initiator{Kind: agentproto.InitiatorInternalHelper}
+		event.Metadata = mergeEventMetadata(event.Metadata, map[string]any{"internalHelper": true})
+		return Result{Events: []agentproto.Event{event}}
+	}
+	event := buildThreadDiscoveredEvent(threadRecord, threadID, cwd, name, status, loaded, runtimeStatus)
+	t.currentThreadID = threadID
+	if t.pendingLocalNewThreadTurn && threadID != "" {
+		t.pendingLocalTurnByThread[threadID] = true
+		t.pendingLocalNewThreadTurn = false
+	}
+	if cwd != "" {
+		t.knownThreadCWD[threadID] = pathcanon.Native(cwd)
+	}
+	t.mergeObservedThread(threadID, threadRecord.ModelProviderID, threadRecord.Model, threadRecord.ReasoningEffort)
+	return Result{Events: []agentproto.Event{event}}
+}
+
+func buildThreadDiscoveredEvent(threadRecord agentproto.ThreadSnapshotRecord, threadID, cwd, name, status string, loaded bool, runtimeStatus *agentproto.ThreadRuntimeStatus) agentproto.Event {
+	event := agentproto.Event{
+		Kind:            agentproto.EventThreadDiscovered,
+		ThreadID:        threadID,
+		CWD:             cwd,
+		Name:            name,
+		Preview:         threadRecord.Preview,
+		Model:           threadRecord.Model,
+		ReasoningEffort: threadRecord.ReasoningEffort,
+		PlanMode:        threadRecord.PlanMode,
+		Status:          status,
+		Loaded:          loaded,
+		FocusSource:     "remote_created_thread",
+		RuntimeStatus:   runtimeStatus,
+	}
+	if threadRecord.ForkedFromID != "" || threadRecord.Source != nil {
+		event.Metadata = map[string]any{}
+		if threadRecord.ForkedFromID != "" {
+			event.Metadata["forkedFromId"] = threadRecord.ForkedFromID
+		}
+		if threadRecord.Source != nil {
+			event.Metadata["threadSource"] = agentproto.CloneThreadSourceRecord(threadRecord.Source)
+		}
+	}
+	return event
+}
+
+func mergeEventMetadata(left, right map[string]any) map[string]any {
+	switch {
+	case len(left) == 0 && len(right) == 0:
+		return nil
+	case len(left) == 0:
+		return xutil.CloneMap(right)
+	case len(right) == 0:
+		return left
+	default:
+		merged := xutil.CloneMap(left)
+		for key, value := range right {
+			merged[key] = value
+		}
+		return merged
+	}
+}
+
+func (t *Translator) observeThreadStatusChanged(message map[string]any) Result {
+	threadID := lookupString(message, "params", "threadId")
+	runtimeStatus := parseThreadRuntimeStatus(lookupAny(message, "params", "status"))
+	if threadID == "" || runtimeStatus == nil {
+		return Result{}
+	}
+	trafficClass := agentproto.TrafficClassPrimary
+	initiator := agentproto.Initiator{Kind: agentproto.InitiatorRemoteSurface}
+	if t.internalThreadIDs[threadID] {
+		trafficClass = agentproto.TrafficClassInternalHelper
+		initiator = agentproto.Initiator{Kind: agentproto.InitiatorInternalHelper}
+	}
+	return Result{Events: []agentproto.Event{{
+		Kind:          agentproto.EventThreadRuntimeStatusUpdated,
+		ThreadID:      threadID,
+		Status:        runtimeStatus.LegacyState(),
+		Loaded:        runtimeStatus.IsLoaded(),
+		TrafficClass:  trafficClass,
+		Initiator:     initiator,
+		RuntimeStatus: runtimeStatus,
+	}}}
+}
+
+func (t *Translator) observeTurnStarted(message map[string]any) Result {
+	threadID := lookupString(message, "params", "thread", "id")
+	if threadID == "" {
+		threadID = lookupString(message, "params", "threadId")
+	}
+	turnID := lookupString(message, "params", "turn", "id")
+	if turnID == "" {
+		turnID = lookupString(message, "params", "turnId")
+	}
+	trafficClass := t.trafficClassForTurn(threadID, turnID)
+	pendingRemoteSurface := t.pendingRemoteTurnByThread[threadID]
+	pendingLocal := t.pendingLocalTurnByThread[threadID]
+	initiator := t.resolveTurnInitiator(threadID, turnID, trafficClass)
+	if turnID != "" {
+		t.turnInitiators[turnID] = initiator
+	}
+	t.Debugf(
+		"observe server turn/started: thread=%s turn=%s initiator=%s traffic=%s pendingRemoteSurface=%s pendingLocal=%t",
+		threadID,
+		turnID,
+		initiator.Kind,
+		trafficClass,
+		pendingRemoteSurface,
+		pendingLocal,
+	)
+	effective, problem := t.codexEffectiveThreadFromObserved(threadID, turnID, t.pendingCodexPolicyByThread[threadID], lookupMap(message, "params"))
+	observed := t.observedThreads[threadID]
+	event := agentproto.Event{
+		Kind:                 agentproto.EventTurnStarted,
+		ThreadID:             threadID,
+		TurnID:               turnID,
+		Status:               "running",
+		TrafficClass:         trafficClass,
+		Initiator:            initiator,
+		Model:                observed.Model,
+		ReasoningEffort:      observed.ReasoningEffort,
+		CodexEffectiveThread: effective,
+		Problem:              problem,
+	}
+	return Result{Events: []agentproto.Event{event}}
+}
+
+func (t *Translator) mergeObservedThread(threadID, providerID, model, reasoning string) {
+	threadID = strings.TrimSpace(threadID)
+	if threadID == "" {
+		return
+	}
+	observed := t.observedThreads[threadID]
+	if value := strings.TrimSpace(providerID); value != "" {
+		observed.ModelProviderID = value
+	}
+	if value := strings.TrimSpace(model); value != "" {
+		observed.Model = value
+	}
+	if value := strings.TrimSpace(reasoning); value != "" {
+		observed.ReasoningEffort = value
+	}
+	t.observedThreads[threadID] = observed
+}
+
+func (t *Translator) codexEffectiveThreadFromObserved(threadID, turnID string, policy *agentproto.CodexResumePolicy, params map[string]any) (*agentproto.CodexEffectiveThreadContract, *agentproto.ErrorInfo) {
+	policy = agentproto.NormalizeCodexResumePolicy(policy)
+	if policy == nil {
+		return nil, nil
+	}
+	observed := t.observedThreads[strings.TrimSpace(threadID)]
+	if observed.ModelProviderID == "" {
+		return nil, codexProtocolIncompleteProblem(threadID, turnID, "Codex turn/started 缺少可证明的 model provider evidence，无法确认当前 thread 的实际 Profile。")
+	}
+	if policy.ModelProviderID != "" && observed.ModelProviderID != policy.ModelProviderID {
+		return nil, codexProtocolIncompleteProblem(threadID, turnID, "Codex observed model provider 与请求的 Resume Policy 不一致。")
+	}
+	effective := &agentproto.CodexEffectiveThreadContract{
+		ResumeMode:             policy.Mode,
+		ConnectionContractID:   policy.ConnectionContractID,
+		ThreadPolicyID:         policy.ThreadPolicyID,
+		ModelProviderID:        observed.ModelProviderID,
+		ReviewModelMode:        policy.ReviewModelMode,
+		ContextMode:            policy.ContextMode,
+		RequestedContextWindow: policy.ContextWindow,
+		RequestedAutoCompact:   policy.AutoCompactLimit,
+	}
+	if policy.ReviewModelMode == agentproto.CodexReviewModelExplicit {
+		effective.ReviewModel = policy.ReviewModel
+	}
+	if observed.Model != "" {
+		effective.Model = observed.Model
+		effective.ModelMode = observedModeForValue(policy.ModelMode, policy.Model, observed.Model)
+	} else if policy.ModelMode == agentproto.CodexThreadValueDefault {
+		effective.ModelMode = agentproto.CodexThreadValueDefault
+	}
+	if observed.ReasoningEffort != "" {
+		effective.ReasoningEffort = observed.ReasoningEffort
+		effective.ReasoningMode = observedModeForValue(policy.ReasoningMode, policy.ReasoningEffort, observed.ReasoningEffort)
+	} else if policy.ReasoningMode == agentproto.CodexThreadValueDefault {
+		effective.ReasoningMode = agentproto.CodexThreadValueDefault
+	}
+	if contextWindow := xutil.LookupIntFromAny(params["modelContextWindow"]); contextWindow > 0 {
+		effective.EffectiveContextWindow = int64(contextWindow)
+		if effective.RequestedContextWindow > 0 && int64(contextWindow) < effective.RequestedContextWindow {
+			effective.ContextStatus = agentproto.CodexContextPreferenceClamped
+		} else {
+			effective.ContextStatus = agentproto.CodexContextPreferenceRequested
+		}
+	}
+	return effective, nil
+}
+
+func observedModeForValue(requestedMode, requestedValue, observedValue string) string {
+	switch requestedMode {
+	case agentproto.CodexThreadValueExplicit:
+		if strings.TrimSpace(requestedValue) == strings.TrimSpace(observedValue) {
+			return agentproto.CodexThreadValueExplicit
+		}
+		return agentproto.CodexThreadValuePreservedObserved
+	case agentproto.CodexThreadValuePreservedObserved:
+		return agentproto.CodexThreadValuePreservedObserved
+	case agentproto.CodexThreadValueDefault:
+		return agentproto.CodexThreadValueDefault
+	default:
+		return ""
+	}
+}
+
+func codexProtocolIncompleteProblem(threadID, turnID, message string) *agentproto.ErrorInfo {
+	return &agentproto.ErrorInfo{
+		Code:      "codex_protocol_incomplete",
+		Layer:     "wrapper",
+		Stage:     "observe_codex_turn_started",
+		Operation: "turn/started",
+		Message:   message,
+		ThreadID:  strings.TrimSpace(threadID),
+		TurnID:    strings.TrimSpace(turnID),
+	}
+}
+
+func (t *Translator) observeTurnCompleted(message map[string]any) Result {
+	threadID := lookupString(message, "params", "thread", "id")
+	if threadID == "" {
+		threadID = lookupString(message, "params", "threadId")
+	}
+	turnID := lookupString(message, "params", "turn", "id")
+	if turnID == "" {
+		turnID = lookupString(message, "params", "turnId")
+	}
+	trafficClass := t.trafficClassForTurn(threadID, turnID)
+	status := lookupString(message, "params", "turn", "status")
+	if status == "" {
+		status = "completed"
+	}
+	errMsg := lookupString(message, "params", "turn", "error", "message")
+	problem, hasProblem := t.pendingTurnProblems[turnID]
+	delete(t.pendingTurnProblems, turnID)
+	if status == "completed" {
+		hasProblem = false
+	}
+	if errMsg == "" && hasProblem {
+		errMsg = problem.Message
+	}
+	initiator := t.turnInitiators[turnID]
+	if initiator.Kind == "" {
+		initiator = t.resolveTurnInitiator(threadID, turnID, trafficClass)
+	}
+	delete(t.turnInitiators, turnID)
+	delete(t.internalTurnIDs, turnID)
+	t.clearReasoningSummaryIndexesForTurn(threadID, turnID)
+	t.Debugf("observe server turn/completed: thread=%s turn=%s status=%s initiator=%s", threadID, turnID, status, initiator.Kind)
+	event := agentproto.Event{
+		Kind:                 agentproto.EventTurnCompleted,
+		ThreadID:             threadID,
+		TurnID:               turnID,
+		Status:               status,
+		ErrorMessage:         errMsg,
+		TurnCompletionOrigin: agentproto.TurnCompletionOriginRuntime,
+		TrafficClass:         trafficClass,
+		Initiator:            initiator,
+	}
+	if hasProblem {
+		problemCopy := problem
+		if problemCopy.ThreadID == "" {
+			problemCopy.ThreadID = threadID
+		}
+		if problemCopy.TurnID == "" {
+			problemCopy.TurnID = turnID
+		}
+		event.Problem = &problemCopy
+	}
+	return Result{Events: []agentproto.Event{event}}
+}

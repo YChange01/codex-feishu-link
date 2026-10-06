@@ -1,0 +1,1283 @@
+import { render, screen, waitFor, within } from "@testing-library/react";
+import userEvent from "@testing-library/user-event";
+import { describe, expect, it, vi } from "vitest";
+import { AdminRoute } from "./AdminRoute";
+import {
+  makeApp,
+  makeAutoConfigPlan,
+  makeAutoConfigPlanResponse,
+  makeBootstrap,
+  makeClaudeProfile,
+  makeCodexProfile,
+  makeImageStagingStatus,
+  makeLogsStorageStatus,
+  makeOpenCodeProfile,
+  makePreviewDriveStatus,
+  makeVSCodeDetect,
+} from "../test/fixtures";
+import { installMockFetch, type MockFetchCall } from "../test/http";
+
+function withClaudeProfiles(
+  routes: Record<string, unknown>,
+  profiles = [makeClaudeProfile()],
+) {
+  return {
+    "/api/admin/codex/profiles": {
+      body: { profiles: [makeCodexProfile()] },
+    },
+    "/g/demo/api/admin/codex/profiles": {
+      body: { profiles: [makeCodexProfile()] },
+    },
+    "/api/admin/claude/profiles": {
+      body: { profiles },
+    },
+    "/g/demo/api/admin/claude/profiles": {
+      body: { profiles },
+    },
+    "/api/admin/opencode/profiles": {
+      body: {
+        profiles: [makeOpenCodeProfile()],
+      },
+    },
+    "/g/demo/api/admin/opencode/profiles": {
+      body: {
+        profiles: [makeOpenCodeProfile()],
+      },
+    },
+    ...routes,
+  };
+}
+
+function makeSingleRobotAdminRoutes(
+  app = makeApp({ id: "bot-1", name: "主机器人", appId: "cli_main" }),
+  routes: Record<string, unknown> = {},
+) {
+  return withClaudeProfiles({
+    "/api/admin/bootstrap-state": { body: makeBootstrap() },
+    "/api/admin/feishu/apps": {
+      body: {
+        apps: [app],
+      },
+    },
+    "/api/admin/autostart/detect": {
+      body: {
+        platform: "linux",
+        supported: true,
+        status: "enabled",
+        configured: true,
+        enabled: true,
+        canApply: true,
+      },
+    },
+    "/api/admin/vscode/detect": { body: makeVSCodeDetect() },
+    "/api/admin/storage/image-staging": {
+      body: makeImageStagingStatus(),
+    },
+    "/api/admin/storage/logs": {
+      body: makeLogsStorageStatus(),
+    },
+    [`/api/admin/storage/preview-drive/${app.id}`]: {
+      body: makePreviewDriveStatus({
+        gatewayId: app.id,
+        name: app.name,
+      }),
+    },
+    ...routes,
+  });
+}
+
+function makeAdminAutoConfigPlan(
+  app = makeApp({ id: "bot-1", name: "主机器人", appId: "cli_main" }),
+  planOverrides: Parameters<typeof makeAutoConfigPlan>[0] = {},
+) {
+  return makeAutoConfigPlanResponse({
+    app,
+    plan: makeAutoConfigPlan({
+      status: "clean",
+      summary: "飞书配置已就绪。",
+      blockingRequirements: [],
+      degradableRequirements: [],
+      ...planOverrides,
+    }),
+  });
+}
+
+async function openAdminArea(
+  user: ReturnType<typeof userEvent.setup>,
+  name: "总览" | "机器人" | "对话后端" | "系统",
+) {
+  await user.click(screen.getAllByRole("button", { name })[0]);
+}
+
+describe("AdminRoute", () => {
+  it("keeps local API requests dot-relative when mounted under a prefixed path", async () => {
+    window.history.replaceState({}, "", "/g/demo/admin");
+    const user = userEvent.setup();
+
+    const { calls } = installMockFetch(withClaudeProfiles({
+      "/g/demo/api/admin/bootstrap-state": {
+        body: makeBootstrap({ admin: { setupURL: "/g/demo/setup" } }),
+      },
+      "/g/demo/api/admin/feishu/apps": {
+        body: { apps: [makeApp({ id: "bot-1", name: "Main Bot" })] },
+      },
+      "/g/demo/api/admin/autostart/detect": {
+        body: {
+          platform: "linux",
+          supported: true,
+          status: "enabled",
+          configured: true,
+          enabled: true,
+          canApply: true,
+        },
+      },
+      "/g/demo/api/admin/vscode/detect": { body: makeVSCodeDetect() },
+      "/g/demo/api/admin/storage/image-staging": {
+        body: makeImageStagingStatus(),
+      },
+      "/g/demo/api/admin/storage/logs": {
+        body: makeLogsStorageStatus(),
+      },
+      "/g/demo/api/admin/storage/preview-drive/bot-1": {
+        body: makePreviewDriveStatus({ gatewayId: "bot-1", name: "Main Bot" }),
+      },
+    }));
+
+    render(<AdminRoute />);
+
+    expect(
+      await screen.findByRole("heading", {
+        name: "Codex Feishu Relay v1.7.0 管理",
+      }),
+    ).toBeInTheDocument();
+    expect(screen.getAllByRole("button", { name: "机器人" }).length).toBeGreaterThan(0);
+    expect(screen.getAllByRole("button", { name: "对话后端" }).length).toBeGreaterThan(0);
+    await openAdminArea(user, "机器人");
+    expect(await screen.findByRole("heading", { name: "机器人" })).toBeInTheDocument();
+    expect(await screen.findByRole("button", { name: /添加机器人/ })).toBeInTheDocument();
+    await openAdminArea(user, "对话后端");
+    expect(await screen.findByRole("heading", { name: "Claude" })).toBeInTheDocument();
+    await user.click(screen.getByRole("button", { name: "Codex" }));
+    expect(await screen.findByRole("heading", { name: "Codex" })).toBeInTheDocument();
+    expect(calls.length).toBeGreaterThan(0);
+    expect(calls.every((call) => call.rawURL.startsWith("./"))).toBe(true);
+    expect(
+      calls.some((call) => call.path === "/g/demo/api/admin/bootstrap-state"),
+    ).toBe(true);
+    expect(calls.some((call) => call.path === "/g/demo/api/admin/claude/profiles")).toBe(
+      true,
+    );
+    expect(calls.some((call) => call.path === "/g/demo/api/admin/codex/profiles")).toBe(
+      true,
+    );
+  });
+
+  it("syncs robot facts from Feishu and updates the displayed name", async () => {
+    window.history.replaceState({}, "", "/admin");
+    const user = userEvent.setup();
+    const app = makeApp({ id: "bot-1", name: "主机器人", appId: "cli_main" });
+
+    installMockFetch(makeSingleRobotAdminRoutes(app, {
+      "/api/admin/feishu/apps/bot-1/facts/refresh": {
+        body: {
+          gatewayID: "bot-1",
+          appID: "cli_main",
+          appName: "新机器人名",
+          botOpenID: "ou_bot",
+          fetchedAt: new Date().toISOString(),
+        },
+      },
+    }));
+
+    render(<AdminRoute />);
+
+    await openAdminArea(user, "机器人");
+    expect(
+      await screen.findByRole("heading", { name: "主机器人" }),
+    ).toBeInTheDocument();
+    await user.click(screen.getByRole("button", { name: "从飞书同步" }));
+
+    expect(
+      await screen.findByRole("heading", { name: "新机器人名" }),
+    ).toBeInTheDocument();
+  });
+
+  it("checks the auto-config plan and displays missing scopes with a copyable import JSON", async () => {
+    window.history.replaceState({}, "", "/admin");
+    const user = userEvent.setup();
+    const originalClipboard = navigator.clipboard;
+    const writeText = vi.fn().mockResolvedValue(undefined);
+    const app = makeApp({
+      id: "bot-permission",
+      name: "权限机器人",
+      appId: "cli_permission",
+      consoleLinks: {
+        auth: "https://open.feishu.cn/app/cli_permission/auth",
+        events: "https://open.feishu.cn/app/cli_permission/event?tab=event",
+        callback: "https://open.feishu.cn/app/cli_permission/event?tab=callback",
+        bot: "https://open.feishu.cn/app/cli_permission/bot",
+      },
+    });
+    Object.defineProperty(navigator, "clipboard", {
+      configurable: true,
+      value: { writeText },
+    });
+
+    installMockFetch(withClaudeProfiles({
+      "/api/admin/bootstrap-state": { body: makeBootstrap() },
+      "/api/admin/feishu/apps": {
+        body: {
+          apps: [app],
+        },
+      },
+      "/api/admin/feishu/apps/bot-permission/auto-config/plan": {
+        body: makeAdminAutoConfigPlan(app, {
+          status: "apply_required",
+          summary: "飞书配置还需要补齐。",
+          blockingRequirements: [
+            {
+              kind: "scope",
+              key: "im:message.group_msg",
+              scopeType: "tenant",
+              feature: "group_message",
+              required: true,
+              present: false,
+            },
+          ],
+          diff: {
+            configPatchRequired: true,
+            abilityPatchRequired: false,
+            missingScopes: [
+              { scope: "im:message.group_msg", scopeType: "tenant" },
+            ],
+            extraScopes: [],
+            missingEvents: [],
+            extraEvents: [],
+            missingCallbacks: [],
+            extraCallbacks: [],
+            callbackTypeMismatch: false,
+            callbackRequestUrlMismatch: false,
+            publishRequired: false,
+          },
+          degradableRequirements: [
+            {
+              kind: "event",
+              key: "im.message.receive_v1",
+              purpose: "接收用户消息",
+              required: false,
+              present: false,
+            },
+          ],
+        }),
+      },
+      "/api/admin/autostart/detect": {
+        body: {
+          platform: "linux",
+          supported: true,
+          status: "enabled",
+          configured: true,
+          enabled: true,
+          canApply: true,
+        },
+      },
+      "/api/admin/vscode/detect": { body: makeVSCodeDetect() },
+      "/api/admin/storage/image-staging": {
+        body: makeImageStagingStatus(),
+      },
+      "/api/admin/storage/logs": {
+        body: makeLogsStorageStatus(),
+      },
+      "/api/admin/storage/preview-drive/bot-permission": {
+        body: makePreviewDriveStatus({
+          gatewayId: "bot-permission",
+          name: "权限机器人",
+        }),
+      },
+    }));
+
+    render(<AdminRoute />);
+
+    await openAdminArea(user, "机器人");
+    await user.click(await screen.findByRole("button", { name: "重新检查配置" }));
+    expect(await screen.findByText("飞书配置还需要补齐。")).toBeInTheDocument();
+    expect(screen.getByText("权限 im:message.group_msg")).toBeInTheDocument();
+    expect(screen.getByDisplayValue(/im:message\.group_msg/)).toBeInTheDocument();
+    expect(screen.getByText("事件 im.message.receive_v1")).toBeInTheDocument();
+    expect(screen.getByText("接收用户消息")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "复制权限 im:message.group_msg" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "复制事件 im.message.receive_v1" })).toBeInTheDocument();
+    const scopeRow = screen.getByText("权限 im:message.group_msg").closest("li");
+    const eventRow = screen.getByText("事件 im.message.receive_v1").closest("li");
+    expect(scopeRow).not.toBeNull();
+    expect(eventRow).not.toBeNull();
+    const scopeConsoleLink = within(scopeRow!).getByRole("link", { name: "去后台配置" });
+    const eventConsoleLink = within(eventRow!).getByRole("link", { name: "去后台配置" });
+    expect(scopeConsoleLink).toHaveAttribute(
+      "href",
+      "https://open.feishu.cn/app/cli_permission/auth",
+    );
+    expect(eventConsoleLink).toHaveAttribute(
+      "href",
+      "https://open.feishu.cn/app/cli_permission/event?tab=event",
+    );
+    expect(scopeConsoleLink.closest(".requirement-name-row")).toBeNull();
+    expect(scopeConsoleLink.closest(".requirement-action")).not.toBeNull();
+    expect(screen.getByText(/^最近检查：/)).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "自动补齐" })).not.toBeInTheDocument();
+
+    await user.click(screen.getByRole("button", { name: "复制权限 im:message.group_msg" }));
+    expect(writeText).toHaveBeenCalledWith("im:message.group_msg");
+    expect(await screen.findByText("权限 im:message.group_msg 已复制。")).toBeInTheDocument();
+
+    await user.click(screen.getByRole("button", { name: "复制导入 JSON" }));
+    expect(writeText).toHaveBeenCalledWith(expect.stringContaining('"im:message.group_msg"'));
+    expect(await screen.findByText("导入 JSON 已复制。")).toBeInTheDocument();
+
+    Object.defineProperty(navigator, "clipboard", {
+      configurable: true,
+      value: originalClipboard,
+    });
+  });
+
+  it("shows clipboard failures inside the permission check card", async () => {
+    window.history.replaceState({}, "", "/admin");
+    const user = userEvent.setup();
+    const originalClipboard = navigator.clipboard;
+    const writeText = vi.fn().mockRejectedValue(new Error("NotAllowedError"));
+    const app = makeApp({
+      id: "bot-permission",
+      name: "权限机器人",
+      appId: "cli_permission",
+      consoleLinks: {
+        auth: "https://open.feishu.cn/app/cli_permission/auth",
+      },
+    });
+    Object.defineProperty(navigator, "clipboard", {
+      configurable: true,
+      value: { writeText },
+    });
+
+    installMockFetch(makeSingleRobotAdminRoutes(app, {
+      "/api/admin/feishu/apps/bot-permission/auto-config/plan": {
+        body: makeAdminAutoConfigPlan(app, {
+          status: "apply_required",
+          summary: "飞书配置还需要补齐。",
+          blockingRequirements: [
+            {
+              kind: "scope",
+              key: "im:message.group_msg",
+              scopeType: "tenant",
+              required: true,
+              present: false,
+            },
+          ],
+        }),
+      },
+    }));
+
+    render(<AdminRoute />);
+
+    await openAdminArea(user, "机器人");
+    await user.click(await screen.findByRole("button", { name: "重新检查配置" }));
+    const permissionSection = screen.getByRole("heading", { name: "权限检查" }).closest("section");
+    expect(permissionSection).not.toBeNull();
+    await user.click(screen.getByRole("button", { name: "复制权限 im:message.group_msg" }));
+
+    expect(writeText).toHaveBeenCalledWith("im:message.group_msg");
+    expect(
+      await within(permissionSection!).findByText(
+        "复制只有在 HTTPS 或 localhost 下才有效，请手动选择内容然后复制。",
+      ),
+    ).toBeInTheDocument();
+
+    Object.defineProperty(navigator, "clipboard", {
+      configurable: true,
+      value: originalClipboard,
+    });
+  });
+
+  it("keeps the permission card read-only and never calls the auto-config write routes", async () => {
+    window.history.replaceState({}, "", "/admin");
+    const user = userEvent.setup();
+    const app = makeApp({
+      id: "bot-permission",
+      name: "权限机器人",
+      appId: "cli_permission",
+    });
+
+    const { calls } = installMockFetch(withClaudeProfiles({
+      "/api/admin/bootstrap-state": { body: makeBootstrap() },
+      "/api/admin/feishu/apps": {
+        body: {
+          apps: [app],
+        },
+      },
+      "/api/admin/feishu/apps/bot-permission/auto-config/plan": () => {
+        return {
+          body: makeAdminAutoConfigPlan(app, {
+            status: "apply_required",
+            summary: "飞书配置还需要补齐。",
+          }),
+        };
+      },
+      "/api/admin/autostart/detect": {
+        body: {
+          platform: "linux",
+          supported: true,
+          status: "enabled",
+          configured: true,
+          enabled: true,
+          canApply: true,
+        },
+      },
+      "/api/admin/vscode/detect": { body: makeVSCodeDetect() },
+      "/api/admin/storage/image-staging": {
+        body: makeImageStagingStatus(),
+      },
+      "/api/admin/storage/logs": {
+        body: makeLogsStorageStatus(),
+      },
+      "/api/admin/storage/preview-drive/bot-permission": {
+        body: makePreviewDriveStatus({
+          gatewayId: "bot-permission",
+          name: "权限机器人",
+        }),
+      },
+    }));
+
+    render(<AdminRoute />);
+
+    await openAdminArea(user, "机器人");
+    await user.click(await screen.findByRole("button", { name: "重新检查配置" }));
+    expect(await screen.findByText("飞书配置还需要补齐。")).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "自动补齐" })).not.toBeInTheDocument();
+    expect(
+      calls.some((call) => call.path.endsWith("/auto-config/complete")),
+    ).toBe(false);
+    expect(calls.some((call) => call.path.endsWith("/auto-config/apply"))).toBe(false);
+    expect(calls.some((call) => call.path.endsWith("/auto-config/publish"))).toBe(false);
+  });
+
+  it("shows a user-facing failure when the auto-config plan cannot be read", async () => {
+    window.history.replaceState({}, "", "/admin");
+    const user = userEvent.setup();
+    const app = makeApp({
+      id: "bot-complete-error",
+      name: "补齐失败机器人",
+      appId: "cli_complete_error",
+    });
+
+    installMockFetch(makeSingleRobotAdminRoutes(app, {
+      "/api/admin/feishu/apps/bot-complete-error/auto-config/plan": {
+        status: 502,
+        body: {
+          error: {
+            code: "feishu_auto_config_failed",
+            message: "暂时无法完成飞书自动配置，请稍后重试。",
+            details:
+              "feishu api application.v6.application.get failed: code=99992402 msg=field validation failed",
+          },
+        },
+      },
+    }));
+
+    render(<AdminRoute />);
+
+    await openAdminArea(user, "机器人");
+    await user.click(await screen.findByRole("button", { name: "重新检查配置" }));
+
+    expect(
+      await screen.findByText("暂时无法确认飞书自动配置状态。"),
+    ).toBeInTheDocument();
+    expect(screen.queryByText(/application\.v6\.application\.get/)).not.toBeInTheDocument();
+    expect(screen.queryByText(/99992402/)).not.toBeInTheDocument();
+    expect(screen.queryByText(/field validation failed/)).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "重新检查" })).toBeInTheDocument();
+  });
+
+  it("shows an awaiting-review plan without offering auto-fill", async () => {
+    window.history.replaceState({}, "", "/admin");
+    const user = userEvent.setup();
+    const app = makeApp({
+      id: "bot-publish-permission",
+      name: "待发布机器人",
+      appId: "cli_publish_permission",
+    });
+
+    const { calls } = installMockFetch(withClaudeProfiles({
+      "/api/admin/bootstrap-state": { body: makeBootstrap() },
+      "/api/admin/feishu/apps": {
+        body: {
+          apps: [app],
+        },
+      },
+      "/api/admin/feishu/apps/bot-publish-permission/auto-config/plan": {
+        body: makeAdminAutoConfigPlan(app, {
+          status: "awaiting_review",
+          summary: "飞书应用变更已进入审核流程，正在等待审核结果。",
+          publish: {
+            needsPublish: false,
+            awaitingReview: true,
+          },
+        }),
+      },
+      "/api/admin/autostart/detect": {
+        body: {
+          platform: "linux",
+          supported: true,
+          status: "enabled",
+          configured: true,
+          enabled: true,
+          canApply: true,
+        },
+      },
+      "/api/admin/vscode/detect": { body: makeVSCodeDetect() },
+      "/api/admin/storage/image-staging": {
+        body: makeImageStagingStatus(),
+      },
+      "/api/admin/storage/logs": {
+        body: makeLogsStorageStatus(),
+      },
+      "/api/admin/storage/preview-drive/bot-publish-permission": {
+        body: makePreviewDriveStatus({
+          gatewayId: "bot-publish-permission",
+          name: "待发布机器人",
+        }),
+      },
+    }));
+
+    render(<AdminRoute />);
+
+    await openAdminArea(user, "机器人");
+    await user.click(await screen.findByRole("button", { name: "重新检查配置" }));
+    expect(
+      await screen.findByText("飞书应用变更已进入审核流程，正在等待审核结果。"),
+    ).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "自动补齐" })).not.toBeInTheDocument();
+    expect(
+      calls.some((call) => call.path.endsWith("/auto-config/complete")),
+    ).toBe(false);
+    expect(calls.some((call) => call.path.endsWith("/auto-config/apply"))).toBe(false);
+    expect(calls.some((call) => call.path.endsWith("/auto-config/publish"))).toBe(false);
+  });
+
+  it("shows a ready auto-config result without missing scopes", async () => {
+    window.history.replaceState({}, "", "/admin");
+    const user = userEvent.setup();
+    const app = makeApp({
+      id: "bot-ready",
+      name: "权限就绪机器人",
+      appId: "cli_ready",
+    });
+
+    installMockFetch(makeSingleRobotAdminRoutes(app, {
+      "/api/admin/feishu/apps/bot-ready/auto-config/plan": {
+        body: makeAdminAutoConfigPlan(app),
+      },
+    }));
+
+    render(<AdminRoute />);
+
+    await openAdminArea(user, "机器人");
+    await user.click(await screen.findByRole("button", { name: "重新检查配置" }));
+
+    expect(await screen.findByText("飞书配置已就绪。")).toBeInTheDocument();
+    expect(screen.queryByText(/还缺少/)).not.toBeInTheDocument();
+    expect(screen.queryByLabelText("权限导入 JSON")).not.toBeInTheDocument();
+  });
+
+  it("shows an actionable auto-config read failure without raw backend text", async () => {
+    window.history.replaceState({}, "", "/admin");
+    const user = userEvent.setup();
+    const app = makeApp({
+      id: "bot-plan-error",
+      name: "状态待确认机器人",
+      appId: "cli_plan_error",
+    });
+
+    installMockFetch(makeSingleRobotAdminRoutes(app, {
+      "/api/admin/feishu/apps/bot-plan-error/auto-config/plan": {
+        status: 502,
+        body: {
+          error: {
+            code: "feishu_auto_config_plan_failed",
+            message: "raw backend verification error",
+          },
+        },
+      },
+    }));
+
+    render(<AdminRoute />);
+
+    await openAdminArea(user, "机器人");
+    await user.click(await screen.findByRole("button", { name: "重新检查配置" }));
+
+    expect(await screen.findByText("暂时无法确认飞书自动配置状态。")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "重新检查" })).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "自动补齐" })).not.toBeInTheDocument();
+    expect(screen.queryByText("raw backend verification error")).not.toBeInTheDocument();
+  });
+
+  it("shows a retryable auto-config read failure", async () => {
+    window.history.replaceState({}, "", "/admin");
+    const user = userEvent.setup();
+    const app = makeApp({
+      id: "bot-failed",
+      name: "权限检查失败机器人",
+      appId: "cli_failed",
+    });
+
+    installMockFetch(makeSingleRobotAdminRoutes(app, {
+      "/api/admin/feishu/apps/bot-failed/auto-config/plan": {
+        status: 502,
+        body: {
+          error: {
+            code: "feishu_permission_check_failed",
+            message: "failed to read feishu auto-config plan",
+          },
+        },
+      },
+    }));
+
+    render(<AdminRoute />);
+
+    await openAdminArea(user, "机器人");
+    await user.click(await screen.findByRole("button", { name: "重新检查配置" }));
+
+    expect(await screen.findByText("暂时无法确认飞书自动配置状态。")).toBeInTheDocument();
+    expect(screen.getAllByRole("button", { name: "重新检查" }).length).toBeGreaterThan(0);
+  });
+
+  it("does not show or request admin auto-config details", async () => {
+    window.history.replaceState({}, "", "/admin");
+    const user = userEvent.setup();
+
+    const { calls } = installMockFetch(withClaudeProfiles({
+      "/api/admin/bootstrap-state": { body: makeBootstrap() },
+      "/api/admin/feishu/apps": {
+        body: {
+          apps: [
+            makeApp({ id: "bot-1", name: "主机器人", appId: "cli_main" }),
+            makeApp({ id: "bot-2", name: "备用机器人", appId: "cli_backup" }),
+          ],
+        },
+      },
+      "/api/admin/autostart/detect": {
+        body: {
+          platform: "linux",
+          supported: true,
+          status: "enabled",
+          configured: true,
+          enabled: true,
+          canApply: true,
+        },
+      },
+      "/api/admin/vscode/detect": { body: makeVSCodeDetect() },
+      "/api/admin/storage/image-staging": {
+        body: makeImageStagingStatus(),
+      },
+      "/api/admin/storage/logs": {
+        body: makeLogsStorageStatus(),
+      },
+      "/api/admin/storage/preview-drive/bot-1": {
+        body: makePreviewDriveStatus({ gatewayId: "bot-1", name: "主机器人" }),
+      },
+      "/api/admin/storage/preview-drive/bot-2": {
+        body: makePreviewDriveStatus({ gatewayId: "bot-2", name: "备用机器人" }),
+      },
+    }));
+
+    render(<AdminRoute />);
+
+    await openAdminArea(user, "机器人");
+    await screen.findByRole("heading", { name: "主机器人" });
+    await user.click(screen.getByRole("button", { name: /备用机器人/ }));
+
+    expect(await screen.findByRole("heading", { name: "备用机器人" })).toBeInTheDocument();
+    expect(
+      calls.some((call) => call.path.includes("/auto-config/")),
+    ).toBe(false);
+    expect(screen.queryByText("自动配置")).not.toBeInTheDocument();
+    expect(screen.queryByText("有降级")).not.toBeInTheDocument();
+  });
+
+  it("creates a new robot and switches to its status page after verify", async () => {
+    window.history.replaceState({}, "", "/admin");
+    const user = userEvent.setup();
+    let appsConfigured = false;
+
+    installMockFetch(withClaudeProfiles({
+      "/api/admin/bootstrap-state": { body: makeBootstrap() },
+      "/api/admin/feishu/onboarding/sessions": {
+        status: 201,
+        body: {
+          session: {
+            id: "session-admin-new",
+            status: "pending",
+            qrCodeDataUrl: "data:image/png;base64,abc",
+          },
+        },
+      },
+      "/api/admin/feishu/apps": (call: MockFetchCall) => {
+        if (call.method === "POST") {
+          appsConfigured = true;
+          return {
+            status: 201,
+            body: {
+              app: makeApp({
+                id: "bot-new",
+                name: "运营机器人",
+                appId: "cli_new",
+              }),
+            },
+          };
+        }
+        return {
+          body: {
+            apps: appsConfigured
+              ? [
+                  makeApp({
+                    id: "bot-new",
+                    name: "运营机器人",
+                    appId: "cli_new",
+                    verifiedAt: "2026-04-25T09:10:00Z",
+                  }),
+                ]
+              : [makeApp({ id: "bot-1", name: "主机器人", appId: "cli_main" })],
+          },
+        };
+      },
+      "/api/admin/feishu/apps/bot-new/verify": {
+        body: {
+          app: makeApp({
+            id: "bot-new",
+            name: "运营机器人",
+            appId: "cli_new",
+            verifiedAt: "2026-04-25T09:10:00Z",
+          }),
+          result: { connected: true, duration: 1_000_000_000 },
+        },
+      },
+      "/api/admin/autostart/detect": {
+        body: {
+          platform: "linux",
+          supported: true,
+          status: "enabled",
+          configured: true,
+          enabled: true,
+          canApply: true,
+        },
+      },
+      "/api/admin/vscode/detect": { body: makeVSCodeDetect() },
+      "/api/admin/storage/image-staging": {
+        body: makeImageStagingStatus(),
+      },
+      "/api/admin/storage/logs": {
+        body: makeLogsStorageStatus(),
+      },
+      "/api/admin/storage/preview-drive/bot-1": {
+        body: makePreviewDriveStatus({ gatewayId: "bot-1", name: "主机器人" }),
+      },
+      "/api/admin/storage/preview-drive/bot-new": {
+        body: makePreviewDriveStatus({ gatewayId: "bot-new", name: "运营机器人" }),
+      },
+    }));
+
+    render(<AdminRoute />);
+
+    await openAdminArea(user, "机器人");
+    await user.click(await screen.findByRole("button", { name: /添加机器人/ }));
+    expect(await screen.findByRole("button", { name: "扫码创建" })).toBeInTheDocument();
+    await user.click(screen.getByRole("button", { name: "手动输入" }));
+    await user.type(screen.getByLabelText("机器人名称（可选）"), "运营机器人");
+    await user.type(screen.getByLabelText("App ID"), "cli_new");
+    await user.type(screen.getByLabelText("App Secret"), "secret_new");
+    await user.click(screen.getByRole("button", { name: "连接并验证" }));
+
+    expect(await screen.findByRole("heading", { name: "运营机器人" })).toBeInTheDocument();
+    expect(await screen.findByText("已完成连接验证。")).toBeInTheDocument();
+  });
+
+  it("opens the delete modal and removes the robot after confirmation", async () => {
+    window.history.replaceState({}, "", "/admin");
+    const user = userEvent.setup();
+    let removed = false;
+
+    installMockFetch(withClaudeProfiles({
+      "/api/admin/bootstrap-state": { body: makeBootstrap() },
+      "/api/admin/feishu/onboarding/sessions": {
+        status: 201,
+        body: {
+          session: {
+            id: "session-admin-delete",
+            status: "pending",
+            qrCodeDataUrl: "data:image/png;base64,abc",
+          },
+        },
+      },
+      "/api/admin/feishu/apps": () => ({
+        body: {
+          apps: removed ? [] : [makeApp({ id: "bot-delete", name: "待删除机器人", appId: "cli_delete" })],
+        },
+      }),
+      "/api/admin/feishu/apps/bot-delete": () => {
+        removed = true;
+        return { body: {} };
+      },
+      "/api/admin/autostart/detect": {
+        body: {
+          platform: "linux",
+          supported: true,
+          status: "enabled",
+          configured: true,
+          enabled: true,
+          canApply: true,
+        },
+      },
+      "/api/admin/vscode/detect": { body: makeVSCodeDetect() },
+      "/api/admin/storage/image-staging": {
+        body: makeImageStagingStatus(),
+      },
+      "/api/admin/storage/logs": {
+        body: makeLogsStorageStatus(),
+      },
+      "/api/admin/storage/preview-drive/bot-delete": {
+        body: makePreviewDriveStatus({ gatewayId: "bot-delete", name: "待删除机器人" }),
+      },
+    }));
+
+    render(<AdminRoute />);
+
+    await openAdminArea(user, "机器人");
+    await user.click(await screen.findByRole("button", { name: "删除机器人" }));
+    expect(await screen.findByRole("dialog")).toHaveTextContent("确认删除机器人");
+    await user.click(screen.getByRole("button", { name: "确认删除" }));
+
+    expect(await screen.findByRole("heading", { name: "添加机器人" })).toBeInTheDocument();
+    expect(await screen.findByText("机器人已删除。")).toBeInTheDocument();
+  });
+
+  it("cleans up logs and updates the visible count", async () => {
+    window.history.replaceState({}, "", "/admin");
+    const user = userEvent.setup();
+
+    installMockFetch(withClaudeProfiles({
+      "/api/admin/bootstrap-state": { body: makeBootstrap() },
+      "/api/admin/feishu/apps": {
+        body: {
+          apps: [makeApp({ id: "bot-1", name: "主机器人", appId: "cli_main" })],
+        },
+      },
+      "/api/admin/autostart/detect": {
+        body: {
+          platform: "linux",
+          supported: true,
+          status: "enabled",
+          configured: true,
+          enabled: true,
+          canApply: true,
+        },
+      },
+      "/api/admin/vscode/detect": { body: makeVSCodeDetect() },
+      "/api/admin/storage/image-staging": {
+        body: makeImageStagingStatus(),
+      },
+      "/api/admin/storage/logs": {
+        body: makeLogsStorageStatus({ fileCount: 128, totalBytes: 860 * 1024 * 1024 }),
+      },
+      "/api/admin/storage/logs/cleanup": {
+        body: {
+          rootDir: "/tmp/logs",
+          olderThanHours: 24,
+          deletedFiles: 70,
+          deletedBytes: 440 * 1024 * 1024,
+          remainingFileCount: 58,
+          remainingBytes: 420 * 1024 * 1024,
+        },
+      },
+      "/api/admin/storage/preview-drive/bot-1": {
+        body: makePreviewDriveStatus({ gatewayId: "bot-1", name: "主机器人" }),
+      },
+    }));
+
+    render(<AdminRoute />);
+
+    await openAdminArea(user, "系统");
+    expect(await screen.findByText("128 个文件，约 860 MB")).toBeInTheDocument();
+    await user.click(screen.getByRole("button", { name: "清理一天前日志" }));
+    expect(await screen.findByText("58 个文件，约 420 MB")).toBeInTheDocument();
+  });
+
+  it("keeps system maintenance errors user-facing", async () => {
+    window.history.replaceState({}, "", "/admin");
+    const user = userEvent.setup();
+
+    installMockFetch(withClaudeProfiles({
+      "/api/admin/bootstrap-state": { body: makeBootstrap() },
+      "/api/admin/feishu/apps": {
+        body: {
+          apps: [
+            makeApp({ id: "bot-1", name: "主机器人", appId: "cli_main" }),
+            makeApp({ id: "bot-2", name: "备用机器人", appId: "cli_backup" }),
+          ],
+        },
+      },
+      "/api/admin/autostart/detect": {
+        status: 500,
+        body: {
+          error: {
+            code: "autostart_detect_failed",
+            message: "failed to detect autostart state",
+            details: "query task scheduler task \\\\CodexFeishuRelay\\\\stable: exit status 1: ����",
+          },
+        },
+      },
+      "/api/admin/vscode/detect": { body: makeVSCodeDetect() },
+      "/api/admin/storage/image-staging": {
+        body: makeImageStagingStatus(),
+      },
+      "/api/admin/storage/logs": {
+        body: makeLogsStorageStatus(),
+      },
+      "/api/admin/storage/preview-drive/bot-1": {
+        body: makePreviewDriveStatus({ gatewayId: "bot-1", name: "主机器人" }),
+      },
+      "/api/admin/storage/preview-drive/bot-2": {
+        status: 500,
+        body: {
+          error: {
+            code: "preview_drive_status_failed",
+            message: "failed to read preview drive status",
+          },
+        },
+      },
+    }));
+
+    render(<AdminRoute />);
+
+    await openAdminArea(user, "系统");
+    expect(await screen.findByText("自动运行状态暂时无法读取，请稍后重试。")).toBeInTheDocument();
+    expect(screen.getByText("部分机器人预览文件状态暂时无法读取，请稍后重试。")).toBeInTheDocument();
+    expect(screen.queryByText(/autostart_detect_failed/)).not.toBeInTheDocument();
+    expect(screen.queryByText(/task scheduler/)).not.toBeInTheDocument();
+    expect(screen.queryByText(/����/)).not.toBeInTheDocument();
+  });
+
+  it("lets the user disable autostart from the system area when it is enabled", async () => {
+    window.history.replaceState({}, "", "/admin");
+    const user = userEvent.setup();
+    const app = makeApp({ id: "bot-1", name: "主机器人", appId: "cli_main" });
+
+    const { calls } = installMockFetch(makeSingleRobotAdminRoutes(app, {
+      "/api/admin/autostart/disable": {
+        body: {
+          platform: "linux",
+          supported: true,
+          status: "disabled",
+          configured: false,
+          enabled: false,
+          canApply: true,
+        },
+      },
+    }));
+
+    render(<AdminRoute />);
+
+    await openAdminArea(user, "系统");
+    expect(await screen.findByText("当前已启用。")).toBeInTheDocument();
+    const disableButton = screen.getByRole("button", { name: "关闭自动运行" });
+    expect(screen.queryByRole("button", { name: "启用自动运行" })).not.toBeInTheDocument();
+
+    await user.click(disableButton);
+
+    expect(await screen.findByText("当前未启用。")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "启用自动运行" })).toBeInTheDocument();
+    expect(calls.some((call) => call.path.endsWith("/autostart/disable"))).toBe(true);
+  });
+
+  it("renders the Claude configuration panel on the v1.7.0 admin layout", async () => {
+    window.history.replaceState({}, "", "/admin");
+    const user = userEvent.setup();
+
+    installMockFetch(withClaudeProfiles({
+      "/api/admin/bootstrap-state": { body: makeBootstrap() },
+      "/api/admin/feishu/apps": {
+        body: {
+          apps: [makeApp({ id: "bot-1", name: "主机器人", appId: "cli_main" })],
+        },
+      },
+      "/api/admin/autostart/detect": {
+        body: {
+          platform: "linux",
+          supported: true,
+          status: "enabled",
+          configured: true,
+          enabled: true,
+          canApply: true,
+        },
+      },
+      "/api/admin/vscode/detect": { body: makeVSCodeDetect() },
+      "/api/admin/storage/image-staging": {
+        body: makeImageStagingStatus(),
+      },
+      "/api/admin/storage/logs": {
+        body: makeLogsStorageStatus(),
+      },
+      "/api/admin/storage/preview-drive/bot-1": {
+        body: makePreviewDriveStatus({ gatewayId: "bot-1", name: "主机器人" }),
+      },
+    }));
+
+    render(<AdminRoute />);
+
+    await openAdminArea(user, "对话后端");
+    const heading = await screen.findByRole("heading", { name: "Claude" });
+    const section = heading.closest("section");
+    expect(section).not.toBeNull();
+    expect(within(section as HTMLElement).getByText("本机默认配置")).toBeInTheDocument();
+  });
+
+  it("renders the Codex provider panel on the v1.7.0 admin layout", async () => {
+    window.history.replaceState({}, "", "/admin");
+    const user = userEvent.setup();
+
+    installMockFetch(withClaudeProfiles({
+      "/api/admin/bootstrap-state": { body: makeBootstrap() },
+      "/api/admin/feishu/apps": {
+        body: {
+          apps: [makeApp({ id: "bot-1", name: "主机器人", appId: "cli_main" })],
+        },
+      },
+      "/api/admin/autostart/detect": {
+        body: {
+          platform: "linux",
+          supported: true,
+          status: "enabled",
+          configured: true,
+          enabled: true,
+          canApply: true,
+        },
+      },
+      "/api/admin/vscode/detect": { body: makeVSCodeDetect() },
+      "/api/admin/storage/image-staging": {
+        body: makeImageStagingStatus(),
+      },
+      "/api/admin/storage/logs": {
+        body: makeLogsStorageStatus(),
+      },
+      "/api/admin/storage/preview-drive/bot-1": {
+        body: makePreviewDriveStatus({ gatewayId: "bot-1", name: "主机器人" }),
+      },
+    }));
+
+    render(<AdminRoute />);
+
+    await openAdminArea(user, "对话后端");
+    await user.click(screen.getByRole("button", { name: "Codex" }));
+    const heading = await screen.findByRole("heading", { name: "Codex" });
+    const section = heading.closest("section");
+    expect(section).not.toBeNull();
+    expect(within(section as HTMLElement).getByText("本机默认 · 跟随 Codex")).toBeInTheDocument();
+  });
+
+  it("loads OpenCode profiles and exposes the OpenCode tab", async () => {
+    window.history.replaceState({}, "", "/admin");
+    const user = userEvent.setup();
+    const { calls } = installMockFetch(makeSingleRobotAdminRoutes(
+      makeApp({ id: "bot-1", name: "主机器人", appId: "cli_main" }),
+      {
+        "/api/admin/opencode/profiles": {
+          body: {
+            profiles: [
+              makeOpenCodeProfile(),
+              makeOpenCodeProfile({
+                id: "op_team",
+                revision: 7,
+                etag: '"opencode-profile-definition:op_team:7"',
+                name: "Team OpenCode",
+                baseURL: "https://api.example.com/v1",
+                hasAPIKey: true,
+                model: "kimi-k2",
+                smallModel: "kimi-small",
+                reviewModel: "hidden-review",
+                subagentModel: "kimi-agent",
+                reasoningEffort: "high",
+                projectConfigMode: "disable",
+                dataIsolationMode: "process",
+                permissionMode: "ask",
+                available: true,
+                builtIn: false,
+                persisted: true,
+                readOnly: false,
+              }),
+            ],
+          },
+        },
+      },
+    ));
+
+    render(<AdminRoute />);
+
+    await openAdminArea(user, "对话后端");
+    await user.click(await screen.findByRole("button", { name: "OpenCode" }));
+
+    expect(await screen.findByRole("heading", { name: "OpenCode" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: /Team OpenCode/ })).toBeInTheDocument();
+    expect(screen.getByText(/模型 kimi-k2/)).toBeInTheDocument();
+    expect(screen.queryByText("hidden-review")).not.toBeInTheDocument();
+    expect(screen.queryByText("projectConfigMode")).not.toBeInTheDocument();
+    expect(calls.some((call) => call.path === "/api/admin/opencode/profiles")).toBe(true);
+  });
+
+  it("keeps Claude profile editing user-facing and saves by required name", async () => {
+    window.history.replaceState({}, "", "/admin");
+    const user = userEvent.setup();
+    let profile = makeClaudeProfile({
+      id: "devseek",
+      name: "DevSeek",
+      authMode: "auth_token",
+      baseURL: "https://proxy.internal/v1",
+      hasAuthToken: true,
+      model: "mimo-v2.5-pro",
+      smallModel: "mimo-v2.5-haiku",
+      builtIn: false,
+      persisted: true,
+      readOnly: false,
+    });
+
+    const { calls } = installMockFetch(withClaudeProfiles({
+      "/api/admin/bootstrap-state": { body: makeBootstrap() },
+      "/api/admin/feishu/apps": {
+        body: {
+          apps: [makeApp({ id: "bot-1", name: "主机器人", appId: "cli_main" })],
+        },
+      },
+      "/api/admin/autostart/detect": {
+        body: {
+          platform: "linux",
+          supported: true,
+          status: "enabled",
+          configured: true,
+          enabled: true,
+          canApply: true,
+        },
+      },
+      "/api/admin/vscode/detect": { body: makeVSCodeDetect() },
+      "/api/admin/storage/image-staging": {
+        body: makeImageStagingStatus(),
+      },
+      "/api/admin/storage/logs": {
+        body: makeLogsStorageStatus(),
+      },
+      "/api/admin/storage/preview-drive/bot-1": {
+        body: makePreviewDriveStatus({ gatewayId: "bot-1", name: "主机器人" }),
+      },
+      "/api/admin/claude/profiles": (call: MockFetchCall) => {
+        if (call.method === "POST") {
+          const body = JSON.parse(String(call.init?.body ?? "{}"));
+          profile = makeClaudeProfile({
+            id: "test-profile",
+            name: body.name,
+            authMode: "auth_token",
+            baseURL: body.baseURL,
+            hasAuthToken: Boolean(body.authToken),
+            model: body.model,
+            smallModel: body.smallModel,
+            reasoningEffort: body.reasoningEffort,
+            builtIn: false,
+            persisted: true,
+            readOnly: false,
+          });
+          return { status: 201, body: { profile } };
+        }
+        return { body: { profiles: [makeClaudeProfile(), profile] } };
+      },
+      "/api/admin/claude/profiles/devseek": (call: MockFetchCall) => {
+        const body = JSON.parse(String(call.init?.body ?? "{}"));
+        profile = makeClaudeProfile({
+          id: "devseek-updated",
+          name: body.name,
+          authMode: "auth_token",
+          baseURL: body.baseURL,
+          hasAuthToken: true,
+          model: body.model,
+          smallModel: body.smallModel,
+          reasoningEffort: body.reasoningEffort,
+          builtIn: false,
+          persisted: true,
+          readOnly: false,
+        });
+        return { body: { profile } };
+      },
+    }, [makeClaudeProfile(), profile]));
+
+    render(<AdminRoute />);
+
+    await openAdminArea(user, "对话后端");
+    await user.click(await screen.findByRole("button", { name: /DevSeek/ }));
+
+    expect(screen.queryByText("认证方式")).not.toBeInTheDocument();
+    expect(screen.queryByText("Token 状态")).not.toBeInTheDocument();
+    expect(screen.queryByText("Token 处理方式")).not.toBeInTheDocument();
+    expect(screen.queryByText(/不会再次回显/)).not.toBeInTheDocument();
+    expect(screen.queryByText(/自动生成/)).not.toBeInTheDocument();
+
+    const nameInput = screen.getByLabelText(/名称/);
+    await user.clear(nameInput);
+    await user.type(nameInput, "DevSeek Updated");
+    await user.clear(screen.getByLabelText("端点地址"));
+    await user.type(screen.getByLabelText("端点地址"), "https://proxy.updated/v1");
+    await user.selectOptions(screen.getByLabelText("推理强度"), "max");
+    await user.click(screen.getByRole("button", { name: "保存修改" }));
+
+    expect(await screen.findByText("Claude 配置已保存。")).toBeInTheDocument();
+    const updateCall = calls.find(
+      (call) => call.method === "PUT" && call.path === "/api/admin/claude/profiles/devseek",
+    );
+    expect(updateCall).toBeDefined();
+    expect(JSON.parse(String(updateCall?.init?.body))).toEqual({
+      name: "DevSeek Updated",
+      baseURL: "https://proxy.updated/v1",
+      model: "mimo-v2.5-pro",
+      smallModel: "mimo-v2.5-haiku",
+      subagentModel: "",
+      instruction: "",
+      reasoningEffort: "max",
+      visionSupported: false,
+    });
+    expect(await screen.findByRole("button", { name: /DevSeek Updated/ })).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: /DevSeek$/ })).not.toBeInTheDocument();
+
+    const claudeSection = screen
+      .getByRole("heading", { name: "Claude" })
+      .closest("section");
+    expect(claudeSection).not.toBeNull();
+
+    await user.click(
+      within(claudeSection as HTMLElement).getByRole("button", { name: /新增配置/ }),
+    );
+    await user.click(screen.getByRole("button", { name: "保存配置" }));
+    expect(await screen.findByText("请填写名称。")).toBeInTheDocument();
+
+    await user.type(screen.getByLabelText(/名称/), "测试配置");
+    await user.type(screen.getByLabelText("认证 Token"), "new-token");
+    await user.selectOptions(screen.getByLabelText("推理强度"), "high");
+    await user.click(screen.getByRole("button", { name: "保存配置" }));
+
+    const createCall = calls.find(
+      (call) => call.method === "POST" && call.path === "/api/admin/claude/profiles",
+    );
+    expect(createCall).toBeDefined();
+    expect(JSON.parse(String(createCall?.init?.body))).toEqual({
+      name: "测试配置",
+      baseURL: "",
+      authToken: "new-token",
+      model: "",
+      smallModel: "",
+      subagentModel: "",
+      instruction: "",
+      reasoningEffort: "high",
+      visionSupported: false,
+    });
+  });
+});

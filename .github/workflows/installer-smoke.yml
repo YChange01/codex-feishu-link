@@ -1,0 +1,311 @@
+name: Installer Smoke
+
+on:
+  push:
+    paths:
+      - ".github/workflows/installer-smoke.yml"
+      - ".github/workflows/installer-lifecycle.yml"
+      - "scripts/ci/go-version-spec.sh"
+      - "install-release.sh"
+      - "install-release.ps1"
+      - "scripts/check/smoke-install-release.sh"
+      - "scripts/check/smoke-install-release.ps1"
+      - "scripts/check/smoke-packaged-install-lifecycle.sh"
+      - "scripts/check/smoke-packaged-install-lifecycle.ps1"
+      - "scripts/check/smoke-macos-installer-result-model.sh"
+      - "scripts/check/smoke-windows-nsis-installer.ps1"
+      - "scripts/release/build-artifacts.sh"
+      - "scripts/release/build-windows-nsis.sh"
+      - "scripts/release/build-macos-installer-app.sh"
+      - "scripts/release/build-macos-dmg.sh"
+      - "scripts/release/build-macos-packaged-installer.sh"
+      - "scripts/release/write-checksums.sh"
+      - "scripts/web/build-admin-ui.sh"
+      - "deploy/windows/**"
+      - "deploy/macos/**"
+      - "internal/app/install/**"
+      - "internal/app/launcher/**"
+      - "internal/config/**"
+  pull_request:
+    paths:
+      - ".github/workflows/installer-smoke.yml"
+      - ".github/workflows/installer-lifecycle.yml"
+      - "scripts/ci/go-version-spec.sh"
+      - "install-release.sh"
+      - "install-release.ps1"
+      - "scripts/check/smoke-install-release.sh"
+      - "scripts/check/smoke-install-release.ps1"
+      - "scripts/check/smoke-packaged-install-lifecycle.sh"
+      - "scripts/check/smoke-packaged-install-lifecycle.ps1"
+      - "scripts/check/smoke-macos-installer-result-model.sh"
+      - "scripts/check/smoke-windows-nsis-installer.ps1"
+      - "scripts/release/build-artifacts.sh"
+      - "scripts/release/build-windows-nsis.sh"
+      - "scripts/release/build-macos-installer-app.sh"
+      - "scripts/release/build-macos-dmg.sh"
+      - "scripts/release/build-macos-packaged-installer.sh"
+      - "scripts/release/write-checksums.sh"
+      - "scripts/web/build-admin-ui.sh"
+      - "deploy/windows/**"
+      - "deploy/macos/**"
+      - "internal/app/install/**"
+      - "internal/app/launcher/**"
+      - "internal/config/**"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: installer-smoke-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-fixtures:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Resolve Go version spec
+        id: go_version
+        shell: bash
+        run: echo "version=$(bash scripts/ci/go-version-spec.sh)" >> "${GITHUB_OUTPUT}"
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: lts/*
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+
+      - name: Setup Go
+        uses: actions/setup-go@v6
+        with:
+          go-version: ${{ steps.go_version.outputs.version }}
+
+      - name: Install NSIS
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y nsis
+
+      - name: Install web dependencies
+        working-directory: web
+        run: npm ci
+
+      - name: Build production fixture
+        env:
+          CODEX_FEISHU_RELAY_BUILD_FLAVOR: shipping
+        run: bash scripts/release/build-artifacts.sh v0.0.0 dist-production
+
+      - name: Build beta fixture
+        env:
+          CODEX_FEISHU_RELAY_BUILD_FLAVOR: shipping
+        run: bash scripts/release/build-artifacts.sh v0.1.0-beta.1 dist-beta --skip-admin-ui-build
+
+      - name: Build production Windows NSIS installer
+        run: |
+          bash scripts/release/build-windows-nsis.sh \
+            --version v0.0.0 \
+            --track production \
+            --dist-dir dist-production
+
+      - name: Build beta Windows NSIS installer
+        run: |
+          bash scripts/release/build-windows-nsis.sh \
+            --version v0.1.0-beta.1 \
+            --track beta \
+            --dist-dir dist-beta
+
+      - name: Upload production fixture
+        uses: actions/upload-artifact@v4
+        with:
+          name: installer-smoke-prod
+          path: dist-production
+          if-no-files-found: error
+
+      - name: Upload production macOS packaging fixture
+        uses: actions/upload-artifact@v4
+        with:
+          name: installer-smoke-prod-macos-input
+          path: |
+            dist-production/codex-feishu-relay_*_darwin_amd64.tar.gz
+            dist-production/codex-feishu-relay_*_darwin_arm64.tar.gz
+          if-no-files-found: error
+
+      - name: Upload beta fixture
+        uses: actions/upload-artifact@v4
+        with:
+          name: installer-smoke-beta
+          path: dist-beta
+          if-no-files-found: error
+
+      - name: Upload production Windows NSIS installer
+        uses: actions/upload-artifact@v4
+        with:
+          name: installer-smoke-prod-windows-nsis
+          path: dist-production/codex-feishu-relay_0.0.0_windows_amd64_installer.exe
+          if-no-files-found: error
+          compression-level: 0
+
+      - name: Upload beta Windows NSIS installer
+        uses: actions/upload-artifact@v4
+        with:
+          name: installer-smoke-beta-windows-nsis
+          path: dist-beta/codex-feishu-relay_0.1.0-beta.1_windows_amd64_installer.exe
+          if-no-files-found: error
+          compression-level: 0
+
+      - name: Upload beta macOS packaging fixture
+        uses: actions/upload-artifact@v4
+        with:
+          name: installer-smoke-beta-macos-input
+          path: |
+            dist-beta/codex-feishu-relay_*_darwin_amd64.tar.gz
+            dist-beta/codex-feishu-relay_*_darwin_arm64.tar.gz
+          if-no-files-found: error
+
+  smoke-unix:
+    needs: build-fixtures
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - ubuntu-latest
+          - macos-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Download production fixture
+        uses: actions/download-artifact@v4
+        with:
+          name: installer-smoke-prod
+          path: ${{ runner.temp }}/installer-smoke/prod
+
+      - name: Download beta fixture
+        uses: actions/download-artifact@v4
+        with:
+          name: installer-smoke-beta
+          path: ${{ runner.temp }}/installer-smoke/beta
+
+      - name: Smoke test shell installer
+        run: |
+          bash scripts/check/smoke-install-release.sh \
+            --version v0.0.0 \
+            --beta-version v0.1.0-beta.1 \
+            --prod-dist-dir "${RUNNER_TEMP}/installer-smoke/prod" \
+            --beta-dist-dir "${RUNNER_TEMP}/installer-smoke/beta"
+
+  smoke-windows:
+    needs: build-fixtures
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Download production fixture
+        uses: actions/download-artifact@v4
+        with:
+          name: installer-smoke-prod
+          path: ${{ runner.temp }}\installer-smoke\prod
+
+      - name: Download beta fixture
+        uses: actions/download-artifact@v4
+        with:
+          name: installer-smoke-beta
+          path: ${{ runner.temp }}\installer-smoke\beta
+
+      - name: Download production Windows NSIS installer
+        uses: actions/download-artifact@v4
+        with:
+          name: installer-smoke-prod-windows-nsis
+          path: ${{ runner.temp }}\installer-smoke\nsis\prod
+
+      - name: Download beta Windows NSIS installer
+        uses: actions/download-artifact@v4
+        with:
+          name: installer-smoke-beta-windows-nsis
+          path: ${{ runner.temp }}\installer-smoke\nsis\beta
+
+      - name: Smoke test PowerShell installer
+        shell: pwsh
+        run: |
+          ./scripts/check/smoke-install-release.ps1 `
+            -Version v0.0.0 `
+            -BetaVersion v0.1.0-beta.1 `
+            -ProdDistDir "$env:RUNNER_TEMP\installer-smoke\prod" `
+            -BetaDistDir "$env:RUNNER_TEMP\installer-smoke\beta"
+
+      - name: Smoke test Windows NSIS installer
+        shell: pwsh
+        run: |
+          ./scripts/check/smoke-windows-nsis-installer.ps1 `
+            -ProdInstallerPath "$env:RUNNER_TEMP\installer-smoke\nsis\prod\codex-feishu-relay_0.0.0_windows_amd64_installer.exe" `
+            -BetaInstallerPath "$env:RUNNER_TEMP\installer-smoke\nsis\beta\codex-feishu-relay_0.1.0-beta.1_windows_amd64_installer.exe"
+
+  build-macos-packaged-installer:
+    needs: build-fixtures
+    runs-on: macos-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Smoke macOS installer result model
+        run: bash scripts/check/smoke-macos-installer-result-model.sh
+
+      - name: Download production fixture
+        uses: actions/download-artifact@v4
+        with:
+          name: installer-smoke-prod-macos-input
+          path: ${{ runner.temp }}/installer-smoke/prod
+
+      - name: Download beta fixture
+        uses: actions/download-artifact@v4
+        with:
+          name: installer-smoke-beta-macos-input
+          path: ${{ runner.temp }}/installer-smoke/beta
+
+      - name: Build production macOS packaged installer
+        run: |
+          bash scripts/release/build-macos-packaged-installer.sh \
+            --version v0.0.0 \
+            --track production \
+            --dist-dir "${RUNNER_TEMP}/installer-smoke/prod"
+
+      - name: Build beta macOS packaged installer
+        run: |
+          bash scripts/release/build-macos-packaged-installer.sh \
+            --version v0.1.0-beta.1 \
+            --track beta \
+            --dist-dir "${RUNNER_TEMP}/installer-smoke/beta"
+
+      - name: Verify packaged installer outputs
+        run: |
+          prod_dmg="${RUNNER_TEMP}/installer-smoke/prod/codex-feishu-relay_0.0.0_darwin_universal_installer.dmg"
+          beta_dmg="${RUNNER_TEMP}/installer-smoke/beta/codex-feishu-relay_0.1.0-beta.1_darwin_universal_installer.dmg"
+          [[ -f "${prod_dmg}" ]]
+          [[ -f "${beta_dmg}" ]]
+          grep -F "$(basename "${prod_dmg}")" "${RUNNER_TEMP}/installer-smoke/prod/checksums.txt"
+          grep -F "$(basename "${beta_dmg}")" "${RUNNER_TEMP}/installer-smoke/beta/checksums.txt"
+
+      - name: Upload production macOS packaged installer
+        uses: actions/upload-artifact@v4
+        with:
+          name: installer-smoke-macos-prod-dmg
+          path: ${{ runner.temp }}/installer-smoke/prod/codex-feishu-relay_0.0.0_darwin_universal_installer.dmg
+          if-no-files-found: error
+          compression-level: 0
+
+      - name: Upload beta macOS packaged installer
+        uses: actions/upload-artifact@v4
+        with:
+          name: installer-smoke-macos-beta-dmg
+          path: ${{ runner.temp }}/installer-smoke/beta/codex-feishu-relay_0.1.0-beta.1_darwin_universal_installer.dmg
+          if-no-files-found: error
+          compression-level: 0

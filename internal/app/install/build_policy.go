@@ -1,0 +1,61 @@
+package install
+
+import (
+	"github.com/YChange01/codex-feishu-link/internal/buildinfo"
+	"github.com/YChange01/codex-feishu-link/internal/config"
+)
+
+func CurrentBuildAllowsReleaseTrack(track ReleaseTrack) bool {
+	return buildinfo.CurrentCapabilityPolicy().AllowsReleaseTrack(string(track))
+}
+
+func CurrentBuildAllowedReleaseTracks() []ReleaseTrack {
+	policy := buildinfo.CurrentCapabilityPolicy()
+	values := make([]ReleaseTrack, 0, len(policy.AllowedReleaseTracks))
+	for _, track := range policy.AllowedReleaseTracks {
+		if parsed := ParseReleaseTrack(track); parsed != "" {
+			values = append(values, parsed)
+		}
+	}
+	return values
+}
+
+func CurrentBuildAllowsLocalUpgrade() bool {
+	return buildinfo.CurrentCapabilityPolicy().AllowLocalUpgrade
+}
+
+func CurrentBuildAllowsDevUpgrade() bool {
+	return buildinfo.CurrentCapabilityPolicy().AllowDevUpgrade
+}
+
+func DefaultTrackForInstallSource(source InstallSource) ReleaseTrack {
+	source = normalizeInstallSource(source)
+	if source != InstallSourceRelease && CurrentBuildAllowsReleaseTrack(ReleaseTrackAlpha) {
+		return ReleaseTrackAlpha
+	}
+	for _, track := range []ReleaseTrack{ReleaseTrackProduction, ReleaseTrackBeta, ReleaseTrackAlpha} {
+		if CurrentBuildAllowsReleaseTrack(track) {
+			return track
+		}
+	}
+	return ReleaseTrackProduction
+}
+
+func applyBuildFlavorDebugDefaults(cfg *config.AppConfig) {
+	if cfg == nil {
+		return
+	}
+	policy := buildinfo.CurrentCapabilityPolicy()
+	if cfg.Debug.Pprof == nil {
+		cfg.Debug.Pprof = &config.PprofSettings{}
+	}
+	if policy.DefaultPprofEnabled {
+		cfg.Debug.Pprof.Enabled = true
+	}
+	if policy.DefaultRelayFlow {
+		cfg.Debug.RelayFlow = true
+	}
+	if policy.DefaultRelayRaw {
+		cfg.Debug.RelayRaw = true
+	}
+}

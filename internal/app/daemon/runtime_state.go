@@ -1,0 +1,144 @@
+package daemon
+
+import (
+	"sync"
+	"sync/atomic"
+	"time"
+
+	"github.com/YChange01/codex-feishu-link/internal/adapter/feishu"
+	"github.com/YChange01/codex-feishu-link/internal/app/cronrepo"
+	cronrt "github.com/YChange01/codex-feishu-link/internal/app/cronruntime"
+	"github.com/YChange01/codex-feishu-link/internal/app/daemon/botcapabilitysettings"
+	"github.com/YChange01/codex-feishu-link/internal/app/daemon/claudeworkspaceprofile"
+	"github.com/YChange01/codex-feishu-link/internal/app/daemon/feishubotidentity"
+	"github.com/YChange01/codex-feishu-link/internal/app/daemon/feishufacts"
+	"github.com/YChange01/codex-feishu-link/internal/app/daemon/feishuroomstate"
+	"github.com/YChange01/codex-feishu-link/internal/app/daemon/surfaceresume"
+	"github.com/YChange01/codex-feishu-link/internal/core/control"
+)
+
+type surfaceResumeRecoveryState struct {
+	Entry               surfaceresume.Entry
+	NextAttemptAt       time.Time
+	LastAttemptAt       time.Time
+	LastFailureCode     string
+	StickyFailureCode   string
+	LastNoticeCode      string
+	TerminalFailureCode string
+}
+
+type vscodeMigrationFlowRecord struct {
+	FlowID           string
+	SurfaceSessionID string
+	OwnerUserID      string
+	MessageID        string
+	IssueKey         string
+	CreatedAt        time.Time
+	UpdatedAt        time.Time
+	ExpiresAt        time.Time
+}
+
+type surfaceResumeRuntimeState struct {
+	persistedStoreRuntimeState[*surfaceresume.Store]
+	recovery                    map[string]*surfaceResumeRecoveryState
+	groupOnDemandContinuations  map[string]*groupOnDemandResumeContinuation
+	groupTerminalFailureNotices map[string]string
+	vscodeMigrationFlows        map[string]*vscodeMigrationFlowRecord
+	vscodeMigrationNextSeq      int64
+	vscodeResumeNotices         map[string]bool
+	vscodeStartupCheckDue       bool
+	vscodeDetachedPromptScanDue bool
+	startupRefreshPending       map[string]bool
+	startupRefreshSeen          bool
+	workspaceContextRoots       map[string]string
+}
+
+type groupOnDemandResumeContinuation struct {
+	Action    control.Action
+	ExpireAt  time.Time
+	CreatedAt time.Time
+}
+
+type claudeWorkspaceProfileRuntimeState struct {
+	persistedStoreRuntimeState[*claudeworkspaceprofile.Store]
+}
+
+type botCapabilitySettingsRuntimeState struct {
+	persistedStoreRuntimeState[*botcapabilitysettings.Store]
+}
+
+type feishuBotIdentityRuntimeState struct {
+	persistedStoreRuntimeState[*feishubotidentity.Store]
+}
+
+type feishuFactsRuntimeState struct {
+	persistedStoreRuntimeState[*feishufacts.Store]
+	mu              sync.RWMutex
+	nextRefresh     time.Time
+	refreshInFlight bool
+}
+
+type feishuRoomRuntimeState struct {
+	persistedStoreRuntimeState[*feishuroomstate.Store]
+	workspaceConflicts map[string]bool
+}
+
+type daemonAsyncRuntimeState struct {
+	sharedDesktop map[string]*sharedDesktopJob
+	pending       []daemonAsyncResult
+	drainQueued   bool
+}
+
+type cronRuntimeState struct {
+	stateIOMu             sync.Mutex
+	loaded                bool
+	syncInFlight          bool
+	state                 *cronrt.StateFile
+	runs                  map[string]*cronrt.RunState
+	jobActiveRuns         map[string]map[string]struct{}
+	exitTargets           map[string]*cronrt.ExitTarget
+	bitableFactory        func(string) (feishu.BitableAPI, error)
+	gatewayIdentityLookup func(string) (cronrt.GatewayIdentity, bool, error)
+	nextScheduleScan      time.Time
+	repoManager           *cronrepo.Manager
+}
+
+type feishuRuntimeState struct {
+	mu                   sync.RWMutex
+	permissionMu         sync.RWMutex
+	primaryGatewayByChat atomic.Value
+	runtimeApply         map[string]feishuRuntimeApplyPendingState
+	attentionRequests    map[string]time.Time
+	permissionGaps       map[string]map[string]*feishuPermissionGapRecord
+	onboarding           map[string]*feishuOnboardingSession
+	registration         feishuRegistrationRunner
+}
+
+func newSurfaceResumeRuntimeState() surfaceResumeRuntimeState {
+	return surfaceResumeRuntimeState{
+		recovery:                    map[string]*surfaceResumeRecoveryState{},
+		groupOnDemandContinuations:  map[string]*groupOnDemandResumeContinuation{},
+		vscodeMigrationFlows:        map[string]*vscodeMigrationFlowRecord{},
+		vscodeResumeNotices:         map[string]bool{},
+		vscodeDetachedPromptScanDue: true,
+		startupRefreshPending:       map[string]bool{},
+		workspaceContextRoots:       map[string]string{},
+	}
+}
+
+func newCronRuntimeState() cronRuntimeState {
+	return cronRuntimeState{
+		runs:          map[string]*cronrt.RunState{},
+		jobActiveRuns: map[string]map[string]struct{}{},
+		exitTargets:   map[string]*cronrt.ExitTarget{},
+	}
+}
+
+func newFeishuRuntimeState() feishuRuntimeState {
+	return feishuRuntimeState{
+		runtimeApply:      map[string]feishuRuntimeApplyPendingState{},
+		attentionRequests: map[string]time.Time{},
+		permissionGaps:    map[string]map[string]*feishuPermissionGapRecord{},
+		onboarding:        map[string]*feishuOnboardingSession{},
+	}
+}

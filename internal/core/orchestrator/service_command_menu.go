@@ -1,0 +1,45 @@
+package orchestrator
+
+import (
+	"strings"
+
+	"github.com/YChange01/codex-feishu-link/internal/core/control"
+	"github.com/YChange01/codex-feishu-link/internal/core/state"
+)
+
+type commandMenuStage string
+
+const (
+	commandMenuStageDetached      commandMenuStage = commandMenuStage(control.FeishuCommandMenuStageDetached)
+	commandMenuStageNormalWorking commandMenuStage = commandMenuStage(control.FeishuCommandMenuStageNormalWorking)
+	commandMenuStageVSCodeWorking commandMenuStage = commandMenuStage(control.FeishuCommandMenuStageVSCodeWorking)
+)
+
+func parseCommandMenuView(raw string) string {
+	fields := strings.Fields(strings.TrimSpace(raw))
+	if len(fields) < 2 {
+		return ""
+	}
+	return strings.ToLower(strings.TrimSpace(fields[1]))
+}
+
+func (s *Service) commandMenuStage(surface *state.SurfaceConsoleRecord) commandMenuStage {
+	if surface == nil || strings.TrimSpace(surface.AttachedInstanceID) == "" {
+		return commandMenuStageDetached
+	}
+	if s.surfaceIsVSCode(surface) {
+		return commandMenuStageVSCodeWorking
+	}
+	return commandMenuStageNormalWorking
+}
+
+func (s *Service) buildCommandHelpView(surface *state.SurfaceConsoleRecord) control.FeishuCatalogView {
+	page := control.BuildFeishuCommandDisplayPageViewForContext(
+		"命令帮助",
+		"以下是当前主展示的 canonical slash command。历史 alias 仍可兼容，但不再作为新的主展示入口。",
+		false,
+		s.buildCatalogContext(surface),
+	)
+	page.CommandID = control.FeishuCommandHelp
+	return control.FeishuCatalogView{Page: &page}
+}

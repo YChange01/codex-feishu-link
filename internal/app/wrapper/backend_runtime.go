@@ -1,0 +1,892 @@
+package wrapper
+
+import (
+	"context"
+	"encoding/json"
+	"strings"
+	"sync"
+	"time"
+
+	acpadapter "github.com/YChange01/codex-feishu-link/internal/adapter/acp"
+	"github.com/YChange01/codex-feishu-link/internal/adapter/claude"
+	"github.com/YChange01/codex-feishu-link/internal/adapter/codex"
+	"github.com/YChange01/codex-feishu-link/internal/claudesessionstore"
+	"github.com/YChange01/codex-feishu-link/internal/core/agentproto"
+	"github.com/YChange01/codex-feishu-link/internal/debuglog"
+	"github.com/YChange01/codex-feishu-link/internal/pathcanon"
+	"github.com/YChange01/codex-feishu-link/internal/pathcompare"
+)
+
+type runtimeObserveResult struct {
+	Events                   []agentproto.Event
+	OutboundToChild          [][]byte
+	OutboundToParent         [][]byte
+	ResolvedCommandResponses []runtimeResolvedCommandResponse
+	Suppress                 bool
+}
+
+type runtimeResolvedCommandResponse struct {
+	RequestID     string
+	RejectMessage string
+}
+
+type runtimeCommandPhase struct {
+	OutboundToChild [][]byte
+	ResponseGate    *runtimeCommandResponseGate
+	Abort           func()
+}
+
+type runtimeCommandResult struct {
+	Events  []agentproto.Event
+	Phases  []runtimeCommandPhase
+	Restart *runtimeCommandRestart
+}
+
+type runtimeCommandRestart struct {
+	DispatchPlan agentproto.PromptDispatchPlan
+}
+
+type runtimeCommandResponseGate struct {
+	RequestID      string
+	RejectProblem  agentproto.ErrorInfo
+	Timeout        time.Duration
+	TimeoutProblem agentproto.ErrorInfo
+	SuppressFrame  bool
+}
+
+type backendRuntime interface {
+	Backend() agentproto.Backend
+	Capabilities() agentproto.Capabilities
+	Launch(context.Context, *App, *debuglog.RawLogger, func(agentproto.ErrorInfo)) (*childSession, error)
+	ObserveClient([]byte) (runtimeObserveResult, error)
+	ObserveServer([]byte) (runtimeObserveResult, error)
+	TranslateCommand(agentproto.Command) (runtimeCommandResult, error)
+	PrepareChildRestart(string, agentproto.PromptDispatchPlan, *agentproto.CodexResumePolicy) error
+	BuildChildRestartRestoreFrame(string) ([]byte, string, bool, error)
+	CancelChildRestartRestore(string)
+}
+
+type runtimeDebugLogger interface {
+	SetDebugLogger(func(string, ...any))
+}
+
+func newBackendRuntime(cfg Config) backendRuntime {
+	backend, ok := agentproto.ParseBackend(cfg.Backend)
+	if !ok {
+		return &unsupportedBackendRuntime{backend: agentproto.Backend(strings.TrimSpace(string(cfg.Backend)))}
+	}
+	switch backend {
+	case agentproto.BackendClaude:
+		runtime := &claudeBackendRuntime{
+			translator:    claude.NewTranslator(cfg.InstanceID),
+			workspaceRoot: cfg.WorkspaceRoot,
+		}
+		if threadID := strings.TrimSpace(cfg.ResumeThreadID); threadID != "" {
+			runtime.initialLaunchResume = &claudeLaunchResumeTarget{
+				ThreadID: threadID,
+				CWD:      pathcanon.Native(cfg.WorkspaceRoot),
+			}
+		}
+		return runtime
+	case agentproto.BackendOpenCode:
+		return &opencodeBackendRuntime{
+			translator: acpadapter.NewTranslator(cfg.InstanceID, cfg.WorkspaceRoot),
+		}
+	default:
+		translator := codex.NewTranslator(cfg.InstanceID)
+		translator.SetSharedAppServerMode(cfg.SharedAppServer)
+		return &codexBackendRuntime{translator: translator, sharedAppServer: cfg.SharedAppServer}
+	}
+}
+
+type unsupportedBackendRuntime struct {
+	backend agentproto.Backend
+}
+
+func (r *unsupportedBackendRuntime) Backend() agentproto.Backend {
+	return r.backend
+}
+
+func (r *unsupportedBackendRuntime) Capabilities() agentproto.Capabilities {
+	return agentproto.Capabilities{}
+}
+
+func (r *unsupportedBackendRuntime) Launch(context.Context, *App, *debuglog.RawLogger, func(agentproto.ErrorInfo)) (*childSession, error) {
+	return nil, agentproto.ErrorInfo{
+		Code:    "backend_unsupported",
+		Layer:   "wrapper",
+		Stage:   "launch",
+		Message: "backend_unsupported",
+	}
+}
+
+func (r *unsupportedBackendRuntime) ObserveClient([]byte) (runtimeObserveResult, error) {
+	return runtimeObserveResult{}, nil
+}
+
+func (r *unsupportedBackendRuntime) ObserveServer([]byte) (runtimeObserveResult, error) {
+	return runtimeObserveResult{}, nil
+}
+
+func (r *unsupportedBackendRuntime) TranslateCommand(command agentproto.Command) (runtimeCommandResult, error) {
+	return runtimeCommandResult{}, agentproto.ErrorInfo{
+		Code:      "backend_unsupported",
+		Layer:     "wrapper",
+		Stage:     "translate_command",
+		Operation: string(command.Kind),
+		Message:   "backend_unsupported",
+		CommandID: command.CommandID,
+		ThreadID:  command.Target.ThreadID,
+		TurnID:    command.Target.TurnID,
+	}
+}
+
+func (r *unsupportedBackendRuntime) PrepareChildRestart(string, agentproto.PromptDispatchPlan, *agentproto.CodexResumePolicy) error {
+	return nil
+}
+
+func (r *unsupportedBackendRuntime) BuildChildRestartRestoreFrame(string) ([]byte, string, bool, error) {
+	return nil, "", false, nil
+}
+
+func (r *unsupportedBackendRuntime) CancelChildRestartRestore(string) {}
+
+type opencodeBackendRuntime struct {
+	mu         sync.Mutex
+	translator *acpadapter.Translator
+}
+
+func (r *opencodeBackendRuntime) Backend() agentproto.Backend {
+	return agentproto.BackendOpenCode
+}
+
+func (r *opencodeBackendRuntime) Capabilities() agentproto.Capabilities {
+	return agentproto.DefaultCapabilitiesForBackend(agentproto.BackendOpenCode)
+}
+
+func (r *opencodeBackendRuntime) Launch(ctx context.Context, app *App, rawLogger *debuglog.RawLogger, reportProblem func(agentproto.ErrorInfo)) (*childSession, error) {
+	if app == nil {
+		return nil, nil
+	}
+	return app.launchOpenCodeChildSession(ctx, rawLogger, reportProblem, r.translator)
+}
+
+func (r *opencodeBackendRuntime) ObserveClient(line []byte) (runtimeObserveResult, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	result, err := r.translator.ObserveClient(line)
+	if err != nil {
+		return runtimeObserveResult{}, err
+	}
+	return mapOpenCodeObserveResult(result), nil
+}
+
+func (r *opencodeBackendRuntime) ObserveServer(line []byte) (runtimeObserveResult, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	result, err := r.translator.ObserveServer(line)
+	if err != nil {
+		return runtimeObserveResult{}, err
+	}
+	return mapOpenCodeObserveResult(result), nil
+}
+
+func (r *opencodeBackendRuntime) TranslateCommand(command agentproto.Command) (runtimeCommandResult, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	result, err := r.translator.TranslateCommand(command)
+	if err != nil {
+		return runtimeCommandResult{}, err
+	}
+	return runtimeCommandResult{
+		Events: result.Events,
+		Phases: singleRuntimeCommandPhases(result.OutboundToChild),
+	}, nil
+}
+
+func (r *opencodeBackendRuntime) SetDebugLogger(debugLog func(string, ...any)) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.translator != nil {
+		r.translator.SetDebugLogger(debugLog)
+	}
+}
+
+func (r *opencodeBackendRuntime) PrepareChildRestart(string, agentproto.PromptDispatchPlan, *agentproto.CodexResumePolicy) error {
+	return nil
+}
+
+func (r *opencodeBackendRuntime) BuildChildRestartRestoreFrame(string) ([]byte, string, bool, error) {
+	return nil, "", false, nil
+}
+
+func (r *opencodeBackendRuntime) CancelChildRestartRestore(string) {}
+
+func mapOpenCodeObserveResult(result acpadapter.Result) runtimeObserveResult {
+	return runtimeObserveResult{
+		Events:                   result.Events,
+		OutboundToChild:          result.OutboundToChild,
+		OutboundToParent:         result.OutboundToParent,
+		ResolvedCommandResponses: mapOpenCodeResolvedCommandResponses(result.ResolvedCommandResponses),
+		Suppress:                 result.Suppress,
+	}
+}
+
+func mapOpenCodeResolvedCommandResponses(responses []acpadapter.ResolvedCommandResponse) []runtimeResolvedCommandResponse {
+	if len(responses) == 0 {
+		return nil
+	}
+	mapped := make([]runtimeResolvedCommandResponse, 0, len(responses))
+	for _, response := range responses {
+		requestID := strings.TrimSpace(response.RequestID)
+		if requestID == "" {
+			continue
+		}
+		mapped = append(mapped, runtimeResolvedCommandResponse{
+			RequestID:     requestID,
+			RejectMessage: strings.TrimSpace(response.RejectMessage),
+		})
+	}
+	if len(mapped) == 0 {
+		return nil
+	}
+	return mapped
+}
+
+type codexBackendRuntime struct {
+	sharedAppServer bool
+	mu              sync.Mutex
+	translator      *codex.Translator
+}
+
+func (r *codexBackendRuntime) Backend() agentproto.Backend {
+	return agentproto.BackendCodex
+}
+
+func (r *codexBackendRuntime) Capabilities() agentproto.Capabilities {
+	capabilities := agentproto.DefaultCapabilitiesForBackend(agentproto.BackendCodex)
+	capabilities.ModelCatalog = true
+	capabilities.SharedAppServer = r.sharedAppServer
+	return capabilities
+}
+
+func (r *codexBackendRuntime) Launch(ctx context.Context, app *App, rawLogger *debuglog.RawLogger, reportProblem func(agentproto.ErrorInfo)) (*childSession, error) {
+	if app == nil {
+		return nil, nil
+	}
+	return app.launchCodexChildSession(ctx, rawLogger, reportProblem)
+}
+
+func (r *codexBackendRuntime) ObserveClient(line []byte) (runtimeObserveResult, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	result, err := r.translator.ObserveClient(line)
+	if err != nil {
+		return runtimeObserveResult{}, err
+	}
+	return runtimeObserveResult{
+		Events:          result.Events,
+		OutboundToChild: result.OutboundToCodex,
+		Suppress:        result.Suppress,
+	}, nil
+}
+
+func (r *codexBackendRuntime) ObserveServer(line []byte) (runtimeObserveResult, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	result, err := r.translator.ObserveServer(line)
+	if err != nil {
+		return runtimeObserveResult{}, err
+	}
+	return runtimeObserveResult{
+		Events:           result.Events,
+		OutboundToChild:  result.OutboundToCodex,
+		OutboundToParent: result.OutboundToParent,
+		Suppress:         result.Suppress,
+	}, nil
+}
+
+func (r *codexBackendRuntime) TranslateCommand(command agentproto.Command) (runtimeCommandResult, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	outbound, err := r.translator.TranslateCommand(command)
+	if err != nil {
+		return runtimeCommandResult{}, err
+	}
+	result := runtimeCommandResult{Phases: singleRuntimeCommandPhases(outbound)}
+	if command.Kind == agentproto.CommandTurnSteer && len(result.Phases) > 0 {
+		gate, err := newTurnSteerResponseGate(command, outbound[0])
+		if err != nil {
+			return runtimeCommandResult{}, err
+		}
+		result.Phases[0].ResponseGate = gate
+	}
+	return result, nil
+}
+
+func (r *codexBackendRuntime) PrepareChildRestart(commandID string, _ agentproto.PromptDispatchPlan, policy *agentproto.CodexResumePolicy) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.sharedAppServer {
+		// The child only transports a desktop-owned connection. Reject before
+		// stopping it: changing its launch configuration cannot reconfigure the
+		// desktop daemon and would invalidate the current subscription.
+		return agentproto.ErrorInfo{
+			Code: "shared_app_server_restart_not_supported", Layer: "wrapper",
+			Stage: "restart_child_prepare", Operation: string(agentproto.CommandProcessChildRestart),
+			Message: "共享桌面模式不能通过飞书重启或重新配置桌面 Codex；请在桌面端修改设置。", CommandID: commandID,
+		}
+	}
+	r.translator.PrepareChildRestartRestorePolicy(policy)
+	return nil
+}
+
+func (r *codexBackendRuntime) BuildChildRestartRestoreFrame(commandID string) ([]byte, string, bool, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.translator.BuildChildRestartRestoreFrame(commandID)
+}
+
+func (r *codexBackendRuntime) CancelChildRestartRestore(requestID string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.translator.CancelChildRestartRestore(requestID)
+}
+
+func (r *codexBackendRuntime) SetDebugLogger(debugLog func(string, ...any)) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.translator.SetDebugLogger(debugLog)
+}
+
+type claudeBackendRuntime struct {
+	mu                        sync.Mutex
+	translator                *claude.Translator
+	workspaceRoot             string
+	initialLaunchResume       *claudeLaunchResumeTarget
+	pendingLaunchResume       *claudeLaunchResumeTarget
+	pendingRestartCommandID   string
+	completedRestartCommandID string
+	expectedResumeThread      *claudeLaunchResumeTarget
+}
+
+type claudeLaunchResumeTarget struct {
+	ThreadID      string
+	CWD           string
+	ForkEphemeral bool
+	ReviewerAgent string
+}
+
+func (r *claudeBackendRuntime) Backend() agentproto.Backend {
+	return agentproto.BackendClaude
+}
+
+func (r *claudeBackendRuntime) Capabilities() agentproto.Capabilities {
+	return agentproto.DefaultCapabilitiesForBackend(agentproto.BackendClaude)
+}
+
+func (r *claudeBackendRuntime) Launch(ctx context.Context, app *App, rawLogger *debuglog.RawLogger, reportProblem func(agentproto.ErrorInfo)) (*childSession, error) {
+	if app == nil {
+		return nil, nil
+	}
+	r.mu.Lock()
+	resume := r.consumeLaunchResumeTarget()
+	resumeThreadID := ""
+	if resume != nil {
+		resumeThreadID = strings.TrimSpace(resume.ThreadID)
+	}
+	r.translator.PrepareForChildLaunch(resumeThreadID)
+	r.mu.Unlock()
+	session, err := app.launchClaudeChildSession(ctx, rawLogger, reportProblem, resume)
+	if err != nil {
+		return nil, err
+	}
+	r.mu.Lock()
+	if resume != nil {
+		copy := *resume
+		r.expectedResumeThread = &copy
+	} else {
+		r.expectedResumeThread = nil
+	}
+	r.mu.Unlock()
+	return session, nil
+}
+
+func (r *claudeBackendRuntime) ObserveClient(line []byte) (runtimeObserveResult, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	result, err := r.translator.ObserveClient(line)
+	if err != nil {
+		return runtimeObserveResult{}, err
+	}
+	return runtimeObserveResult{
+		Events:          result.Events,
+		OutboundToChild: result.OutboundToClaude,
+		Suppress:        result.Suppress,
+	}, nil
+}
+
+func (r *claudeBackendRuntime) ObserveServer(line []byte) (runtimeObserveResult, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	result, err := r.translator.ObserveServer(line)
+	if err != nil {
+		return runtimeObserveResult{}, err
+	}
+	if r.expectedResumeThread != nil {
+		if sessionID := strings.TrimSpace(r.translator.RuntimeStateSnapshot().SessionID); sessionID != "" {
+			r.expectedResumeThread = nil
+		}
+	}
+	return runtimeObserveResult{
+		Events:                   result.Events,
+		OutboundToChild:          result.OutboundToClaude,
+		OutboundToParent:         result.OutboundToParent,
+		ResolvedCommandResponses: mapClaudeResolvedCommandResponses(result.ResolvedCommandResponses),
+		Suppress:                 result.Suppress,
+	}, nil
+}
+
+func (r *claudeBackendRuntime) TranslateCommand(command agentproto.Command) (runtimeCommandResult, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if events, handled, err := claudesessionstore.HandleLocalCommand(command, r.workspaceRoot, r.translator.RuntimeStateSnapshot()); handled {
+		if err != nil {
+			return runtimeCommandResult{}, err
+		}
+		return runtimeCommandResult{Events: events}, nil
+	}
+	if plan, err := r.restartPlanForCommand(command); err != nil {
+		return runtimeCommandResult{}, err
+	} else if plan != nil {
+		return runtimeCommandResult{Restart: plan}, nil
+	}
+	outbound, err := r.translator.TranslateCommand(command)
+	if err != nil {
+		return runtimeCommandResult{}, err
+	}
+	phases, err := r.newClaudeCommandPhases(command, outbound)
+	if err != nil {
+		return runtimeCommandResult{}, err
+	}
+	return runtimeCommandResult{Phases: phases}, nil
+}
+
+func singleRuntimeCommandPhases(outbound [][]byte) []runtimeCommandPhase {
+	if len(outbound) == 0 {
+		return nil
+	}
+	return []runtimeCommandPhase{{
+		OutboundToChild: append([][]byte(nil), outbound...),
+	}}
+}
+
+func mapClaudeResolvedCommandResponses(responses []claude.ResolvedCommandResponse) []runtimeResolvedCommandResponse {
+	if len(responses) == 0 {
+		return nil
+	}
+	mapped := make([]runtimeResolvedCommandResponse, 0, len(responses))
+	for _, response := range responses {
+		requestID := strings.TrimSpace(response.RequestID)
+		if requestID == "" {
+			continue
+		}
+		mapped = append(mapped, runtimeResolvedCommandResponse{
+			RequestID:     requestID,
+			RejectMessage: strings.TrimSpace(response.RejectMessage),
+		})
+	}
+	if len(mapped) == 0 {
+		return nil
+	}
+	return mapped
+}
+
+func (r *claudeBackendRuntime) newClaudeCommandPhases(command agentproto.Command, outbound [][]byte) ([]runtimeCommandPhase, error) {
+	phases := singleRuntimeCommandPhases(outbound)
+	abort := func() {
+		r.abortTranslatedCommand(command.CommandID)
+	}
+	for index := range phases {
+		phases[index].Abort = abort
+	}
+	if command.Kind != agentproto.CommandPromptSend || len(outbound) < 2 {
+		return phases, nil
+	}
+	gate, ok, err := newClaudePermissionModeResponseGate(command, outbound[0])
+	if err != nil {
+		return nil, err
+	}
+	if !ok {
+		return phases, nil
+	}
+	phases = []runtimeCommandPhase{{
+		OutboundToChild: [][]byte{outbound[0]},
+		ResponseGate:    gate,
+	}}
+	if len(outbound) > 1 {
+		phases = append(phases, runtimeCommandPhase{
+			OutboundToChild: append([][]byte(nil), outbound[1:]...),
+		})
+	}
+	return phases, nil
+}
+
+func (r *claudeBackendRuntime) abortTranslatedCommand(commandID string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.translator.AbortCommand(commandID)
+}
+
+func newClaudePermissionModeResponseGate(command agentproto.Command, frame []byte) (*runtimeCommandResponseGate, bool, error) {
+	var message map[string]any
+	if err := json.Unmarshal(frame, &message); err != nil {
+		return nil, false, agentproto.ErrorInfo{
+			Code:             "invalid_claude_permission_frame",
+			Layer:            "wrapper",
+			Stage:            "translate_command",
+			Operation:        string(command.Kind),
+			Message:          "wrapper 无法解析 Claude 权限切换请求。",
+			Details:          err.Error(),
+			SurfaceSessionID: command.Origin.Surface,
+			CommandID:        command.CommandID,
+			ThreadID:         command.Target.ThreadID,
+			TurnID:           command.Target.TurnID,
+		}
+	}
+	if strings.TrimSpace(lookupStringFromMap(message, "type")) != "control_request" {
+		return nil, false, nil
+	}
+	request, _ := message["request"].(map[string]any)
+	if strings.TrimSpace(lookupStringFromMap(request, "subtype")) != "set_permission_mode" {
+		return nil, false, nil
+	}
+	requestID := strings.TrimSpace(lookupStringFromMap(message, "request_id"))
+	if requestID == "" {
+		return nil, false, agentproto.ErrorInfo{
+			Code:             "missing_command_request_id",
+			Layer:            "wrapper",
+			Stage:            "translate_command",
+			Operation:        string(command.Kind),
+			Message:          "wrapper 生成 Claude 权限切换请求时缺少 request id。",
+			SurfaceSessionID: command.Origin.Surface,
+			CommandID:        command.CommandID,
+			ThreadID:         command.Target.ThreadID,
+			TurnID:           command.Target.TurnID,
+		}
+	}
+	return &runtimeCommandResponseGate{
+		RequestID: requestID,
+		RejectProblem: agentproto.ErrorInfo{
+			Code:             "claude_permission_mode_rejected",
+			Layer:            "wrapper",
+			Stage:            "command_response",
+			Operation:        string(command.Kind),
+			Message:          "本地 Claude 拒绝了这次权限或 Plan 模式切换。",
+			SurfaceSessionID: command.Origin.Surface,
+			CommandID:        command.CommandID,
+			ThreadID:         command.Target.ThreadID,
+			TurnID:           command.Target.TurnID,
+		},
+		Timeout: steerCommandResponseTimeout,
+		TimeoutProblem: agentproto.ErrorInfo{
+			Code:             "claude_permission_mode_response_timeout",
+			Layer:            "wrapper",
+			Stage:            "command_response",
+			Operation:        string(command.Kind),
+			Message:          "等待本地 Claude 确认权限或 Plan 模式切换时超时。",
+			SurfaceSessionID: command.Origin.Surface,
+			CommandID:        command.CommandID,
+			ThreadID:         command.Target.ThreadID,
+			TurnID:           command.Target.TurnID,
+		},
+		SuppressFrame: true,
+	}, true, nil
+}
+
+func newTurnSteerResponseGate(command agentproto.Command, frame []byte) (*runtimeCommandResponseGate, error) {
+	requestID := lookupStringFromRawFrame(frame, "id")
+	if strings.TrimSpace(requestID) == "" {
+		return nil, agentproto.ErrorInfo{
+			Code:             "missing_command_request_id",
+			Layer:            "wrapper",
+			Stage:            "translate_command",
+			Operation:        string(command.Kind),
+			Message:          "wrapper 生成追加输入请求时缺少 request id。",
+			SurfaceSessionID: command.Origin.Surface,
+			CommandID:        command.CommandID,
+			ThreadID:         command.Target.ThreadID,
+			TurnID:           command.Target.TurnID,
+		}
+	}
+	return &runtimeCommandResponseGate{
+		RequestID: requestID,
+		RejectProblem: agentproto.ErrorInfo{
+			Code:             "steer_rejected",
+			Layer:            "wrapper",
+			Stage:            "command_response",
+			Operation:        string(command.Kind),
+			Message:          "本地 Codex 拒绝了这次追加输入。",
+			SurfaceSessionID: command.Origin.Surface,
+			CommandID:        command.CommandID,
+			ThreadID:         command.Target.ThreadID,
+			TurnID:           command.Target.TurnID,
+		},
+		Timeout: steerCommandResponseTimeout,
+		TimeoutProblem: agentproto.ErrorInfo{
+			Code:             "steer_response_timeout",
+			Layer:            "wrapper",
+			Stage:            "command_response",
+			Operation:        string(command.Kind),
+			Message:          "等待本地 Codex 确认追加输入时超时。",
+			SurfaceSessionID: command.Origin.Surface,
+			CommandID:        command.CommandID,
+			ThreadID:         command.Target.ThreadID,
+			TurnID:           command.Target.TurnID,
+		},
+		SuppressFrame: true,
+	}, nil
+}
+
+func (r *claudeBackendRuntime) PrepareChildRestart(commandID string, dispatchPlan agentproto.PromptDispatchPlan, _ *agentproto.CodexResumePolicy) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	resume, err := r.resolveLaunchResumeTarget(dispatchPlan)
+	if err != nil {
+		return err
+	}
+	r.pendingLaunchResume = resume
+	r.pendingRestartCommandID = strings.TrimSpace(commandID)
+	return nil
+}
+
+func (r *claudeBackendRuntime) BuildChildRestartRestoreFrame(commandID string) ([]byte, string, bool, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.translator.BuildChildRestartRestoreFrame(commandID)
+}
+
+func (r *claudeBackendRuntime) CancelChildRestartRestore(requestID string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.translator.CancelChildRestartRestore(requestID)
+}
+
+func (r *claudeBackendRuntime) SetDebugLogger(debugLog func(string, ...any)) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.translator.SetDebugLogger(debugLog)
+}
+
+func (r *claudeBackendRuntime) restartPlanForCommand(command agentproto.Command) (*runtimeCommandRestart, error) {
+	if command.Kind != agentproto.CommandPromptSend {
+		return nil, nil
+	}
+	if commandID := strings.TrimSpace(command.CommandID); commandID != "" && commandID == r.completedRestartCommandID {
+		r.completedRestartCommandID = ""
+		return nil, nil
+	}
+	dispatchPlan := agentproto.PromptDispatchPlanFromTarget(command.Target)
+	if dispatchPlan.ExecutionMode == agentproto.PromptExecutionModeForkEphemeral {
+		sourceThreadID := strings.TrimSpace(dispatchPlan.SourceThreadID)
+		if sourceThreadID == "" {
+			return nil, nil
+		}
+		resume, found, err := r.lookupForkSourceTarget(dispatchPlan)
+		if err != nil {
+			return nil, err
+		}
+		if !found || resume == nil {
+			return nil, nil
+		}
+		dispatchPlan.SourceThreadID = resume.ThreadID
+		if strings.TrimSpace(dispatchPlan.CWD) == "" {
+			dispatchPlan.CWD = resume.CWD
+		}
+		return &runtimeCommandRestart{DispatchPlan: dispatchPlan}, nil
+	}
+	targetThreadID := strings.TrimSpace(dispatchPlan.ExecutionThreadID)
+	current := r.currentResumeTarget()
+	if dispatchPlan.ExecutionMode == agentproto.PromptExecutionModeStartNew && targetThreadID == "" {
+		if current == nil || strings.TrimSpace(current.ThreadID) == "" {
+			return nil, nil
+		}
+		if strings.TrimSpace(dispatchPlan.CWD) == "" {
+			dispatchPlan.CWD = strings.TrimSpace(current.CWD)
+			if dispatchPlan.CWD == "" {
+				dispatchPlan.CWD = strings.TrimSpace(r.workspaceRoot)
+			}
+		}
+		return &runtimeCommandRestart{DispatchPlan: dispatchPlan}, nil
+	}
+	if targetThreadID == "" {
+		return nil, nil
+	}
+	if current != nil && strings.EqualFold(strings.TrimSpace(current.ThreadID), targetThreadID) {
+		return nil, nil
+	}
+	resume, found, err := r.lookupStoredResumeTarget(dispatchPlan)
+	if err != nil {
+		return nil, err
+	}
+	if !found || resume == nil {
+		return nil, nil
+	}
+	dispatchPlan.ExecutionThreadID = resume.ThreadID
+	if strings.TrimSpace(dispatchPlan.CWD) == "" {
+		dispatchPlan.CWD = resume.CWD
+	}
+	return &runtimeCommandRestart{DispatchPlan: dispatchPlan}, nil
+}
+
+func (r *claudeBackendRuntime) resolveLaunchResumeTarget(dispatchPlan agentproto.PromptDispatchPlan) (*claudeLaunchResumeTarget, error) {
+	dispatchPlan = agentproto.NormalizePromptDispatchPlan(dispatchPlan)
+	if dispatchPlan.ExecutionMode == agentproto.PromptExecutionModeForkEphemeral {
+		resume, found, err := r.lookupForkSourceTarget(dispatchPlan)
+		if err != nil {
+			return nil, err
+		}
+		if !found || resume == nil {
+			return nil, agentproto.ErrorInfo{
+				Code:      "claude_fork_source_thread_not_found",
+				Layer:     "wrapper",
+				Stage:     "prepare_child_restart",
+				Operation: string(agentproto.CommandPromptSend),
+				Message:   "目标 Claude 会话当前不可 fork，当前不能直接从这个会话创建临时分支。",
+				ThreadID:  strings.TrimSpace(dispatchPlan.SourceThreadID),
+			}
+		}
+		resume.ForkEphemeral = true
+		if dispatchPlan.Purpose == agentproto.PromptPurposeReview {
+			resume.ReviewerAgent = "reviewer"
+		}
+		return resume, nil
+	}
+	threadID := strings.TrimSpace(dispatchPlan.ExecutionThreadID)
+	cwd := strings.TrimSpace(dispatchPlan.CWD)
+	if threadID == "" {
+		if dispatchPlan.ExecutionMode == agentproto.PromptExecutionModeStartNew {
+			return nil, nil
+		}
+		current := r.currentResumeTarget()
+		if current == nil || strings.TrimSpace(current.ThreadID) == "" {
+			return nil, nil
+		}
+		copy := *current
+		return &copy, nil
+	}
+	resume, found, err := r.lookupStoredResumeTarget(dispatchPlan)
+	if err != nil {
+		return nil, err
+	}
+	if !found || resume == nil {
+		return nil, agentproto.ErrorInfo{
+			Code:      "claude_resume_thread_not_found",
+			Layer:     "wrapper",
+			Stage:     "prepare_child_restart",
+			Operation: string(agentproto.CommandPromptSend),
+			Message:   "目标 Claude 会话当前不可恢复，当前不能直接切回这个会话。",
+			ThreadID:  threadID,
+		}
+	}
+	if cwd == "" {
+		cwd = resume.CWD
+	}
+	return &claudeLaunchResumeTarget{
+		ThreadID: threadID,
+		CWD:      cwd,
+	}, nil
+}
+
+func (r *claudeBackendRuntime) lookupForkSourceTarget(dispatchPlan agentproto.PromptDispatchPlan) (*claudeLaunchResumeTarget, bool, error) {
+	dispatchPlan = agentproto.NormalizePromptDispatchPlan(dispatchPlan)
+	sourceThreadID := strings.TrimSpace(dispatchPlan.SourceThreadID)
+	if sourceThreadID == "" {
+		return nil, false, nil
+	}
+	sourcePlan := dispatchPlan
+	sourcePlan.ExecutionMode = agentproto.PromptExecutionModeResumeExisting
+	sourcePlan.ExecutionThreadID = sourceThreadID
+	sourcePlan.SourceThreadID = ""
+	return r.lookupStoredResumeTarget(sourcePlan)
+}
+
+func (r *claudeBackendRuntime) lookupStoredResumeTarget(dispatchPlan agentproto.PromptDispatchPlan) (*claudeLaunchResumeTarget, bool, error) {
+	dispatchPlan = agentproto.NormalizePromptDispatchPlan(dispatchPlan)
+	threadID := strings.TrimSpace(dispatchPlan.ExecutionThreadID)
+	if threadID == "" {
+		return nil, false, nil
+	}
+	cwd := strings.TrimSpace(dispatchPlan.CWD)
+	if meta, err := claudesessionstore.ResolveResumeSession(r.workspaceRoot, threadID); err != nil {
+		return nil, false, agentproto.ErrorInfo{
+			Code:      "claude_resume_workspace_mismatch",
+			Layer:     "wrapper",
+			Stage:     "prepare_child_restart",
+			Operation: string(agentproto.CommandPromptSend),
+			Message:   "目标 Claude 会话不属于当前工作区，当前不能直接恢复到这个会话。",
+			Details:   err.Error(),
+			ThreadID:  threadID,
+		}
+	} else if meta == nil {
+		return nil, false, nil
+	} else if meta != nil && strings.TrimSpace(meta.CWD) != "" {
+		cwd = strings.TrimSpace(meta.CWD)
+	}
+	if cwd == "" {
+		cwd = strings.TrimSpace(r.workspaceRoot)
+	}
+	if strings.TrimSpace(cwd) != "" && strings.TrimSpace(r.workspaceRoot) != "" &&
+		!pathcompare.SameCleanPlatformPath(cwd, r.workspaceRoot) {
+		return nil, false, agentproto.ErrorInfo{
+			Code:      "claude_resume_workspace_mismatch",
+			Layer:     "wrapper",
+			Stage:     "prepare_child_restart",
+			Operation: string(agentproto.CommandPromptSend),
+			Message:   "目标 Claude 会话不属于当前工作区，当前不能直接恢复到这个会话。",
+			Details:   "target cwd does not match wrapper workspace root",
+			ThreadID:  threadID,
+		}
+	}
+	return &claudeLaunchResumeTarget{
+		ThreadID: threadID,
+		CWD:      cwd,
+	}, true, nil
+}
+
+func (r *claudeBackendRuntime) consumeLaunchResumeTarget() *claudeLaunchResumeTarget {
+	if r == nil {
+		return nil
+	}
+	if r.pendingLaunchResume != nil {
+		resume := r.pendingLaunchResume
+		r.pendingLaunchResume = nil
+		r.completedRestartCommandID = r.pendingRestartCommandID
+		r.pendingRestartCommandID = ""
+		return resume
+	}
+	if r.initialLaunchResume != nil {
+		resume := r.initialLaunchResume
+		r.initialLaunchResume = nil
+		return resume
+	}
+	return nil
+}
+
+func (r *claudeBackendRuntime) currentResumeTarget() *claudeLaunchResumeTarget {
+	if r == nil {
+		return nil
+	}
+	if r.expectedResumeThread != nil {
+		copy := *r.expectedResumeThread
+		return &copy
+	}
+	runtime := r.translator.RuntimeStateSnapshot()
+	if strings.TrimSpace(runtime.SessionID) == "" {
+		return nil
+	}
+	return &claudeLaunchResumeTarget{
+		ThreadID: strings.TrimSpace(runtime.SessionID),
+		CWD:      strings.TrimSpace(runtime.CWD),
+	}
+}

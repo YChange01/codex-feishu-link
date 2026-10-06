@@ -1,0 +1,579 @@
+package codex
+
+import (
+	"encoding/json"
+	"fmt"
+	"strings"
+
+	"github.com/YChange01/codex-feishu-link/internal/core/agentproto"
+	"github.com/YChange01/codex-feishu-link/internal/pathcanon"
+	"github.com/YChange01/codex-feishu-link/internal/xutil"
+)
+
+func (t *Translator) TranslateCommand(command agentproto.Command) ([][]byte, error) {
+	if t.sharedAppServer && (command.Kind == agentproto.CommandThreadCompactStart || command.Kind == agentproto.CommandReviewStart) {
+		return nil, fmt.Errorf("共享桌面模式暂不支持飞书压缩或独立审阅，请在桌面端执行")
+	}
+	if t.sharedAppServer && (command.Kind == agentproto.CommandTurnSteer || command.Kind == agentproto.CommandTurnInterrupt) && (command.Target.ThreadID != t.sharedThreadID || !t.sharedSubscriptionReady) {
+		return nil, fmt.Errorf("shared command target is not the subscribed thread")
+	}
+	switch command.Kind {
+	case agentproto.CommandThreadSubscribe:
+		return t.translateSharedThreadSubscribe(command)
+	case agentproto.CommandPromptSend:
+		return t.translatePromptSend(command)
+	case agentproto.CommandReviewStart:
+		return t.translateReviewStart(command)
+	case agentproto.CommandThreadCompactStart:
+		threadID := strings.TrimSpace(command.Target.ThreadID)
+		if threadID == "" {
+			return nil, fmt.Errorf("thread.compact.start requires thread id")
+		}
+		if t.currentThreadID == "" || threadID != t.currentThreadID {
+			requestID := t.NextRequest("thread-resume")
+			t.pendingThreadResume[requestID] = pendingThreadResume{
+				ThreadID: threadID,
+				Command:  command,
+			}
+			t.Debugf(
+				"translate remote compact: command=%s action=thread/resume request=%s targetThread=%s currentThread=%s knownCWD=%s surface=%s",
+				command.CommandID,
+				requestID,
+				threadID,
+				t.currentThreadID,
+				t.knownThreadCWD[threadID],
+				choose(command.Origin.Surface, command.Origin.ChatID),
+			)
+			params := map[string]any{
+				"threadId": threadID,
+				"cwd":      pathcanon.Native(choose(command.Target.CWD, t.knownThreadCWD[threadID])),
+			}
+			applyCodexResumePolicyToThreadParams(params, command.CodexResume)
+			t.recordCodexPolicyForThread(threadID, command.CodexResume)
+			payload := map[string]any{
+				"id":     requestID,
+				"method": "thread/resume",
+				"params": params,
+			}
+			bytes, err := json.Marshal(payload)
+			if err != nil {
+				return nil, err
+			}
+			return [][]byte{append(bytes, '\n')}, nil
+		}
+		payload, requestID, err := t.directCompactStart(command)
+		if err != nil {
+			return nil, err
+		}
+		t.Debugf(
+			"translate remote compact: command=%s action=thread/compact/start request=%s targetThread=%s currentThread=%s surface=%s",
+			command.CommandID,
+			requestID,
+			threadID,
+			t.currentThreadID,
+			choose(command.Origin.Surface, command.Origin.ChatID),
+		)
+		return [][]byte{payload}, nil
+	case agentproto.CommandTurnInterrupt:
+		payload := map[string]any{
+			"id":     t.NextRequest("turn-interrupt"),
+			"method": "turn/interrupt",
+			"params": map[string]any{
+				"threadId": command.Target.ThreadID,
+				"turnId":   command.Target.TurnID,
+			},
+		}
+		t.pendingSuppressedResponse[xutil.LookupStringFromAny(payload["id"])] = suppressedResponseContext{Action: "turn/interrupt"}
+		bytes, err := json.Marshal(payload)
+		if err != nil {
+			return nil, err
+		}
+		return [][]byte{append(bytes, '\n')}, nil
+	case agentproto.CommandTurnSteer:
+		payload := map[string]any{
+			"id":     t.NextRequest("turn-steer"),
+			"method": "turn/steer",
+			"params": map[string]any{
+				"threadId":       command.Target.ThreadID,
+				"expectedTurnId": command.Target.TurnID,
+				"input":          t.buildInputs(command.Prompt.Inputs),
+			},
+		}
+		if t.sharedAppServer {
+			payload["params"].(map[string]any)["clientUserMessageId"] = agentproto.RemoteUserMessageClientPrefix + t.instanceID + ":" + command.CommandID
+		}
+		bytes, err := json.Marshal(payload)
+		if err != nil {
+			return nil, err
+		}
+		return [][]byte{append(bytes, '\n')}, nil
+	case agentproto.CommandThreadsRefresh:
+		query := defaultThreadListQuery()
+		if owner, ok := t.threadListBroker.LookupOwner(query); ok {
+			t.beginThreadListRefresh(owner.RequestID, owner.Visible)
+			t.Debugf(
+				"translate threads refresh: join inflight request=%s visible=%t currentThread=%s inflightReads=%d",
+				owner.RequestID,
+				owner.Visible,
+				t.currentThreadID,
+				t.threadListRefreshPendingReadCount(),
+			)
+			return nil, nil
+		}
+		requestID := t.NextRequest("threads-refresh")
+		t.beginThreadListRefresh(requestID, false)
+		t.threadListBroker.RegisterNativeOwner(requestID, query)
+		t.Debugf(
+			"translate threads refresh: request=%s currentThread=%s inflightReads=%d",
+			requestID,
+			t.currentThreadID,
+			t.threadListRefreshPendingReadCount(),
+		)
+		payload := map[string]any{
+			"id":     requestID,
+			"method": "thread/list",
+			"params": map[string]any{
+				"limit":          50,
+				"cursor":         nil,
+				"sortKey":        "created_at",
+				"modelProviders": []any{},
+				"archived":       false,
+				"sourceKinds":    []any{},
+			},
+		}
+		bytes, err := json.Marshal(payload)
+		if err != nil {
+			return nil, err
+		}
+		return [][]byte{append(bytes, '\n')}, nil
+	case agentproto.CommandThreadHistoryRead:
+		requestID := t.NextRequest("thread-history-read")
+		t.pendingThreadHistoryReads[requestID] = pendingThreadHistoryRead{
+			CommandID: command.CommandID,
+			ThreadID:  command.Target.ThreadID,
+		}
+		payload := map[string]any{
+			"id":     requestID,
+			"method": "thread/read",
+			"params": map[string]any{
+				"threadId":     command.Target.ThreadID,
+				"includeTurns": true,
+			},
+		}
+		bytes, err := json.Marshal(payload)
+		if err != nil {
+			return nil, err
+		}
+		return [][]byte{append(bytes, '\n')}, nil
+	case agentproto.CommandModelList:
+		return t.translateModelList(command)
+	case agentproto.CommandRateLimitsRead:
+		return t.translateRateLimitsRead(command)
+	case agentproto.CommandRequestRespond:
+		return t.translateRequestRespond(command)
+	case agentproto.CommandMCPOAuthLogin:
+		return t.translateMCPOAuthLogin(command)
+	case agentproto.CommandThreadGoalSet, agentproto.CommandThreadGoalGet, agentproto.CommandThreadGoalClear:
+		return t.translateThreadGoalCommand(command)
+	case agentproto.CommandThreadRead:
+		return t.translateThreadReadCommand(command)
+	default:
+		return nil, nil
+	}
+}
+
+func (t *Translator) translateMCPOAuthLogin(command agentproto.Command) ([][]byte, error) {
+	if command.MCP.OAuthLogin == nil {
+		return nil, fmt.Errorf("mcp.oauth_login.start requires oauth login payload")
+	}
+	login := command.MCP.OAuthLogin
+	serverName := strings.TrimSpace(login.ServerName)
+	if serverName == "" {
+		return nil, fmt.Errorf("mcp.oauth_login.start requires server name")
+	}
+	threadID := strings.TrimSpace(choose(login.ThreadID, command.Target.ThreadID))
+	flowKey := mcpOAuthLoginFlowKey(serverName, threadID)
+	if requestID, exists := t.pendingMCPOAuthLoginKeys[flowKey]; exists {
+		pending := t.pendingMCPOAuthLogins[requestID]
+		return nil, fmt.Errorf("mcp oauth login already pending for server %q thread %q command %s", serverName, threadID, pending.CommandID)
+	}
+	requestID := t.NextRequest("mcp-oauth-login")
+	params := map[string]any{
+		"name": serverName,
+	}
+	if threadID != "" {
+		params["threadId"] = threadID
+	}
+	if len(login.Scopes) != 0 {
+		scopes := make([]string, 0, len(login.Scopes))
+		for _, scope := range login.Scopes {
+			scope = strings.TrimSpace(scope)
+			if scope != "" {
+				scopes = append(scopes, scope)
+			}
+		}
+		if len(scopes) != 0 {
+			params["scopes"] = scopes
+		}
+	}
+	if login.TimeoutSecs > 0 {
+		params["timeoutSecs"] = login.TimeoutSecs
+	}
+	initiator := agentproto.Initiator{
+		Kind:             agentproto.InitiatorRemoteSurface,
+		SurfaceSessionID: strings.TrimSpace(choose(command.Origin.Surface, command.Origin.ChatID)),
+	}
+	if initiator.SurfaceSessionID == "" {
+		initiator.Kind = agentproto.InitiatorUnknown
+	}
+	t.pendingMCPOAuthLogins[requestID] = pendingMCPOAuthLogin{
+		CommandID:   command.CommandID,
+		Initiator:   initiator,
+		ServerName:  serverName,
+		ThreadID:    threadID,
+		Scopes:      append([]string(nil), login.Scopes...),
+		TimeoutSecs: login.TimeoutSecs,
+	}
+	t.pendingMCPOAuthLoginKeys[flowKey] = requestID
+	t.Debugf(
+		"translate mcp oauth login: command=%s request=%s server=%s thread=%s surface=%s",
+		command.CommandID,
+		requestID,
+		serverName,
+		threadID,
+		initiator.SurfaceSessionID,
+	)
+	payload := map[string]any{
+		"id":     requestID,
+		"method": "mcpServer/oauth/login",
+		"params": params,
+	}
+	bytes, err := json.Marshal(payload)
+	if err != nil {
+		return nil, err
+	}
+	return [][]byte{append(bytes, '\n')}, nil
+}
+
+func (t *Translator) translatePromptSend(command agentproto.Command) ([][]byte, error) {
+	switch command.Target.EffectivePromptExecutionMode() {
+	case agentproto.PromptExecutionModeForkEphemeral:
+		return t.translatePromptSendForkEphemeral(command)
+	case agentproto.PromptExecutionModeStartEphemeral:
+		return t.translatePromptSendThreadStart(command, true)
+	case agentproto.PromptExecutionModeStartNew:
+		return t.translatePromptSendThreadStart(command, false)
+	default:
+		return t.translatePromptSendResumeOrDirect(command)
+	}
+}
+
+func (t *Translator) translatePromptSendThreadStart(command agentproto.Command, ephemeral bool) ([][]byte, error) {
+	t.pendingLocalNewThreadTurn = false
+	requestID := t.NextRequest("thread-start")
+	t.pendingThreadCreate[requestID] = pendingThreadCreate{
+		Command: command,
+		Action:  "thread/start",
+	}
+	params := t.buildThreadStartParamsWithPolicy(command.Target.CWD, command.Overrides, command.CodexResume)
+	if ephemeral {
+		params["ephemeral"] = true
+		params["persistExtendedHistory"] = false
+	}
+	if command.Target.InternalHelper {
+		t.pendingInternalThreadSet[requestID] = true
+	}
+	t.Debugf(
+		"translate remote prompt: command=%s mode=%s action=thread/start request=%s targetThread=%s sourceThread=%s cwd=%s currentThread=%s surface=%s inputs=%d",
+		command.CommandID,
+		command.Target.EffectivePromptExecutionMode(),
+		requestID,
+		command.Target.ThreadID,
+		command.Target.SourceThreadID,
+		command.Target.CWD,
+		t.currentThreadID,
+		choose(command.Origin.Surface, command.Origin.ChatID),
+		len(command.Prompt.Inputs),
+	)
+	payload := map[string]any{
+		"id":     requestID,
+		"method": "thread/start",
+		"params": params,
+	}
+	bytes, err := json.Marshal(payload)
+	if err != nil {
+		return nil, err
+	}
+	return [][]byte{append(bytes, '\n')}, nil
+}
+
+func (t *Translator) translatePromptSendForkEphemeral(command agentproto.Command) ([][]byte, error) {
+	sourceThreadID := strings.TrimSpace(choose(command.Target.SourceThreadID, command.Target.ThreadID))
+	if sourceThreadID == "" {
+		return nil, fmt.Errorf("prompt.send fork_ephemeral requires source thread id")
+	}
+	requestID := t.NextRequest("thread-fork")
+	t.pendingThreadCreate[requestID] = pendingThreadCreate{
+		Command: command,
+		Action:  "thread/fork",
+	}
+	if command.Target.InternalHelper {
+		t.pendingInternalThreadSet[requestID] = true
+	}
+	t.Debugf(
+		"translate remote prompt: command=%s mode=%s action=thread/fork request=%s sourceThread=%s cwd=%s currentThread=%s surface=%s inputs=%d",
+		command.CommandID,
+		command.Target.EffectivePromptExecutionMode(),
+		requestID,
+		sourceThreadID,
+		command.Target.CWD,
+		t.currentThreadID,
+		choose(command.Origin.Surface, command.Origin.ChatID),
+		len(command.Prompt.Inputs),
+	)
+	payload := map[string]any{
+		"id":     requestID,
+		"method": "thread/fork",
+		"params": map[string]any{
+			"threadId":  sourceThreadID,
+			"ephemeral": true,
+		},
+	}
+	bytes, err := json.Marshal(payload)
+	if err != nil {
+		return nil, err
+	}
+	return [][]byte{append(bytes, '\n')}, nil
+}
+
+func (t *Translator) translatePromptSendResumeOrDirect(command agentproto.Command) ([][]byte, error) {
+	if t.sharedAppServer && strings.TrimSpace(command.Target.ThreadID) != "" && (command.Target.ThreadID != t.sharedThreadID || !t.sharedSubscriptionReady) {
+		return nil, fmt.Errorf("shared thread subscription is not ready; select the thread again")
+	}
+	if strings.TrimSpace(command.Target.ThreadID) == "" {
+		return t.translatePromptSendThreadStart(command, false)
+	}
+	delete(t.pendingLocalTurnByThread, command.Target.ThreadID)
+	if t.currentThreadID == "" || command.Target.ThreadID != t.currentThreadID {
+		requestID := t.NextRequest("thread-resume")
+		t.pendingThreadResume[requestID] = pendingThreadResume{
+			ThreadID: command.Target.ThreadID,
+			Command:  command,
+		}
+		t.Debugf(
+			"translate remote prompt: command=%s mode=%s action=thread/resume request=%s targetThread=%s cwd=%s currentThread=%s knownCWD=%s surface=%s inputs=%d",
+			command.CommandID,
+			command.Target.EffectivePromptExecutionMode(),
+			requestID,
+			command.Target.ThreadID,
+			command.Target.CWD,
+			t.currentThreadID,
+			t.knownThreadCWD[command.Target.ThreadID],
+			choose(command.Origin.Surface, command.Origin.ChatID),
+			len(command.Prompt.Inputs),
+		)
+		params := map[string]any{
+			"threadId": command.Target.ThreadID,
+			"cwd":      pathcanon.Native(choose(command.Target.CWD, t.knownThreadCWD[command.Target.ThreadID])),
+		}
+		applyCodexResumePolicyToThreadParams(params, command.CodexResume)
+		t.recordCodexPolicyForThread(command.Target.ThreadID, command.CodexResume)
+		payload := map[string]any{
+			"id":     requestID,
+			"method": "thread/resume",
+			"params": params,
+		}
+		bytes, err := json.Marshal(payload)
+		if err != nil {
+			return nil, err
+		}
+		return [][]byte{append(bytes, '\n')}, nil
+	}
+	payload, requestID, err := t.directTurnStart(command.Target.ThreadID, command, false)
+	if err != nil {
+		return nil, err
+	}
+	t.Debugf(
+		"translate remote prompt: command=%s mode=%s action=turn/start request=%s targetThread=%s cwd=%s currentThread=%s surface=%s inputs=%d",
+		command.CommandID,
+		command.Target.EffectivePromptExecutionMode(),
+		requestID,
+		command.Target.ThreadID,
+		command.Target.CWD,
+		t.currentThreadID,
+		choose(command.Origin.Surface, command.Origin.ChatID),
+		len(command.Prompt.Inputs),
+	)
+	return [][]byte{payload}, nil
+}
+
+func (t *Translator) translateRequestRespond(command agentproto.Command) ([][]byte, error) {
+	if command.Request.RequestID == "" {
+		return nil, nil
+	}
+	result := map[string]any{}
+	responseType, _ := command.Request.Response["type"].(string)
+	switch responseType {
+	case "approval":
+		if decision, _ := command.Request.Response["decision"].(string); strings.TrimSpace(decision) != "" {
+			result["decision"] = strings.TrimSpace(decision)
+			break
+		}
+		approved, _ := command.Request.Response["approved"].(bool)
+		if approved {
+			result["decision"] = "accept"
+		} else {
+			result["decision"] = "decline"
+		}
+	case "structured":
+		if value, ok := command.Request.Response["result"]; ok {
+			result = map[string]any{"result": value}
+		}
+	default:
+		result = command.Request.Response
+	}
+	payload := map[string]any{
+		"id":     decodeNativeRequestID(command.Request.RequestID),
+		"result": result,
+	}
+	bytes, err := json.Marshal(payload)
+	if err != nil {
+		return nil, err
+	}
+	return [][]byte{append(bytes, '\n')}, nil
+}
+
+func (t *Translator) buildThreadStartParamsWithPolicy(cwd string, overrides agentproto.PromptOverrides, policy *agentproto.CodexResumePolicy) map[string]any {
+	params := map[string]any{}
+	if agentproto.NormalizeCodexResumePolicy(policy) == nil {
+		params = xutil.CloneMap(t.latestThreadStartParams)
+	}
+	if len(params) == 0 {
+		params = map[string]any{}
+	}
+	params["cwd"] = pathcanon.Native(choose(cwd, xutil.LookupStringFromAny(params["cwd"])))
+	setDefault(params, "model", nil)
+	setDefault(params, "modelProvider", nil)
+	setDefault(params, "config", map[string]any{})
+	setDefault(params, "approvalPolicy", "on-request")
+	setDefault(params, "baseInstructions", nil)
+	setDefault(params, "developerInstructions", nil)
+	setDefault(params, "sandbox", "read-only")
+	setDefault(params, "personality", nil)
+	setDefault(params, "experimentalRawEvents", false)
+	setDefault(params, "dynamicTools", nil)
+	applyCodexResumePolicyToThreadParams(params, policy)
+	applyPromptOverridesToThreadStart(params, overrides)
+	return params
+}
+
+func (t *Translator) directTurnStart(threadID string, command agentproto.Command, newThread bool) ([]byte, string, error) {
+	delete(t.pendingLocalTurnByThread, threadID)
+	t.pendingRemoteTurnByThread[threadID] = choose(command.Origin.Surface, command.Origin.ChatID)
+	template := t.selectTurnTemplate(threadID, newThread)
+	if t.sharedAppServer && !newThread {
+		// Other clients can change the live thread after our last observation.
+		// Never replay cached model/effort or collaboration settings into it.
+		template = map[string]any{}
+	}
+	template["threadId"] = threadID
+	template["input"] = t.buildInputs(command.Prompt.Inputs)
+	if t.sharedAppServer {
+		template["clientUserMessageId"] = agentproto.RemoteUserMessageClientPrefix + t.instanceID + ":" + command.CommandID
+	}
+	template["cwd"] = pathcanon.Native(choose(command.Target.CWD, choose(xutil.LookupStringFromAny(template["cwd"]), t.knownThreadCWD[threadID])))
+	setDefault(template, "approvalPolicy", nil)
+	setDefault(template, "sandboxPolicy", nil)
+	setDefault(template, "model", nil)
+	setDefault(template, "effort", nil)
+	setDefault(template, "summary", "auto")
+	setDefault(template, "personality", nil)
+	setDefault(template, "collaborationMode", nil)
+	setDefault(template, "attachments", []any{})
+	if !t.sharedAppServer || newThread {
+		applyCodexResumePolicyToTurnStart(template, command.CodexResume)
+	}
+	applyPromptOverridesToTurnStart(template, command.Overrides)
+	t.recordCodexPolicyForThread(threadID, command.CodexResume)
+	requestID := t.NextRequest("turn-start")
+	payload := map[string]any{
+		"id":     requestID,
+		"method": "turn/start",
+		"params": template,
+	}
+	t.pendingSuppressedResponse[xutil.LookupStringFromAny(payload["id"])] = suppressedResponseContext{
+		Action:           "turn/start",
+		CommandID:        command.CommandID,
+		ThreadID:         threadID,
+		SurfaceSessionID: choose(command.Origin.Surface, command.Origin.ChatID),
+	}
+	bytes, err := json.Marshal(payload)
+	if err != nil {
+		return nil, "", err
+	}
+	return append(bytes, '\n'), requestID, nil
+}
+
+func (t *Translator) recordCodexPolicyForThread(threadID string, policy *agentproto.CodexResumePolicy) {
+	threadID = strings.TrimSpace(threadID)
+	policy = agentproto.NormalizeCodexResumePolicy(policy)
+	if threadID == "" || policy == nil {
+		return
+	}
+	t.pendingCodexPolicyByThread[threadID] = policy
+}
+
+func (t *Translator) directCompactStart(command agentproto.Command) ([]byte, string, error) {
+	threadID := strings.TrimSpace(command.Target.ThreadID)
+	if threadID == "" {
+		return nil, "", fmt.Errorf("thread.compact.start requires thread id")
+	}
+	requestID := t.NextRequest("thread-compact-start")
+	surfaceID := choose(command.Origin.Surface, command.Origin.ChatID)
+	t.pendingRemoteTurnByThread[threadID] = surfaceID
+	payload := map[string]any{
+		"id":     requestID,
+		"method": "thread/compact/start",
+		"params": map[string]any{
+			"threadId": threadID,
+		},
+	}
+	t.pendingSuppressedResponse[requestID] = suppressedResponseContext{
+		Action:           "thread/compact/start",
+		ThreadID:         threadID,
+		SurfaceSessionID: surfaceID,
+	}
+	bytes, err := json.Marshal(payload)
+	if err != nil {
+		return nil, "", err
+	}
+	return append(bytes, '\n'), requestID, nil
+}
+
+func (t *Translator) selectTurnTemplate(threadID string, newThread bool) map[string]any {
+	switch {
+	case newThread && len(t.newThreadTurnTemplate) > 0:
+		return xutil.CloneMap(t.newThreadTurnTemplate)
+	case len(t.turnStartByThread[threadID]) > 0:
+		return xutil.CloneMap(t.turnStartByThread[threadID])
+	case len(t.latestTurnStartTemplate) > 0:
+		return xutil.CloneMap(t.latestTurnStartTemplate)
+	default:
+		return map[string]any{}
+	}
+}
+
+func (t *Translator) buildInputs(inputs []agentproto.Input) []map[string]any {
+	output := make([]map[string]any, 0, len(inputs))
+	for _, input := range inputs {
+		switch input.Type {
+		case agentproto.InputText:
+			output = append(output, map[string]any{"type": "text", "text": input.Text, "text_elements": []any{}})
+		case agentproto.InputLocalImage:
+			output = append(output, map[string]any{"type": "localImage", "path": input.Path, "mimeType": input.MIMEType})
+		case agentproto.InputRemoteImage:
+			output = append(output, map[string]any{"type": "image", "url": input.URL, "mimeType": input.MIMEType})
+		}
+	}
+	return output
+}

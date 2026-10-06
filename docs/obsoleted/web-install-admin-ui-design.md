@@ -1,0 +1,32 @@
+# Web 安装与管理界面设计草案（已废弃）
+
+> Type: `obsoleted`
+> Updated: `2026-07-17`
+> Summary: 原“安装与管理界面总设计稿”已拆分并归档；同步已归档 WebSetup/Admin 文档链接，本文不再作为当前设计依据。
+> Superseded By: `docs/obsoleted/web-setup-wizard-redesign.md`, `docs/implemented/web-admin-ui-redesign.md`, `docs/obsoleted/web-install-admin-prerequisites-design.md`
+
+## 1. 说明
+
+原文档同时讨论：
+
+1. Web Setup 向导
+2. 本地管理页
+3. 前置技术改造
+
+随着实现推进，这三类内容已经各自形成独立文档，继续保留在一个总稿里会造成：
+
+1. setup 与 admin 的产品语义混在一起
+2. 已落地与未落地内容难以区分
+3. 新文档与旧总稿互相重复、容易冲突
+
+## 2. 当前应参考的文档
+
+当前如果要看：
+
+- setup 历史交互：请看 [../obsoleted/web-setup-wizard-redesign.md](../obsoleted/web-setup-wizard-redesign.md)
+- admin 当前管理页：请看 [../implemented/web-admin-ui-redesign.md](../implemented/web-admin-ui-redesign.md)
+- 实现前置改造的历史背景：请看 [../obsoleted/web-install-admin-prerequisites-design.md](../obsoleted/web-install-admin-prerequisites-design.md)
+
+## 3. 保留原因
+
+保留这个废弃文档条目，是为了避免后续有人继续把旧文件当作当前 source of truth。

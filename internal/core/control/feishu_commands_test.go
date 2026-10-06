@@ -1,0 +1,841 @@
+package control
+
+import (
+	"reflect"
+	"strings"
+	"testing"
+
+	"github.com/YChange01/codex-feishu-link/internal/core/agentproto"
+)
+
+func TestParseFeishuTextActionRecognizesDebugCommand(t *testing.T) {
+	action, ok := ParseFeishuTextActionWithoutCatalog("/debug")
+	if !ok {
+		t.Fatal("expected /debug to be parsed")
+	}
+	if action.Kind != ActionDebugCommand {
+		t.Fatalf("action kind = %q, want %q", action.Kind, ActionDebugCommand)
+	}
+	if action.Text != "/debug" {
+		t.Fatalf("action text = %q, want %q", action.Text, "/debug")
+	}
+}
+
+func TestParseFeishuTextActionRecognizesAdminRootCommand(t *testing.T) {
+	action, ok := ParseFeishuTextActionWithoutCatalog("/admin")
+	if !ok {
+		t.Fatal("expected /admin to be parsed")
+	}
+	if action.Kind != ActionAdminRoot {
+		t.Fatalf("action kind = %q, want %q", action.Kind, ActionAdminRoot)
+	}
+	if action.Text != "/admin" {
+		t.Fatalf("action text = %q, want %q", action.Text, "/admin")
+	}
+}
+
+func TestParseFeishuTextActionRecognizesAdminSubcommands(t *testing.T) {
+	for _, input := range []string{
+		"/admin web",
+		"/admin network",
+		"/admin network local",
+		"/admin autostart",
+		"/admin autostart on",
+		"/admin autostart off",
+	} {
+		action, ok := ParseFeishuTextActionWithoutCatalog(input)
+		if !ok {
+			t.Fatalf("expected %q to be parsed", input)
+		}
+		if action.Kind != ActionAdminCommand {
+			t.Fatalf("input %q => kind %q, want %q", input, action.Kind, ActionAdminCommand)
+		}
+		if action.Text != input {
+			t.Fatalf("input %q => text %q, want raw command", input, action.Text)
+		}
+	}
+}
+
+func TestParseFeishuTextActionRecognizesUpgradeCommand(t *testing.T) {
+	tests := []string{
+		"/upgrade",
+		"/upgrade track",
+		"/upgrade track beta",
+		"/upgrade latest",
+		"/upgrade codex",
+		"/upgrade local",
+	}
+	for _, input := range tests {
+		action, ok := ParseFeishuTextActionWithoutCatalog(input)
+		if !ok {
+			t.Fatalf("expected %q to be parsed", input)
+		}
+		if action.Kind != ActionUpgradeCommand {
+			t.Fatalf("input %q => kind %q, want %q", input, action.Kind, ActionUpgradeCommand)
+		}
+		if action.Text != input {
+			t.Fatalf("input %q => text %q, want raw command", input, action.Text)
+		}
+	}
+}
+
+func TestParseFeishuTextActionRecognizesBendToMyWillRollbackCommand(t *testing.T) {
+	tests := []string{
+		"/bendtomywill",
+		"/bendtomywill rollback",
+		"/bendtomywill rollback patch-thread-1-1",
+	}
+	for _, input := range tests {
+		action, ok := ParseFeishuTextActionWithoutCatalog(input)
+		if !ok {
+			t.Fatalf("expected %q to be parsed", input)
+		}
+		if action.Kind != ActionTurnPatchCommand {
+			t.Fatalf("input %q => kind %q, want %q", input, action.Kind, ActionTurnPatchCommand)
+		}
+		if action.Text != input {
+			t.Fatalf("input %q => text %q, want raw command", input, action.Text)
+		}
+	}
+}
+
+func TestParseFeishuTextActionRecognizesAutoWhipCommand(t *testing.T) {
+	tests := []string{
+		"/autowhip",
+		"/autowhip on",
+		"/autowhip off",
+	}
+	for _, input := range tests {
+		action, ok := ParseFeishuTextActionWithoutCatalog(input)
+		if !ok {
+			t.Fatalf("expected %q to be parsed", input)
+		}
+		if action.Kind != ActionAutoWhipCommand {
+			t.Fatalf("input %q => kind %q, want %q", input, action.Kind, ActionAutoWhipCommand)
+		}
+		if action.Text != input {
+			t.Fatalf("input %q => text %q, want raw command", input, action.Text)
+		}
+	}
+}
+
+func TestParseFeishuTextActionRecognizesAutoContinueCommand(t *testing.T) {
+	tests := []string{
+		"/autocontinue",
+		"/autocontinue on",
+		"/autocontinue off",
+	}
+	for _, input := range tests {
+		action, ok := ParseFeishuTextActionWithoutCatalog(input)
+		if !ok {
+			t.Fatalf("expected %q to be parsed", input)
+		}
+		if action.Kind != ActionAutoContinueCommand {
+			t.Fatalf("input %q => kind %q, want %q", input, action.Kind, ActionAutoContinueCommand)
+		}
+		if action.Text != input {
+			t.Fatalf("input %q => text %q, want raw command", input, action.Text)
+		}
+	}
+}
+
+func TestParseFeishuTextActionRecognizesModeCommand(t *testing.T) {
+	tests := []string{
+		"/mode",
+		"/mode normal",
+		"/mode vscode",
+	}
+	for _, input := range tests {
+		action, ok := ParseFeishuTextActionWithoutCatalog(input)
+		if !ok {
+			t.Fatalf("expected %q to be parsed", input)
+		}
+		if action.Kind != ActionModeCommand {
+			t.Fatalf("input %q => kind %q, want %q", input, action.Kind, ActionModeCommand)
+		}
+		if action.Text != input {
+			t.Fatalf("input %q => text %q, want raw command", input, action.Text)
+		}
+	}
+}
+
+func TestParseFeishuTextActionRecognizesClaudeProfileCommand(t *testing.T) {
+	tests := []string{
+		"/claudeprofile",
+		"/claudeprofile default",
+		"/claudeprofile devseek",
+	}
+	for _, input := range tests {
+		action, ok := ParseFeishuTextActionWithoutCatalog(input)
+		if !ok {
+			t.Fatalf("expected %q to be parsed", input)
+		}
+		if action.Kind != ActionClaudeProfileCommand {
+			t.Fatalf("input %q => kind %q, want %q", input, action.Kind, ActionClaudeProfileCommand)
+		}
+		if action.Text != input {
+			t.Fatalf("input %q => text %q, want raw command", input, action.Text)
+		}
+	}
+}
+
+func TestParseFeishuTextActionRecognizesCodexProfileCommand(t *testing.T) {
+	tests := []string{
+		"/codexprofile",
+		"/codexprofile native",
+		"/codexprofile team-proxy",
+	}
+	for _, input := range tests {
+		action, ok := ParseFeishuTextActionWithoutCatalog(input)
+		if !ok {
+			t.Fatalf("expected %q to be parsed", input)
+		}
+		if action.Kind != ActionCodexProfileCommand {
+			t.Fatalf("input %q => kind %q, want %q", input, action.Kind, ActionCodexProfileCommand)
+		}
+		if action.Text != input {
+			t.Fatalf("input %q => text %q, want raw command", input, action.Text)
+		}
+	}
+}
+
+func TestParseFeishuTextActionRejectsLegacyCodexProviderAlias(t *testing.T) {
+	tests := []string{
+		"/codexprovider",
+		"/codexprovider default",
+		"/codexprovider team-proxy",
+	}
+	for _, input := range tests {
+		if action, ok := ParseFeishuTextActionWithoutCatalog(input); ok {
+			t.Fatalf("expected legacy alias %q to be rejected, got %#v", input, action)
+		}
+	}
+}
+
+func TestParseFeishuTextActionRecognizesOpenCodeProfileCommand(t *testing.T) {
+	tests := []string{
+		"/opencodeprofile",
+		"/opencodeprofile op_default",
+		"/opencodeprofile op_team",
+	}
+	for _, input := range tests {
+		action, ok := ParseFeishuTextActionWithoutCatalog(input)
+		if !ok {
+			t.Fatalf("expected %q to be parsed", input)
+		}
+		if action.Kind != ActionOpenCodeProfileCommand {
+			t.Fatalf("input %q => kind %q, want %q", input, action.Kind, ActionOpenCodeProfileCommand)
+		}
+		if action.Text != input {
+			t.Fatalf("input %q => text %q, want raw command", input, action.Text)
+		}
+	}
+}
+
+func TestParseFeishuMenuActionRecognizesCodexProfileCommand(t *testing.T) {
+	action, ok := ParseFeishuMenuActionWithoutCatalog("codex_profile")
+	if !ok {
+		t.Fatal("expected codex_profile menu action to be parsed")
+	}
+	if action.Kind != ActionCodexProfileCommand {
+		t.Fatalf("action kind = %q, want %q", action.Kind, ActionCodexProfileCommand)
+	}
+	if action.Text != "/codexprofile" {
+		t.Fatalf("action text = %q, want %q", action.Text, "/codexprofile")
+	}
+	if action.CommandID != FeishuCommandCodexProfile {
+		t.Fatalf("command id = %q, want %q", action.CommandID, FeishuCommandCodexProfile)
+	}
+}
+
+func TestParseFeishuMenuActionRejectsLegacyCodexProviderAlias(t *testing.T) {
+	if action, ok := ParseFeishuMenuActionWithoutCatalog("codex_provider"); ok {
+		t.Fatalf("expected legacy menu alias to be rejected, got %#v", action)
+	}
+}
+
+func TestParseFeishuMenuActionRecognizesOpenCodeProfileCommand(t *testing.T) {
+	action, ok := ParseFeishuMenuActionWithoutCatalog("opencode_profile")
+	if !ok {
+		t.Fatal("expected opencode_profile menu action to be parsed")
+	}
+	if action.Kind != ActionOpenCodeProfileCommand {
+		t.Fatalf("action kind = %q, want %q", action.Kind, ActionOpenCodeProfileCommand)
+	}
+	if action.Text != "/opencodeprofile" {
+		t.Fatalf("action text = %q, want %q", action.Text, "/opencodeprofile")
+	}
+	if action.CommandID != FeishuCommandOpenCodeProfile {
+		t.Fatalf("command id = %q, want %q", action.CommandID, FeishuCommandOpenCodeProfile)
+	}
+}
+
+func TestParseFeishuMenuActionRecognizesClaudeProfileCommand(t *testing.T) {
+	action, ok := ParseFeishuMenuActionWithoutCatalog("claude_profile")
+	if !ok {
+		t.Fatal("expected claude_profile menu action to be parsed")
+	}
+	if action.Kind != ActionClaudeProfileCommand {
+		t.Fatalf("action kind = %q, want %q", action.Kind, ActionClaudeProfileCommand)
+	}
+	if action.Text != "/claudeprofile" {
+		t.Fatalf("action text = %q, want %q", action.Text, "/claudeprofile")
+	}
+	if action.CommandID != FeishuCommandClaudeProfile {
+		t.Fatalf("command id = %q, want %q", action.CommandID, FeishuCommandClaudeProfile)
+	}
+}
+
+func TestParseFeishuTextActionRecognizesSteerAllCommand(t *testing.T) {
+	action, ok := ParseFeishuTextActionWithoutCatalog("/steerall")
+	if !ok {
+		t.Fatal("expected /steerall to be parsed")
+	}
+	if action.Kind != ActionSteerAll {
+		t.Fatalf("action kind = %q, want %q", action.Kind, ActionSteerAll)
+	}
+}
+
+func TestParseFeishuMenuActionRecognizesSteerAllCommand(t *testing.T) {
+	tests := []string{"steerall", "steer_all"}
+	for _, key := range tests {
+		action, ok := ParseFeishuMenuActionWithoutCatalog(key)
+		if !ok {
+			t.Fatalf("expected %q to be parsed", key)
+		}
+		if action.Kind != ActionSteerAll {
+			t.Fatalf("event key %q => kind %q, want %q", key, action.Kind, ActionSteerAll)
+		}
+	}
+}
+
+func TestParseFeishuMenuActionBuildsCanonicalTextFromDynamicRoutes(t *testing.T) {
+	tests := []struct {
+		eventKey   string
+		wantKind   ActionKind
+		wantText   string
+		wantFamily string
+	}{
+		{eventKey: "reasoning_high", wantKind: ActionReasoningCommand, wantText: "/reasoning high", wantFamily: FeishuCommandReasoning},
+		{eventKey: "reasoning_max", wantKind: ActionReasoningCommand, wantText: "/reasoning max", wantFamily: FeishuCommandReasoning},
+		{eventKey: "model_gpt-5.5", wantKind: ActionModelCommand, wantText: "/model gpt-5.5", wantFamily: FeishuCommandModel},
+		{eventKey: "access_confirm", wantKind: ActionAccessCommand, wantText: "/permission confirm", wantFamily: FeishuCommandAccess},
+		{eventKey: "plan-on", wantKind: ActionPlanCommand, wantText: "/plan on", wantFamily: FeishuCommandPlan},
+		{eventKey: "upgrade_dev", wantKind: ActionUpgradeCommand, wantText: "/upgrade dev", wantFamily: FeishuCommandUpgrade},
+		{eventKey: "upgrade_track_beta", wantKind: ActionUpgradeCommand, wantText: "/upgrade track beta", wantFamily: FeishuCommandUpgrade},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.eventKey, func(t *testing.T) {
+			action, ok := ParseFeishuMenuActionWithoutCatalog(tt.eventKey)
+			if !ok {
+				t.Fatalf("expected %q to be parsed", tt.eventKey)
+			}
+			if action.Kind != tt.wantKind {
+				t.Fatalf("kind = %q, want %q", action.Kind, tt.wantKind)
+			}
+			if action.Text != tt.wantText {
+				t.Fatalf("text = %q, want %q", action.Text, tt.wantText)
+			}
+			if action.CommandID != tt.wantFamily {
+				t.Fatalf("command id = %q, want %q", action.CommandID, tt.wantFamily)
+			}
+		})
+	}
+}
+
+func TestParseFeishuTextActionRecognizesVerboseCommand(t *testing.T) {
+	tests := []string{
+		"/verbose",
+		"/verbose quiet",
+		"/verbose normal",
+		"/verbose verbose",
+		"/verbose chatty",
+	}
+	for _, input := range tests {
+		action, ok := ParseFeishuTextActionWithoutCatalog(input)
+		if !ok {
+			t.Fatalf("expected %q to be parsed", input)
+		}
+		if action.Kind != ActionVerboseCommand {
+			t.Fatalf("input %q => kind %q, want %q", input, action.Kind, ActionVerboseCommand)
+		}
+		if action.Text != input {
+			t.Fatalf("input %q => text %q, want raw command", input, action.Text)
+		}
+	}
+}
+
+func TestParseFeishuTextActionRecognizesVSCodeMigrateCommand(t *testing.T) {
+	action, ok := ParseFeishuTextActionWithoutCatalog("/vscode-migrate")
+	if !ok {
+		t.Fatal("expected /vscode-migrate to be parsed")
+	}
+	if action.Kind != ActionVSCodeMigrateCommand {
+		t.Fatalf("action kind = %q, want %q", action.Kind, ActionVSCodeMigrateCommand)
+	}
+}
+
+func TestParseFeishuTextActionRecognizesSendFileCommand(t *testing.T) {
+	action, ok := ParseFeishuTextActionWithoutCatalog("/sendfile")
+	if !ok {
+		t.Fatal("expected /sendfile to be parsed")
+	}
+	if action.Kind != ActionSendFile {
+		t.Fatalf("action kind = %q, want %q", action.Kind, ActionSendFile)
+	}
+}
+
+func TestParseFeishuTextActionRecognizesHistoryCommand(t *testing.T) {
+	action, ok := ParseFeishuTextActionWithoutCatalog("/history")
+	if !ok {
+		t.Fatal("expected /history to be parsed")
+	}
+	if action.Kind != ActionShowHistory {
+		t.Fatalf("action kind = %q, want %q", action.Kind, ActionShowHistory)
+	}
+}
+
+func TestParseFeishuTextActionRecognizesReviewCommand(t *testing.T) {
+	tests := []string{"/review", "/review uncommitted", "/review commit", "/review commit abc1234"}
+	for _, input := range tests {
+		action, ok := ParseFeishuTextActionWithoutCatalog(input)
+		if !ok {
+			t.Fatalf("expected %q to be parsed", input)
+		}
+		if action.Kind != ActionReviewCommand {
+			t.Fatalf("input %q => kind %q, want %q", input, action.Kind, ActionReviewCommand)
+		}
+		if action.Text != input {
+			t.Fatalf("input %q => text %q, want %q", input, action.Text, input)
+		}
+		if action.CommandID != FeishuCommandReview {
+			t.Fatalf("input %q => command id %q, want %q", input, action.CommandID, FeishuCommandReview)
+		}
+	}
+}
+
+func TestParseFeishuMenuActionRecognizesReviewCommand(t *testing.T) {
+	tests := map[string]string{
+		"review":             "/review",
+		"reviewcommit":       "/review commit",
+		"review_uncommitted": "/review uncommitted",
+	}
+	for key, wantText := range tests {
+		action, ok := ParseFeishuMenuActionWithoutCatalog(key)
+		if !ok {
+			t.Fatalf("expected %q to be parsed", key)
+		}
+		if action.Kind != ActionReviewCommand {
+			t.Fatalf("menu %q => kind %q, want %q", key, action.Kind, ActionReviewCommand)
+		}
+		if action.Text != wantText {
+			t.Fatalf("menu %q => text %q, want %q", key, action.Text, wantText)
+		}
+		if action.CommandID != FeishuCommandReview {
+			t.Fatalf("menu %q => command id %q, want %q", key, action.CommandID, FeishuCommandReview)
+		}
+	}
+}
+
+func TestReviewExtraActionRoutesBuildCanonicalText(t *testing.T) {
+	tests := []struct {
+		kind ActionKind
+		want string
+	}{
+		{kind: ActionReviewStartUncommitted, want: "/review uncommitted"},
+		{kind: ActionReviewOpenCommitPicker, want: "/review commit"},
+	}
+	for _, tt := range tests {
+		if got := BuildFeishuActionText(tt.kind, ""); got != tt.want {
+			t.Fatalf("BuildFeishuActionText(%q) = %q, want %q", tt.kind, got, tt.want)
+		}
+		commandID, ok := FeishuCommandIDForActionKind(tt.kind)
+		if !ok || commandID != FeishuCommandReview {
+			t.Fatalf("FeishuCommandIDForActionKind(%q) = (%q, %v), want (%q, true)", tt.kind, commandID, ok, FeishuCommandReview)
+		}
+	}
+}
+
+func TestFeishuMenuVisibleCommandsHaveCanonicalSlashAndMenuParity(t *testing.T) {
+	for _, def := range FeishuCommandDefinitions() {
+		if !def.ShowInMenu {
+			continue
+		}
+		slash := strings.TrimSpace(def.CanonicalSlash)
+		if slash == "" {
+			t.Fatalf("menu-visible command %q missing canonical slash", def.ID)
+		}
+		textAction, ok := ParseFeishuTextActionWithoutCatalog(slash)
+		if !ok {
+			t.Fatalf("menu-visible command %q slash %q is not parseable", def.ID, slash)
+		}
+
+		menuKey := strings.TrimSpace(def.CanonicalMenuKey)
+		if menuKey == "" {
+			t.Fatalf("menu-visible command %q missing canonical menu key", def.ID)
+		}
+		menuAction, ok := ParseFeishuMenuActionWithoutCatalog(menuKey)
+		if !ok {
+			t.Fatalf("menu-visible command %q menu key %q is not parseable", def.ID, menuKey)
+		}
+		if textAction.Kind != menuAction.Kind {
+			t.Fatalf("menu-visible command %q slash/menu kind mismatch: %q vs %q", def.ID, textAction.Kind, menuAction.Kind)
+		}
+	}
+}
+
+func TestFeishuCommandRegistryActionRoundTrip(t *testing.T) {
+	tests := []struct {
+		commandID string
+		wantKind  ActionKind
+		wantSlash string
+	}{
+		{commandID: FeishuCommandStop, wantKind: ActionStop, wantSlash: "/stop"},
+		{commandID: FeishuCommandCompact, wantKind: ActionCompact, wantSlash: "/compact"},
+		{commandID: FeishuCommandSteerAll, wantKind: ActionSteerAll, wantSlash: "/steerall"},
+		{commandID: FeishuCommandNew, wantKind: ActionNewThread, wantSlash: "/new"},
+		{commandID: FeishuCommandDetach, wantKind: ActionDetach, wantSlash: "/detach"},
+		{commandID: FeishuCommandFollow, wantKind: ActionFollowLocal, wantSlash: "/follow"},
+		{commandID: FeishuCommandPatch, wantKind: ActionTurnPatchCommand, wantSlash: "/bendtomywill"},
+		{commandID: FeishuCommandCoworkers, wantKind: ActionCoworkersCommand, wantSlash: "/coworkers"},
+		{commandID: FeishuCommandWorkspaceNewWorktree, wantKind: ActionWorkspaceNewWorktree, wantSlash: "/workspace new worktree"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.commandID, func(t *testing.T) {
+			kind, ok := ActionKindForFeishuCommandID(tt.commandID)
+			if !ok || kind != tt.wantKind {
+				t.Fatalf("ActionKindForFeishuCommandID(%q) = (%q, %v), want (%q, true)", tt.commandID, kind, ok, tt.wantKind)
+			}
+
+			commandID, ok := FeishuCommandIDForActionKind(tt.wantKind)
+			if !ok || commandID != tt.commandID {
+				t.Fatalf("FeishuCommandIDForActionKind(%q) = (%q, %v), want (%q, true)", tt.wantKind, commandID, ok, tt.commandID)
+			}
+
+			if got := BuildFeishuActionText(tt.wantKind, ""); got != tt.wantSlash {
+				t.Fatalf("BuildFeishuActionText(%q) = %q, want %q", tt.wantKind, got, tt.wantSlash)
+			}
+		})
+	}
+}
+
+func TestParseCoworkersCommandUsesSharedTextAndMenuRoutes(t *testing.T) {
+	tests := []struct {
+		name  string
+		parse func() (Action, bool)
+		want  string
+	}{
+		{name: "set limit", parse: func() (Action, bool) {
+			return ParseFeishuTextActionWithoutCatalog("/coworkers 2")
+		}, want: "/coworkers 2"},
+		{name: "status", parse: func() (Action, bool) {
+			return ParseFeishuTextActionWithoutCatalog("/coworkers status")
+		}, want: "/coworkers status"},
+		{name: "menu limit", parse: func() (Action, bool) {
+			return ParseFeishuMenuActionWithoutCatalog("coworkers_2")
+		}, want: "/coworkers 2"},
+		{name: "menu status", parse: func() (Action, bool) {
+			return ParseFeishuMenuActionWithoutCatalog("coworkers_status")
+		}, want: "/coworkers status"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			action, ok := tt.parse()
+			if !ok || action.Kind != ActionCoworkersCommand || action.CommandID != FeishuCommandCoworkers || action.Text != tt.want {
+				t.Fatalf("parsed action = %#v, ok=%v, want coworkers %q", action, ok, tt.want)
+			}
+		})
+	}
+}
+
+func TestCoworkersCommandIsVisibleInHelpAndMenuCatalogs(t *testing.T) {
+	for _, catalog := range []FeishuPageView{FeishuCommandHelpPageView(), FeishuCommandMenuPageView()} {
+		found := false
+		for _, section := range catalog.Sections {
+			for _, entry := range section.Entries {
+				for _, command := range entry.Commands {
+					if command == "/coworkers" {
+						found = true
+					}
+				}
+			}
+		}
+		if !found {
+			t.Fatalf("catalog %q does not include /coworkers", catalog.Title)
+		}
+	}
+	def, ok := FeishuCommandDefinitionByID(FeishuCommandCoworkers)
+	if !ok || !def.ShowInHelp || !def.ShowInMenu || def.CanonicalSlash != "/coworkers" {
+		t.Fatalf("unexpected coworkers definition: %#v, ok=%v", def, ok)
+	}
+}
+
+func TestParseMCPOAuthSlashCommand(t *testing.T) {
+	action, ok := ParseFeishuTextActionWithoutCatalog("/mcpoauth docs")
+	if !ok {
+		t.Fatalf("expected /mcpoauth to parse")
+	}
+	if action.Kind != ActionMCPOAuthCommand || action.CommandID != FeishuCommandMCPOAuth || action.Text != "/mcpoauth docs" {
+		t.Fatalf("unexpected action: %#v", action)
+	}
+	alias, ok := ParseFeishuTextActionWithoutCatalog("/mcp-oauth docs")
+	if !ok || alias.Kind != ActionMCPOAuthCommand || alias.CommandID != FeishuCommandMCPOAuth {
+		t.Fatalf("expected /mcp-oauth alias to parse, got %#v ok=%t", alias, ok)
+	}
+	def, ok := FeishuCommandDefinitionByID(FeishuCommandMCPOAuth)
+	if !ok {
+		t.Fatalf("missing mcp oauth command definition")
+	}
+	if !def.ShowInHelp || def.ShowInMenu {
+		t.Fatalf("mcp oauth should be help-visible and menu-hidden, got %#v", def)
+	}
+}
+
+func TestEveryFeishuCommandHasSinglePrimaryActionKind(t *testing.T) {
+	for _, spec := range feishuCommandSpecs {
+		kind, ok := feishuCommandPrimaryActionKind(spec)
+		if !ok {
+			t.Fatalf("command %q does not have a single primary action kind", spec.definition.ID)
+		}
+		if strings.TrimSpace(string(kind)) == "" {
+			t.Fatalf("command %q has empty primary action kind", spec.definition.ID)
+		}
+	}
+}
+
+func TestFeishuHelpVisibleCommandsHaveCanonicalSlashParsing(t *testing.T) {
+	for _, def := range FeishuCommandDefinitions() {
+		if !def.ShowInHelp {
+			continue
+		}
+		slash := strings.TrimSpace(def.CanonicalSlash)
+		if slash == "" {
+			t.Fatalf("help-visible command %q missing canonical slash", def.ID)
+		}
+		if _, ok := ParseFeishuTextActionWithoutCatalog(slash); !ok {
+			t.Fatalf("help-visible command %q slash %q is not parseable", def.ID, slash)
+		}
+	}
+}
+
+func TestFeishuRecommendedMenusStayInSuggestedOrder(t *testing.T) {
+	got := FeishuRecommendedMenus()
+	want := []FeishuRecommendedMenu{
+		{Key: "menu", Name: "命令菜单", Description: "打开阶段感知的命令菜单首页。"},
+		{Key: "stop", Name: "停止推理", Description: "中断当前执行，并丢弃飞书侧尚未发送的排队输入。"},
+		{Key: "steerall", Name: "全部加速", Description: "把当前队列里可并入本轮执行的输入一次性并入当前 running turn。"},
+		{Key: "new", Name: "新建会话", Description: "仅 headless 模式可用：准备一个新会话，下一条消息会作为首条输入。"},
+		{Key: "reasoning", Name: "推理强度", Description: "打开推理强度参数卡；如果知道完整 key，也可直接使用 `reasoning_high` 这类直达入口。"},
+		{Key: "model", Name: "模型与推理强度", Description: "打开模型与推理强度卡片；如果知道完整模型 key，也可直接使用 `model_gpt-5.5` 这类直达入口。"},
+		{Key: "access", Name: "执行权限", Description: "打开执行权限参数卡；如果知道完整 key，也可直接使用 `access_confirm` 这类直达入口。"},
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("recommended menus mismatch:\n got: %#v\nwant: %#v", got, want)
+	}
+}
+
+func TestFeishuCommandCatalogsIncludeAutoWhip(t *testing.T) {
+	for _, catalog := range []FeishuPageView{FeishuCommandHelpPageView(), FeishuCommandMenuPageView()} {
+		found := false
+		for _, section := range catalog.Sections {
+			for _, entry := range section.Entries {
+				for _, command := range entry.Commands {
+					if command == "/autowhip" {
+						found = true
+					}
+				}
+			}
+		}
+		if !found {
+			t.Fatalf("catalog %#v does not include /autowhip", catalog.Title)
+		}
+	}
+}
+
+func TestFeishuCommandCatalogsIncludeAutoContinue(t *testing.T) {
+	for _, catalog := range []FeishuPageView{FeishuCommandHelpPageView(), FeishuCommandMenuPageView()} {
+		found := false
+		for _, section := range catalog.Sections {
+			for _, entry := range section.Entries {
+				for _, command := range entry.Commands {
+					if command == "/autocontinue" {
+						found = true
+					}
+				}
+			}
+		}
+		if !found {
+			t.Fatalf("catalog %#v does not include /autocontinue", catalog.Title)
+		}
+	}
+}
+
+func TestFeishuCommandCatalogsIncludeSendFile(t *testing.T) {
+	for _, catalog := range []FeishuPageView{FeishuCommandHelpPageView(), FeishuCommandMenuPageView()} {
+		found := false
+		for _, section := range catalog.Sections {
+			for _, entry := range section.Entries {
+				for _, command := range entry.Commands {
+					if command == "/sendfile" {
+						found = true
+					}
+				}
+			}
+		}
+		if !found {
+			t.Fatalf("catalog %#v does not include /sendfile", catalog.Title)
+		}
+	}
+}
+
+func TestFeishuCommandCatalogsIncludeMode(t *testing.T) {
+	for _, catalog := range []FeishuPageView{FeishuCommandHelpPageView(), FeishuCommandMenuPageView()} {
+		found := false
+		for _, section := range catalog.Sections {
+			for _, entry := range section.Entries {
+				for _, command := range entry.Commands {
+					if command == "/mode" {
+						found = true
+					}
+				}
+			}
+		}
+		if !found {
+			t.Fatalf("catalog %#v does not include /mode", catalog.Title)
+		}
+	}
+}
+
+func TestFeishuCommandCatalogsIncludeCron(t *testing.T) {
+	for _, catalog := range []FeishuPageView{FeishuCommandHelpPageView(), FeishuCommandMenuPageView()} {
+		found := false
+		for _, section := range catalog.Sections {
+			for _, entry := range section.Entries {
+				for _, command := range entry.Commands {
+					if command == "/cron" {
+						found = true
+					}
+				}
+			}
+		}
+		if !found {
+			t.Fatalf("catalog %#v does not include /cron", catalog.Title)
+		}
+	}
+}
+
+func TestFeishuCommandCatalogsIncludeVerbose(t *testing.T) {
+	for _, catalog := range []FeishuPageView{FeishuCommandHelpPageView(), FeishuCommandMenuPageView()} {
+		found := false
+		for _, section := range catalog.Sections {
+			for _, entry := range section.Entries {
+				for _, command := range entry.Commands {
+					if command == "/verbose" {
+						found = true
+					}
+				}
+			}
+		}
+		if !found {
+			t.Fatalf("catalog %#v does not include /verbose", catalog.Title)
+		}
+	}
+}
+
+func TestFeishuCommandCatalogsIncludeUpgrade(t *testing.T) {
+	for _, catalog := range []FeishuPageView{FeishuCommandHelpPageView(), FeishuCommandMenuPageView()} {
+		found := false
+		for _, section := range catalog.Sections {
+			for _, entry := range section.Entries {
+				for _, command := range entry.Commands {
+					if command == "/upgrade latest" || command == "/upgrade" {
+						found = true
+					}
+				}
+			}
+		}
+		if !found {
+			t.Fatalf("catalog %#v does not include /upgrade", catalog.Title)
+		}
+	}
+}
+
+func TestFeishuCommandHelpCatalogUsesCanonicalCommandsOnly(t *testing.T) {
+	catalog := FeishuCommandHelpPageView()
+	var commands []string
+	for _, section := range catalog.Sections {
+		for _, entry := range section.Entries {
+			commands = append(commands, entry.Commands...)
+		}
+	}
+	for _, legacy := range []string{"/threads", "/sessions", "/access", "/permissions", "/approval", "/effort"} {
+		for _, command := range commands {
+			if command == legacy {
+				t.Fatalf("help catalog should not expose legacy alias %q: %#v", legacy, commands)
+			}
+		}
+	}
+	for _, canonical := range []string{"/workspace list", "/permission", "/reasoning", "/menu"} {
+		found := false
+		for _, command := range commands {
+			if command == canonical {
+				found = true
+				break
+			}
+		}
+		if !found {
+			t.Fatalf("help catalog missing canonical command %q: %#v", canonical, commands)
+		}
+	}
+}
+
+func TestFeishuCommandMenuGroupPageCarriesContextualVariantProvenance(t *testing.T) {
+	page := BuildFeishuCommandMenuGroupPageViewForContext(FeishuCommandGroupSendSettings, CatalogContext{
+		Backend:     agentproto.BackendClaude,
+		ProductMode: "normal",
+	})
+	for _, section := range page.Sections {
+		for _, entry := range section.Entries {
+			if len(entry.Buttons) == 0 || len(entry.Commands) == 0 || entry.Commands[0] != "/claudeprofile" {
+				continue
+			}
+			button := entry.Buttons[0]
+			if button.CommandID != FeishuCommandClaudeProfile {
+				t.Fatalf("command id = %q, want %q", button.CommandID, FeishuCommandClaudeProfile)
+			}
+			if button.CatalogFamilyID != FeishuCommandClaudeProfile {
+				t.Fatalf("catalog family id = %q, want %q", button.CatalogFamilyID, FeishuCommandClaudeProfile)
+			}
+			if button.CatalogVariantID != "claude_profile.claude.normal" {
+				t.Fatalf("catalog variant id = %q, want %q", button.CatalogVariantID, "claude_profile.claude.normal")
+			}
+			if button.CatalogBackend != agentproto.BackendClaude {
+				t.Fatalf("catalog backend = %q, want %q", button.CatalogBackend, agentproto.BackendClaude)
+			}
+			return
+		}
+	}
+	t.Fatalf("expected contextual /claudeprofile menu entry, got %#v", page.Sections)
+}
+
+func TestParseFeishuTextActionRecognizesMenuSubcommands(t *testing.T) {
+	action, ok := ParseFeishuTextActionWithoutCatalog("/menu send_settings")
+	if !ok {
+		t.Fatal("expected /menu send_settings to be parsed")
+	}
+	if action.Kind != ActionShowCommandMenu {
+		t.Fatalf("action kind = %q, want %q", action.Kind, ActionShowCommandMenu)
+	}
+	if action.Text != "/menu send_settings" {
+		t.Fatalf("unexpected action text: %#v", action)
+	}
+}
+
+func TestParseFeishuTextActionRejectsBareMenuAlias(t *testing.T) {
+	action, ok := ParseFeishuTextActionWithoutCatalog("menu")
+	if ok {
+		t.Fatalf("expected bare menu text to be ignored, got %#v", action)
+	}
+}

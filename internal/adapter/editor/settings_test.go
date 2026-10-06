@@ -1,0 +1,143 @@
+package editor
+
+import (
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+)
+
+func TestClearVSCodeSettingsExecutable(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "settings.json")
+	raw := []byte("{\n  \"chatgpt.cliExecutable\": \"/usr/local/bin/codex-feishu-relay\",\n  \"editor.fontSize\": 14\n}\n")
+	if err := os.WriteFile(path, raw, 0o644); err != nil {
+		t.Fatalf("seed settings: %v", err)
+	}
+
+	if err := ClearVSCodeSettingsExecutable(path); err != nil {
+		t.Fatalf("clear settings: %v", err)
+	}
+
+	updated, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read cleared settings: %v", err)
+	}
+	text := string(updated)
+	if strings.Contains(text, "chatgpt.cliExecutable") {
+		t.Fatalf("expected cli executable override to be removed, got %s", text)
+	}
+	if !strings.Contains(text, "\"editor.fontSize\": 14") {
+		t.Fatalf("expected unrelated settings to remain, got %s", text)
+	}
+}
+
+func TestClearVSCodeSettingsExecutableMissingFileIsNoop(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "missing.json")
+	if err := ClearVSCodeSettingsExecutable(path); err != nil {
+		t.Fatalf("clear settings: %v", err)
+	}
+}
+
+func TestSetVSCodeSettingsExecutable(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "settings.json")
+	raw := []byte("{\n  \"editor.fontSize\": 14\n}\n")
+	if err := os.WriteFile(path, raw, 0o644); err != nil {
+		t.Fatalf("seed settings: %v", err)
+	}
+
+	if err := SetVSCodeSettingsExecutable(path, "/usr/local/bin/codex"); err != nil {
+		t.Fatalf("set settings: %v", err)
+	}
+
+	updated, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read updated settings: %v", err)
+	}
+	text := string(updated)
+	if !strings.Contains(text, "\"chatgpt.cliExecutable\": \"/usr/local/bin/codex\"") {
+		t.Fatalf("expected cli executable override to be restored, got %s", text)
+	}
+	if !strings.Contains(text, "\"editor.fontSize\": 14") {
+		t.Fatalf("expected unrelated settings to remain, got %s", text)
+	}
+}
+
+func TestDetectVSCodeSettingsSupportsJSONC(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "settings.json")
+	raw := []byte("{\n  // use wrapper\n  \"chatgpt.cliExecutable\": \"/usr/local/bin/codex-feishu-relay\",\n}\n")
+	if err := os.WriteFile(path, raw, 0o644); err != nil {
+		t.Fatalf("seed settings: %v", err)
+	}
+
+	status, err := DetectVSCodeSettings(path, "/usr/local/bin/codex-feishu-relay")
+	if err != nil {
+		t.Fatalf("detect settings: %v", err)
+	}
+	if !status.Exists {
+		t.Fatalf("expected settings to exist, got %#v", status)
+	}
+	if status.CLIExecutable != "/usr/local/bin/codex-feishu-relay" {
+		t.Fatalf("cli executable = %q, want /usr/local/bin/codex-feishu-relay", status.CLIExecutable)
+	}
+	if !status.MatchesBinary {
+		t.Fatalf("expected settings to match binary, got %#v", status)
+	}
+	if status.ParseError != "" {
+		t.Fatalf("expected no parse error, got %q", status.ParseError)
+	}
+}
+
+func TestDetectVSCodeSettingsNormalizesInvalidWindowsPathEscapes(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "settings.json")
+	exePath := `C:\Tools\codex-feishu-relay.exe`
+	raw := []byte("{\n  \"chatgpt.cliExecutable\": \"C:\\Tools\\codex-feishu-relay.exe\",\n  \"editor.fontSize\": 14\n}\n")
+	raw = []byte(strings.ReplaceAll(string(raw), `\\`, `\`))
+	if err := os.WriteFile(path, raw, 0o644); err != nil {
+		t.Fatalf("seed settings: %v", err)
+	}
+
+	status, err := DetectVSCodeSettings(path, exePath)
+	if err != nil {
+		t.Fatalf("detect settings: %v", err)
+	}
+	if !status.Exists {
+		t.Fatalf("expected settings to exist, got %#v", status)
+	}
+	if status.CLIExecutable != exePath {
+		t.Fatalf("cli executable = %q, want %q", status.CLIExecutable, exePath)
+	}
+	if !status.MatchesBinary {
+		t.Fatalf("expected settings to match binary, got %#v", status)
+	}
+	if status.ParseError != "" {
+		t.Fatalf("expected recoverable invalid escape to be normalized, got parse error %q", status.ParseError)
+	}
+}
+
+func TestDetectVSCodeSettingsKeepsDetectPathWhenJSONIsUnrecoverable(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "settings.json")
+	raw := []byte("{\n  \"editor.fontSize\": 14,,\n}\n")
+	if err := os.WriteFile(path, raw, 0o644); err != nil {
+		t.Fatalf("seed settings: %v", err)
+	}
+
+	status, err := DetectVSCodeSettings(path, "/usr/local/bin/codex-feishu-relay")
+	if err != nil {
+		t.Fatalf("detect settings: %v", err)
+	}
+	if !status.Exists {
+		t.Fatalf("expected settings to exist, got %#v", status)
+	}
+	if status.ParseError == "" {
+		t.Fatalf("expected parse error for unrecoverable malformed JSON, got %#v", status)
+	}
+	if status.CLIExecutable != "" || status.MatchesBinary {
+		t.Fatalf("expected malformed settings to avoid false positive executable match, got %#v", status)
+	}
+}

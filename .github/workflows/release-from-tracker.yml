@@ -1,0 +1,67 @@
+name: Release From Tracker
+
+on:
+  issues:
+    types:
+      - closed
+
+permissions:
+  contents: write
+  issues: read
+
+concurrency:
+  group: release-tracker-${{ github.event.issue.number }}
+  cancel-in-progress: false
+
+jobs:
+  plan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      ref: ${{ steps.readiness.outputs.ref }}
+      track: ${{ steps.readiness.outputs.track }}
+      version: ${{ steps.readiness.outputs.version }}
+      should_release: ${{ steps.flag.outputs.should_release }}
+
+    steps:
+      # 非 tracker issue 也至少执行一个真实 job，避免 workflow 全 skipped
+      # 时 run 不 finalize（GitHub Actions 偶发卡在 in_progress）。
+      - name: Skip non-tracker issue
+        if: ${{ !contains(join(github.event.issue.labels.*.name, ','), 'release:tracker') }}
+        run: echo "issue #${{ github.event.issue.number }} is not a release tracker; skipping release"
+
+      - name: Checkout
+        if: ${{ contains(join(github.event.issue.labels.*.name, ','), 'release:tracker') }}
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Validate tracker readiness
+        id: readiness
+        if: ${{ contains(join(github.event.issue.labels.*.name, ','), 'release:tracker') }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPOSITORY: ${{ github.repository }}
+        run: |
+          bash scripts/check/release-readiness.sh \
+            --issue "${{ github.event.issue.number }}" \
+            --require-closed
+
+      - name: Mark release as approved
+        id: flag
+        if: ${{ contains(join(github.event.issue.labels.*.name, ','), 'release:tracker') }}
+        run: echo "should_release=true" >> "${GITHUB_OUTPUT}"
+
+  release:
+    needs: plan
+    if: ${{ needs.plan.outputs.should_release == 'true' }}
+    uses: ./.github/workflows/release.yml
+    permissions:
+      contents: write
+    with:
+      ref: ${{ needs.plan.outputs.ref }}
+      track: ${{ needs.plan.outputs.track }}
+      version: ${{ needs.plan.outputs.version }}
+      bump: auto
+      draft: false
+    secrets: inherit

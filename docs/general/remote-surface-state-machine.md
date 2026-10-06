@@ -1,0 +1,2119 @@
+# Remote Surface 核心状态机
+
+> Type: `general`
+> Updated: `2026-10-05`
+> Summary: 共享 Codex 默认跟随桌面实时模型与强度，并在订阅、每轮开始及后台模型变化时显示确认值。
+> 1. visible 但 contract mismatch 的 workspace/session 仍然可见，不会再被 `/list`、`/use`、workspace recency、target picker 直接吞掉；
+> 2. 这些 mismatch 候选不会再假装“可直接接管”；
+> 3. detached `/use`、headless exact-thread restore、workspace attach、startup resume、`/mode` backend switch、`/claudeprofile`、`/codexprofile`、`/opencodeprofile` 现在都会统一先判定 `attach visible compatible / reuse managed compatible / restart managed incompatible / fresh-start matching headless / reject`，而不是各自维护平行 continuation；
+> 4. headless restore 不再把 visible VS Code 或 visible external mismatch 误当成 exact-thread auto-restore 目标；手动 `attach workspace` 也不再 silent 接管 profile/backend-contract mismatch 的实例。
+> 5. Claude managed headless 的 exact-thread restore 现在额外要求“目标 session 的 cwd 仍属于该 instance 当前 workspace”才允许原地复用；跨 workspace 旧 session 会改走 restart/fresh-start，不再把当前 attached Claude instance 的 metadata 直接 silent retarget 到别的目录。
+> `codex <-> claude <-> opencode` 的 headless backend 互切现在统一锚定当前工作区目录：只要切换前已有当前 workspace，surface 就会保留这份 workspace claim，并优先 attach 目标 backend 下同 workspace 的兼容在线实例；若只剩 incompatible managed headless，则会 restart 成匹配合同；若没有兼容实例，则会 fresh-start matching managed headless，并保留原来的 unbound / new-thread-ready / exact-thread continuation 意图。进入 Claude workspace 时，surface 会按 `workspace+profile` 快照恢复飞书临时 `reasoning / access` override；`plan` 不写入也不恢复这套快照，而 `/status` 会把“最近观察到的当前会话权限/模式”和“下条飞书消息的实际 override”分开投影。2026-08-11 补充：OpenCode `/permission` 是 relaunch-backed runtime desired，合法私聊写 bot capability 的 `PromptOverride.AccessMode`，队列冻结该 desired access 但 dispatch 不发送 ACP per-turn override；空闲 workspace 立即按 `OpenCodeRuntimeAccessMode` 重启，不空闲时由 prompt dispatch preflight 进入 `PendingHeadless(Purpose=prompt_dispatch_restart)` 后自动继续原消息。OpenCode `/plan on|off` 已开放为 ACP session mode 动态切换，queue item 只在飞书显式 override 存在时冻结 `PlanMode`，dispatch 时由 translator 在 `session/prompt` 前发送 `session/set_config_option configId=mode`；`/plan clear` 清掉本地 override，后续 prompt 不再强制 mode，跟随 OpenCode 当前/默认状态。2026-08-12 #877 补充：OpenCode `/reasoning low|medium|high|xhigh|max|clear` 也是飞书显式 runtime override，存入 bot/surface `PromptOverride.ReasoningEffort`；queue item 冻结该 reasoning override，dispatch 时 translator 在 `session/prompt` 前按固定顺序执行 `mode` 后 `effort` 的 `session/set_config_option`。只有当前 OpenCode session/model 通过 ACP `configOptions id=effort` 声明支持时才允许修改；否则 `/reasoning` fail closed 并提示当前模型/配置不支持。2026-08-09 补充：OpenCode headless 使用同一条 mode/profile/restart 主链，`/mode opencode` 与 `/opencodeprofile` 都会冻结 `OpenCodeAdmissionRef` 并在 workspace 内走 `workspace_route_restart`；OpenCode observed config 不写回 workspace defaults，profile revision 不匹配时 fail closed。2026-08-01 补充：Codex headless admission 现在在 queue item、PendingHeadless 和 daemon start command 上冻结 `CodexAdmissionRef`；daemon runtime resolver 优先消费该精确 definition/preference revision，而不是启动时重读 current Profile。resolver 输出的 `CodexConnectionContract` 与 `CodexThreadPolicy` 会回填到 pending launch，并在实例连回后成为 active instance 与 route actual 的 observed contract；Codex instance compatibility 在 route actual 带 connection contract 时必须匹配 `ConnectionContractID`，同 Profile 的 Key/端点 generation 变化不会复用旧 child。当前进程内 pending/queue/active owner 也会进入 Codex Profile references projection，删除检查不只看 durable bot/surface resume owner。同日补充：Codex prompt dispatch、`thread/start`、`thread/resume`、compact resume 与 `process.child.restart` restore 现在统一携带 typed `CodexResumePolicy`；`apply_target_profile` 会显式传目标 `modelProvider`，只在 policy 为 explicit/preserved 时传 `model` 与 reasoning/review/context config，`codex_default` 不再从本地 UI template 或旧 thread metadata 猜值；profile instruction 作为 thread policy 进入 `developerInstructions`，不再通过 `model_catalog_json` 修改 `instructions_template`；`agents.default_subagent_model` 作为 first-class launch override 注入，只有 DeepSeek/MiMo 等 catalog-backed provider 才额外注入 provider-owned catalog，普通 GPT/OpenAI-like profile 不生成 generic managed catalog。`TurnStarted` 会把 requested/effective context window 写入 `CodexEffectiveThreadContract`，当上游 effective window 小于 requested window 时标记 `context_preference_clamped`。2026-05-02 的新变化是：Claude headless 的 `/reasoning` 也正式并入 headless launch contract，queue item / auto-continue / review apply 都会冻结各自目标 reasoning；真正 dispatch 前统一比较 `desired launch contract` 与 wrapper hello 上报的 observed runtime contract，若不一致则进入 `PendingHeadless(Purpose=prompt_dispatch_restart)`，由 daemon 显式 `kill + start headless`，实例重新 attach 后再自动继续原 dispatch。Claude `/permission` 与 `/plan` 仍保留动态 permission-mode 通道，不被并入 Claude reasoning restart-only 合同；其中显式 `/permission` override 还会额外写入 `workspace+profile` 快照，而 `plan` 不会。Codex/OpenCode Profile 切换也已并入同一条 surface 级 headless 重启主链，切换时会沿用与 Claude profile 相同的 request-gate / busy-gate / current-workspace continuation 规则；idle detached 更新 bot record 的 canonical Profile 并投影同 gateway surface，workspace 内则由发起 surface 直接重启或 fresh-start 当前工作区。其余能力仍保持此前基线：headless 的被动恢复入口（attach unbound、`selected_thread_lost`、`thread_claim_lost`）统一回到“锁定当前工作区”的 target picker，不再回退旧 scoped selection prompt；VS Code `/list` / `/use` / `/useall` 继续走结构化实例/线程卡，其中线程选择统一成当前实例内的 dropdown，并隐藏不可切换会话、改用 plain-text 提示说明。surface-level backend seam 也已正式落成真实状态：headless 下区分 `codex` / `claude` / `opencode` 三个 backend，workspace defaults、surface resume 与 detached catalog context 都按 backend 分区，`/mode` 的底层语义收口成 `codex|claude|opencode|vscode`，其中 `normal` 仍作为 `codex` 的兼容 alias。另一个新变化是把上游 runtime 问题自动继续从 `autowhip` 中拆成独立 `autocontinue` overlay：它由 orchestrator 本地 codex/gateway error-family policy 驱动，拥有自己的 queue lane、reply anchor、tail-only 状态卡与 backoff，不再和“正常结束后继续催活”混用；request gate 现在还补上了 `item/tool/call` 的最小 fail-closed 分支：relay / Feishu / headless 会展示只读 `tool_callback` 提示，并立即自动回写 unsupported 结构化结果，避免 tool 在中途 silent hang；同时 detached-branch 产品入口已经正式接上：普通文本里的 `[什么？]` / `[耸肩摊手]` 会分别触发 `fork_ephemeral` / `start_ephemeral`，统一复用 `keep_surface_selection`，且不会再让 detour turn 污染当前 surface 默认 thread；review mode 的 detached review session 也已接入同一条远端状态机：review thread 会带显式 `source=review` / parent-thread 元数据，surface 会在不改绑当前选中 thread 的前提下记录 `ReviewSession` runtime，并把后续审阅文本继续路由到 review thread；与此同时，普通 attach/list/use 候选现在会显式排除 `source=review` 会话，不再把 detached review thread 混进 merged thread list、current-instance dropdown 或 workspace recency。本轮还把 `process.child.restart` 收口成“两段式 restart 合同”：`ack` 只代表新 child 已接管，thread restore 结果改由独立 outcome event 回传，daemon 会对 `/bendtomywill` 与 standalone Codex upgrade 统一等待最终 outcome，因此 late restore 不会再把 patch / upgrade 误判成已失败或已完成。2026-05-06 的补充是：Claude wrapper 在“当前 child 已经 `--resume` 到某个旧 session”时，如果 surface 明确要求 `PromptExecutionMode=start_new + threadID=""`，会先把 child 重启成 fresh launch，再清掉旧的 expected-resume 影子状态，确保 `/new` 的首条消息不会重新落回被恢复的旧 Claude session。同一轮里，remote-surface 的 execution lifecycle 也已明确拆成两个 sibling seam：dispatch core 统一 owner `DispatchMode / ActiveQueueItemID / QueuedQueueItemIDs / pendingRemote / activeRemote`，recovery core 统一 owner `PendingHeadless / headless attach-fail-expire / disconnect-degraded-timeout teardown`；`prompt_dispatch_restart` 只保留显式 handshake，不再让 queue/recovery 在业务路径里平行散写同一批 carrier。注意：2026-04-29 新拍板的下一轮 Claude MVP 产品边界不再由本文定义，而改以 [Claude Backend Integration Plan](../inprogress/claude-backend-integration-plan.md) 第 `7.6` / `12.1` 节为准；本文仍只记录当前 live 实现。
+
+2026-08-13 #887 补充：detached review 不再把普通聊天框输入自动路由到 review thread。ready 结果卡显式提供 `继续追问审阅`、`退出审阅`、`按审阅意见继续修改`；只有第一个动作会开启一次性纯文字 capture，其他普通文字、图片、文件均被 Review overlay gate 拦截。
+
+权限命令的规范入口为 `/permission`；`/permissions`、`/access`、`/approval` 保留为兼容别名。内部 `access` command ID、菜单 key、卡片 owner 与权限生效语义保持不变。
+
+## 1. 文档定位
+
+2026-08-01 #766 补充：Codex Profile-aware resume 不再把 requested policy 当作 observed actual。普通 dispatch、compact 与 `process.child.restart` restore 在目标 thread 已有同 connection/provider 的 `CodexEffectiveThreadContract` 时使用 `preserve_thread_settings`，保留 observed model/reasoning，同时仍请求当前 Profile 的 context preference；否则使用 `apply_target_profile`。`CodexEffectiveThreadContract` 只记录 `thread/started` 或 `thread.settings.updated` 已证明的 provider/model/reasoning，以及 `turn/started` 的 requested/effective context window；缺少 provider evidence 或 observed provider 与 Resume Policy 冲突时，wrapper 在 `turn.started` 上附带 `codex_protocol_incomplete`，不把 requested provider/model/reasoning 伪装成 actual。2026-08-02 补充：Codex headless 的跨模型组自动新会话有两道状态机边界：`/codexprofile` 在生成 headless continuation 时先比较当前 thread/source runtime 组与目标 Profile 组，普通 dispatch 在冻结 queue item 时再比较旧 thread 已证明模型组与当前目标模型组；目前模型组只分 `gpt` 与 `non_gpt`。目标 Profile 组优先由 Profile 声明的模型推导，DeepSeek catalog-backed dynamic API Profile 不再因为走动态目录而被归到 GPT 组。双方都可判定且不同组时，不再复用旧 thread；profile/backend 切换进入 `workspace_route_restart + PrepareNewThread=true`，dispatch guard 同步把 surface 切到 `new_thread_ready`，并提示用户已自动新建会话。目标模型继续由 typed `CodexResumePolicy`、目标 Profile 或用户显式 override 持有，不在 wrapper/adapter 清理历史 item。
+
+这份文档描述的是**当前代码已经实现**的 remote surface 状态机，不是历史问题列表，也不是未来方案草稿。
+
+2026-08-08 #838 补充：`/detach` 与 `/workspace detach` 都是 detach-like route mutation，会清除当前私聊 surface 的全部 durable resume target（instance、thread、cwd、workspace、route、headless）。清理会在事件/UI/daemon dispatch 之前完成，并在 dispatch 后用同一清理意图再次同步，避免 dispatch 释放 app mutex 时被 recovery tick 插入；`E6 Abandoning` 期间 headless 与 VS Code auto-resume 都明确跳过，直到 surface 最终 detach。
+
+2026-08-08 #840 补充：Feishu 机器人进群事件 `im.chat.member.bot.added_v1` 现在是 room primary bootstrap 的独立入口。daemon 收到事件后先在 app 锁外复用 `feishufacts` scope 缓存确认 `im:chat:readonly`（兼容 `im:chat`），再通过 gateway `im.v1.chat.get` 读取 `chat_mode` 与 `bot_count`；只有 `chat_mode == group` 且 `bot_count == 1` 时才进入锁内尝试写 room primary。锁内写入是 compare-and-set：仅当 `PrimaryGatewayID` 仍为空时把当前 gateway 写入 room durable state 并刷新 primary snapshot；已有 primary 时 no-op，不替换，也不发成功提示。若 room state 持久化失败，daemon 会回滚刚写入的 runtime primary 并刷新 snapshot，不留下只在内存中生效的假 primary。`chat.get` 缺权限会进入现有 permission gap / call broker cooldown 路径，并给群内发送权限提示；事件是否已订阅仍由 setup/admin auto-config 基于已发布版本 `event_infos` 检查，runtime 不把“没有收到事件”推断成未订阅。
+
+2026-08-09 补充：用户可见 queue item 曾进入排队后，再由 dispatch core 推进到 `E2 Dispatching` 时，会追加 `TimelineTextQueuedMessageStarted`，并投递成回复原消息的短提示「开始执行这条排队消息。」；同一次 enqueue 立刻 dispatch 的输入不会发这条提示，AutoWhip / AutoContinue 等内部来源也不会发。
+
+2026-08-08 #837 / 2026-08-10 #855 / 2026-08-11 补充：Feishu 群聊 workspace 以 room 为 SSOT。`RoomNoWorkspace` 下，当前 room primary bot 收到普通文本时会保存 pending text 并打开 target picker，用户选定 workspace/session 后复用 picker confirm 的既有 replay 链路继续执行原文本；非当前 primary 的普通文本，以及图片、文件和 backend-bound action 仍统一返回 `room_workspace_required`，不保存 pending text、不打开 target picker、不 stage 输入；`/menu`、`/help`、`/status`、`/primary`、`/workspace`、workspace picker 等 control-plane 仍可用。`RoomHasWorkspace` 下未 attach 的同 room bot 收到文本/图片/文件时，继承 room workspace 并 attach 或启动自己的 headless context，不继承 sibling selected thread。群聊 `/workspace detach` 改为 room-level clear：只有当前 primary bot 可执行，成功后清 room workspace、reset 同 room 全部 surface runtime，并在 daemon 持久层清同 room 全部 surface resume target；裸 `/detach` 仍是 surface 级兼容 detach，不清 room workspace。若当前 surface 没有 attached runtime / pending headless、但 room 仍绑定 workspace，`/status` 把该目录标为“群绑定目录”，裸 `/detach` 返回剩余 room binding 与 `/workspace detach` 提示，而不是继续说“没有已接管的工作区”。
+
+2026-08-11 #873 补充：Codex 的配置入口已从 provider-first 收口为 Profile-only。`/codexprofile` 是唯一用户入口，旧 `/codexprovider` 文本命令和 `codex_provider` 菜单 action 均拒绝解析；gateway/bot record 的 canonical owner 是 `CodexProfileID`，旧 `CodexProviderID/codexProviderID` 只允许作为存量状态文件的加载迁移输入，规范化后立即清空且不再写回。bare Profile 卡使用可分页 `select_static`，只暴露可用 native/API/OAuth Profile 为可选项；缺 secret、OAuth 不可用或探测未知的 Profile 保留在只读状态说明里，不能被 callback 选中。legacy Provider catalog 不再反向合成 Profile catalog；Profile 选择只能消费 daemon materialized canonical Profile read model。
+
+它承担两个职责：
+
+1. 作为当前 remote surface 行为的长期 source of truth。
+2. 作为后续状态机相关改动在提交前必须回看的 guardrail。
+
+审计基线覆盖：
+
+1. [internal/core/orchestrator/service.go](../../internal/core/orchestrator/service.go)
+2. [internal/core/orchestrator/service_surface.go](../../internal/core/orchestrator/service_surface.go)
+3. [internal/core/orchestrator/service_thread_global.go](../../internal/core/orchestrator/service_thread_global.go)
+4. [internal/core/orchestrator/service_snapshot.go](../../internal/core/orchestrator/service_snapshot.go)
+5. [internal/core/orchestrator/service_surface_backend.go](../../internal/core/orchestrator/service_surface_backend.go)
+5. [internal/core/orchestrator/service_test.go](../../internal/core/orchestrator/service_test.go)
+6. [internal/core/state/types.go](../../internal/core/state/types.go)
+7. [internal/core/state/surface_backend.go](../../internal/core/state/surface_backend.go)
+8. [internal/core/state/workspace_defaults.go](../../internal/core/state/workspace_defaults.go)
+7. [internal/core/control/types.go](../../internal/core/control/types.go)
+8. [internal/core/control/feishu_commands.go](../../internal/core/control/feishu_commands.go)
+9. [internal/core/orchestrator/service_autocontinue.go](../../internal/core/orchestrator/service_autocontinue.go)
+10. [internal/core/orchestrator/service_claude_headless_preflight.go](../../internal/core/orchestrator/service_claude_headless_preflight.go)
+11. [internal/core/orchestrator/service_headless_contract_switch.go](../../internal/core/orchestrator/service_headless_contract_switch.go)
+12. [internal/core/orchestrator/service_queue.go](../../internal/core/orchestrator/service_queue.go)
+13. [internal/core/orchestrator/service_review_actions.go](../../internal/core/orchestrator/service_review_actions.go)
+14. [internal/core/orchestrator/service_surface_attach.go](../../internal/core/orchestrator/service_surface_attach.go)
+15. [internal/core/orchestrator/service_overlay_runtime.go](../../internal/core/orchestrator/service_overlay_runtime.go)
+16. [internal/core/orchestrator/service_recovery.go](../../internal/core/orchestrator/service_recovery.go)
+16. [internal/codexstate/sqlite_threads.go](../../internal/codexstate/sqlite_threads.go)
+17. [internal/adapter/feishu/gateway/routing.go](../../internal/adapter/feishu/gateway/routing.go)
+18. [internal/adapter/feishu/gateway.go](../../internal/adapter/feishu/gateway.go)
+19. [internal/adapter/feishu/gateway_runtime.go](../../internal/adapter/feishu/gateway_runtime.go)
+20. [internal/adapter/feishu/projector.go](../../internal/adapter/feishu/projector.go)
+21. [internal/core/orchestrator/service_command_menu.go](../../internal/core/orchestrator/service_command_menu.go)
+22. [internal/app/daemon/app_headless.go](../../internal/app/daemon/app_headless.go)
+23. [internal/app/daemon/app_ingress.go](../../internal/app/daemon/app_ingress.go)
+24. [internal/app/daemon/app_surface_resume_state.go](../../internal/app/daemon/app_surface_resume_state.go)
+25. [internal/app/daemon/surface_resume_state.go](../../internal/app/daemon/surface_resume_state.go)
+26. [internal/app/daemon/app_test.go](../../internal/app/daemon/app_test.go)
+27. [internal/app/daemon/surface_resume_state_test.go](../../internal/app/daemon/surface_resume_state_test.go)
+28. [internal/app/daemon/admin_vscode.go](../../internal/app/daemon/admin_vscode.go)
+29. [internal/app/daemon/app_vscode_migration.go](../../internal/app/daemon/app_vscode_migration.go)
+30. [internal/app/daemon/app_vscode_migration_test.go](../../internal/app/daemon/app_vscode_migration_test.go)
+31. [internal/app/wrapper/app.go](../../internal/app/wrapper/app.go)
+32. [internal/core/orchestrator/service_path_picker.go](../../internal/core/orchestrator/service_path_picker.go)
+33. [internal/core/orchestrator/service_target_picker.go](../../internal/core/orchestrator/service_target_picker.go)
+34. [internal/core/orchestrator/service_ui_runtime.go](../../internal/core/orchestrator/service_ui_runtime.go)
+35. [internal/core/control/feishu_target_picker.go](../../internal/core/control/feishu_target_picker.go)
+36. [internal/core/orchestrator/service_target_picker_git_import.go](../../internal/core/orchestrator/service_target_picker_git_import.go)
+37. [internal/app/daemon/app_git_workspace_import.go](../../internal/app/daemon/app_git_workspace_import.go)
+38. [internal/app/gitworkspace/import.go](../../internal/app/gitworkspace/import.go)
+39. [internal/app/daemon/app_turn_patch.go](../../internal/app/daemon/app_turn_patch.go)
+40. [internal/app/daemon/app_turn_patch_tx.go](../../internal/app/daemon/app_turn_patch_tx.go)
+41. [internal/app/daemon/app_turn_patch_view.go](../../internal/app/daemon/app_turn_patch_view.go)
+36. [internal/app/daemon/turnpatchruntime/model.go](../../internal/app/daemon/turnpatchruntime/model.go)
+37. [internal/codexstate/turn_patch_storage.go](../../internal/codexstate/turn_patch_storage.go)
+38. [internal/codexstate/turn_patch_ledger.go](../../internal/codexstate/turn_patch_ledger.go)
+39. [internal/app/daemon/app_codex_upgrade.go](../../internal/app/daemon/app_codex_upgrade.go)
+40. [internal/app/daemon/app_child_restart_wait.go](../../internal/app/daemon/app_child_restart_wait.go)
+41. [internal/app/wrapper/app_child_session.go](../../internal/app/wrapper/app_child_session.go)
+42. [internal/app/wrapper/app_io.go](../../internal/app/wrapper/app_io.go)
+43. [internal/adapter/codex/translator_observe_server.go](../../internal/adapter/codex/translator_observe_server.go)
+
+## 2. 审计前提
+
+### 2.1 `threadID` 当前就是 relay 全局仲裁键
+
+当前 thread claim 是 `map[string]*threadClaimRecord`，key 只有 `threadID`。
+
+这依赖下面这个前提，而且现在就是产品前提：
+
+1. 同一台机器上，`threadID` 在单个 `relayd` 仲裁域内全局唯一。
+2. 同一台机器上只运行一个 `relayd`。
+
+这个假设必须保留在文档里，避免以后误改成“按 instance 局部唯一”。
+
+### 2.2 surface 按 gateway/chat 区分，但 claim 是 relay 全局的
+
+surface 本身仍按 `gatewayID + chat/user` 区分，不同飞书 app 会形成不同 surface。
+
+surface identity 只接受精确四段格式 `feishu:<gatewayID>:<user|chat>:<scopeID>`。`internal/feishuidentity` 是 build / parse / validate 的 SSOT；gateway、preview、daemon、state 与 orchestrator 必须直接复用该 contract，未知 scope、空字段或额外分段不得通过字符串扫描被识别成有效群聊或私聊 surface。普通消息也只保留 `PlanInboundMessageEvent -> QueuedMessageWork.parseAction` 一条 planning/parsing 主链，测试通过真实 handler 路径同步 capture action，不维护另一份 parser。
+
+但 `instanceClaims` 和 `threadClaims` 都在同一个 orchestrator 里仲裁，所以：
+
+1. 不同飞书 app 之间会竞争同一套 instance/thread 资源。
+2. instance attach 互斥、thread attach 互斥都是**跨 app 的全局规则**。
+
+Feishu 群聊消息在进入 surface 状态机前还有一层 gateway 入站前置 gate：
+
+1. 私聊消息不要求 mention，继续按 `feishu:<gatewayID>:user:<preferredActorId>` 进入 surface。
+2. 群聊消息若 `mentions` 命中当前 gateway 缓存的 bot `open_id`，允许 materialize / reuse `feishu:<gatewayID>:chat:<chatID>` surface。
+3. 群聊消息若 `mentions` 存在但未命中当前 bot，fail closed 忽略，不记录 `messageID -> surfaceID`，不进入 queue / dispatch。
+4. 群聊无 mention 的用户消息只在 daemon 当前 primary snapshot 记录 `chatID -> current gateway`，且 daemon 短 TTL 权限缓存确认该 gateway 具备当前权限 `im:message.group_msg` 或历史兼容权限 `im:message.group_msg:readonly` 时放行；否则在 record / parse / image-file download / queue 前忽略。该 snapshot 由 room durable state 复制生成，gateway callback 热路径不读取 orchestrator mutable root。
+5. 群聊无 mention 且 sender 是 bot 的消息默认忽略，避免 bot 之间互相触发。
+6. 当前 bot `open_id` 在 gateway 启动时通过 bot info API 获取并缓存；主机器人权限热路径只读 daemon 缓存，不逐条调用飞书 API。
+
+Feishu 群聊 surface 之上现在还有一层 room context coordination record，并已参与 headless workspace claim 仲裁：
+
+1. 群聊 surface materialize/resume 时会按 `chatID` 维护 `FeishuRoomContexts[feishu:chat:<chatID>]`。
+2. record 当前保存 room id、`chatID`、参与过的 gateway id evidence、surface session id evidence、`WorkspaceKey`、workspace 绑定操作者/更新时间与 `WorkspaceResetGeneration`。
+3. 私聊 surface 不创建 room context。
+4. 同一 `chatID` 下不同 gateway 的群 surface 在 V1 会进入同一个 room context；这是当前本机实测策略，不是 Feishu 官方跨 app 稳定性承诺。
+5. `workspaceClaims` 的 owner 已从单 `SurfaceSessionID` 扩展为 `surface` / `room`：私聊或非 room surface 继续以 surface 为 owner；群聊 surface 以 `feishu:chat:<chatID>` room 为 owner。
+6. 同一 room 下的多个群 surface 可以共享同一个 workspace claim；不同 room 或私聊 surface 对同一 workspace 仍会被判定 busy。
+7. room binding 是没有自身 workspace route 的 same-room surface 的最后一级 current-workspace fallback；因此第二个 bot 首次打开 `/use` / target picker 时会默认选中 room workspace，而不是回到全局列表第一项。若 room 尚未绑定 workspace，当前 room primary bot 的普通文本可以保存 pending text 并打开 target picker，确认后再 replay 原文本；非当前 primary 的普通文本，以及图片、文件和其它 backend-bound data-plane 输入仍直接返回 `room_workspace_required`，不打开 target picker、不 stage 图片/文件；用户也可以显式通过 `/workspace` 或 workspace picker 建立 room workspace。
+8. room 已绑定时，路由到某个 bot 的文本、图片、文件都会先消费该 room workspace，并通过 workspace continuation 接管或启动当前 bot 自己的 headless context。若该 workspace 只有同 room sibling 已 claim 的实例，continuation 会走 fresh headless，而不是抢 sibling instance；后续文本按新会话首条消息派发，图片/文件进入当前 bot 的 staged input，不继承其它 bot 的 selected thread。
+9. room binding 的写入点收口在真正改变 workspace claim 的入口：workspace attach、attach instance、跨 workspace thread attach、fresh workspace prepare 成功建立 `PendingHeadless` 后立即同步 room binding；target picker 只负责选择，confirm 后复用这些底层入口。fresh pending 后续启动失败不会自动清空 room binding，因为群 workspace 选择已经成立，用户可以继续在该 workspace 上重试或由同 room 其它 bot 启动自己的 context。
+10. room 已绑定且目标 workspace 不同时，切换前先确认当前 surface 可以安全离开，再检查同 room 是否存在 active/pending request、pending headless、active review、dispatching/running queue 或 instance active turn；命中 blocker 时拒绝，不 reset sibling surface，也不进入 primary gate。
+11. destructive room workspace change 必须通过 room primary gate：当前 surface 的 gateway 必须与 `FeishuRoomContextRecord.PrimaryGatewayID` 精确匹配；无 primary 或其他 bot 都 fail closed，提示先对目标 bot 执行 `/primary on`。该 workspace change gate 不调用 Feishu chat info API；只有机器人进群自动 bootstrap 会在锁外调用 `chat.get` 判断 `bot_count`。
+12. primary bot 切换成功会 reset 同 room 其它 surface 的 context-bound runtime：attachment、selected thread、workspace claim、queue、staged image/file、pending request/capture、exec/reasoning progress、review session、plan proposal、target picker；触发切换的当前 surface 后续按目标 workspace 正常 attach/launch。
+13. primary bot 执行群聊 `/workspace detach` 成功时会清空 `FeishuRoomContextRecord.WorkspaceKey`、递增 `WorkspaceResetGeneration`、reset 同 room 全部 surface（包括当前 surface），并清掉 room active reservations。daemon 会在同一持久化 episode 里清同 room 全部 surface resume target，防止 room clear 后被 surface resume fallback 或重启恢复旧 workspace。非 primary 的群聊 `/workspace detach` 拒绝且不改变 room 或 sibling surface；裸 `/detach` 仍只释放当前 surface。若当前 surface 已 detached、但 room 仍绑定 workspace，裸 `/detach` 只提示该 room binding 仍存在并指向 `/workspace detach`，不清 room。
+14. instance claim 与 thread claim 仍是 surface 级全局独占，同 room 不共享实例或会话。
+15. room context 的 `ActiveReservations` 是同 room 执行预算的 runtime SSOT，而不是单一 holder lock：每个新的独立 agent turn 在 staged input 绑定、route mutation、thread message 记录和 queue item 创建前先占一个 reservation；queue item / remote turn 会用实际 queue/turn evidence 刷新，review start、Claude prompt restart 和 headless group replay 在各自 pending 生命周期内保留独立 reservation。`ConcurrencyLimit` 缺失时按 1，显式 0 表示 unlimited，正数限制同 room 内所有实际 agent dispatch；compact、refresh、model list 等 context-only/control action 不占 slot。
+16. 当 room reservation 命中上限时，普通文本、headless replay、AutoContinue、AutoWhip、review apply 等新的独立 turn 都直接返回 `room_workspace_active`，不创建新的 queue item；已经 dispatching/running 的任务不因降低上限而中断，已有 per-surface queue 也不转换成 room 级队列。AutoContinue / AutoWhip 这类 tick 驱动入口会对该 notice 做短冷却，避免同一 active holder 持续刷屏。reservation reconcile 会保留仍有真实 queue/turn、pending review/headless 或未知 surface evidence 的记录，并清掉已被清理的 review reservation；room workspace reset 也会清掉 room reservations。
+17. 合法四段式 Feishu 私聊和群聊 surface 的 effective capability settings 都读取 gateway/bot 级 `BotCapabilitySettings`。`/mode`、provider/profile、model/reasoning/access/plan 只允许私聊修改；每个命令从最新 gateway record 开始，只更新自己拥有的字段，再把结果投影到同 gateway 已 materialize 的 surface，且只有合法私聊配置事务可以在 record 缺失时首建。plan confirmation 与 Claude workspace snapshot 等运行生命周期转换只能字段级更新已有 record；record 缺失时保留当前 surface 的 route-derived 执行状态，不能从群聊或生命周期路径反向整记录初始化 SSOT。旧私聊 surface 和 surface resume entry 同样不能整记录回写。record 同时保存 Codex profile、Claude profile 与 OpenCode profile 的非活动选择，active backend contract 只暴露当前一侧；非法 identity、gateway 不匹配或非 Feishu surface 保持本地设置语义。群聊 dispatch、headless launch contract 与 catalog context 使用 bot record 作为能力默认；群聊菜单隐藏这些入口，手输或卡片回调尝试修改时返回 `bot_capability_private_required` 或同卡错误提示。群 surface 自身仍保存 workspace/session/queue/staged input/AutoWhip/AutoContinue 等 context runtime。
+   - detached 合法私聊不再把 workspace/instance attachment 当作 bot setting 的持久化前提：Codex `/model`、`/reasoning`、`/permission`，Claude `/reasoning`、`/permission`，以及 OpenCode `/permission` 都可直接查看、修改和清除 bot desired；Codex 无 instance catalog 时降级为手动模型/推理输入并提示无法本地校验。Claude/OpenCode `/model` 继续由各自 Profile/原生配置持有并 hidden + reject；OpenCode `/reasoning` 继续要求当前 ACP session/model 已声明 `effort`，detached 时 fail closed。VS Code 与非 Feishu surface 保留原 attachment 规则。
+   - Codex 选择的 canonical 字段是 `CodexProfileID`。可见 writer 只有 `/codexprofile`；旧 `/codexprovider` 和 `codex_provider` 不再进入 mutation。`CodexProviderID/codexProviderID` 只在加载旧持久化状态时单向迁移到 Profile ID，不能形成两个可漂移 owner。
+   - OpenCode 选择的 canonical 字段是 `OpenCodeProfileID`。可见 writer 是 `/opencodeprofile`；切换成功会冻结匹配的 `OpenCodeAdmissionRef`，自定义/API profile 缺失或 stale revision 时启动 fail closed，默认 `op_default` inherit profile 可无 admission ref 启动。OpenCode 运行时权限的 canonical 用户入口是 `/permission`，只写 `PromptOverride.AccessMode` 中的 `full_access` / `confirm` desired state，不读取 profile `permissionMode` 作为 SSOT。OpenCode 运行时推理强度的 canonical 用户入口是 `/reasoning`，只写 `PromptOverride.ReasoningEffort` 中的 `low/medium/high/xhigh/max` desired ACP effort；`clear` 删除该 override 并让后续 prompt 跟随 OpenCode 当前/默认状态。
+   1. bot 级 Codex / Claude / OpenCode Profile 契约变化（私聊 `/codexprofile` / `/claudeprofile` / `/opencodeprofile` 成功切换）后，同 gateway 已 materialize 的 headless surface 做实例收敛：
+      - surface 期望值按投影更新不变；收敛只针对已 attach 的 headless 实例：`surfaceInstanceCompatibility` 判定不兼容且 surface 空闲时，复用 headless contract switch 流程杀旧实例并按新 profile 重启；
+      - 正在执行 turn / 有排队消息 / pending headless / delayed detach 的 surface 不硬杀，置 `ContractRefreshPending`；下一次交互入口（文本消息）在实例空闲时自动收敛，并把本条消息存入 pending text input，等新实例连接后重放，不丢消息；
+      - Codex 兼容性判定以期望 `CodexProfileID` 为权威：Profile 不一致即不兼容；Profile 一致后再用 surface 派生的 admission/connection contract 比较 revision 精度。profile 投影会清空 surface 的 Codex 派生缓存（admission ref / connection contract / thread policy）；daemon 启动时若 admission ref 与期望 Profile 不一致，以期望 Profile 为准重新解析当前 revision；
+      - OpenCode 兼容性判定以 `OpenCodeProfileID`、frozen `OpenCodeAdmissionRef` 与 `OpenCodeRuntimeAccessMode` 为权威；profile ID 或 revision 变化时不恢复旧 session，而是保留 workspace 并走 `workspace_route_restart + PrepareNewThread=true`，连回后进入 `R5 NewThreadReady`，下一条消息在新 Profile overlay 下创建 session；仅 runtime access desired 变化的 relaunch 仍可恢复原 session。忙碌 sibling surface 延迟到下一条文本收敛时也会比较当前实例与目标 Profile/revision，保持相同的新 session 规则；
+      - detached surface 只更新期望值，下次 attach 自然按新契约收敛。
+18. bot capability lookup 明确区分 not-applicable / absent / valid / invalid：只有 absent 会按既定 lifecycle 语义暂用当前 surface 的 route-derived 状态；若 map 中已有 record 但无法规范化，或 storage key 与 record gateway 不一致，则进入 `BotCapabilitySettingsInvalid` gate，effective read 不回退 raw surface，配置、route lifecycle、queue 与 AutoContinue dispatch 都 fail closed。正常 store materialize 与字段级 transaction 不会产生该状态；异常时仍允许 `/stop`、`/detach` 与 `/workspace detach` 释放资源，修复持久化状态并重启后可恢复。
+19. room context 还持有群级 `PrimaryGatewayID`，作为“无 @ 普通消息由哪个 bot 承接”的 durable SSOT。daemon 的 `FeishuRoomStateRecord` 通过历史文件路径 `feishu-room-primary.json` 的 schema v2 统一持久化 room/chat、workspace/update/reset 与 primary/update durable 字段；文件名仅为原位兼容保留，不再代表 primary-only 数据模型。gateway 入站热路径只读取 daemon 维护的 copy-on-write primary snapshot，snapshot 在 room state materialize、primary sync 与 AppID identity cleanup 后刷新；`ActiveReservations`、gateway evidence、surface evidence 仍只属于运行时状态，只有 room concurrency limit 持久化。
+20. 启动顺序先装载 durable room state，再装载 surface resume。旧 schema v1 只含 primary 时会原位升级；某个 room 尚无 durable workspace 且所有 surface resume 候选一致时，只在启动事务内补录一次并立即写入 room state。room 一旦有 durable workspace，surface resume 不再反向覆盖它；room workspace 被清空后，同 room surface resume target 也会被同步清空，不再从旧 surface target backfill。
+21. room workspace 与 surface resume 候选比较使用 `state.ResolveWorkspaceClaimKey(...)` / `state.ResolveHeadlessResumeWorkspaceKey(...)` 的 claim-key 语义，而不是纯字符串 normalize；同一宿主目录的 symlink、macOS `/var` vs `/private/var`、Windows 短/长路径不应制造多个候选。
+22. 同 room 的 surface resume 候选彼此不一致，或与 durable room workspace 不一致时，daemon 记录排序后的冲突诊断并在统一 ingress 入口阻断普通文本、`/list`、`/use` 与菜单回调，返回 `room_workspace_recovery_conflict`；不得按最新时间或当前 bot 静默任选 workspace。修复持久化状态并重启后退出该 fail-closed 状态。
+23. surface resume 在当前 surface 暂时无法生成 target 时，只能回退上一份与当前 effective workspace 一致的 target。primary bot 把 room workspace 从 A 切到 B 或清空 room workspace 后，sibling surface 的 effective workspace 已由 room SSOT 变成 B 或空；daemon 必须在同一持久化事务中丢弃 sibling 的旧 A target，再写入 room 新状态，避免一次合法切换或清空在下次启动时制造伪恢复冲突。当前 surface 仍有明确 target 时不走这条 fallback，真实不一致仍由启动 conflict gate fail closed。
+24. `GatewayID` 只表示可复用配置槽位，committed AppID/generation 才表示当前 bot identity。AppID 替换或配置删除时，controller 会先关闭旧 gateway generation 的 action gate、取消事件源并等待已经进入的 action 排空；随后 daemon 在 identity store 写入 pending transition，并以可重放 identity transition 清掉该 gateway 的 surface、surface resume、bot capability、匹配的 room primary、claim/UI/turn/progress/access、turn patch flow/transaction 等 bot-owned runtime。room workspace 继续保留；新 App 不会继承旧 surface、旧会话、旧 primary 或旧 `/bendtomywill` owner card。durable 清理或 identity commit 任一步失败时，新 runtime 不启动，后续 apply 继续重放同一 transition；即使配置改回旧 AppID 或同槽位重建同 AppID，也会先完成旧 generation 清理并提交新 generation。仅 AppSecret 变化不会触发该清理。
+
+### 2.3 飞书私聊 surface identity 当前依赖 preferred actor id
+
+飞书 P2P surface 当前不是“任意 user id 字符串都可互换”，而是 gateway-aware 的：
+
+1. surface id 形如 `feishu:<gatewayID>:user:<preferredActorId>`。
+2. `preferredActorId` 当前优先级固定为：
+   1. `open_id`
+   2. `user_id`
+   3. `union_id`
+3. 文本消息、bot menu、reaction actor、卡片 callback operator 都必须遵守同一优先级。
+4. 卡片 callback 还必须先尝试通过 `open_message_id -> 已记录的 surfaceSessionId` 回到原 surface；消息查不到时，只接受卡片 payload 中可信的 `surface_session_id` carrier。该 carrier 必须匹配当前 gateway，且 `user` scope 要匹配 callback operator preferred actor id、`chat` scope 要匹配 callback context open_chat_id；仍无法证明时直接 fail closed，不再回退到 operator/chat 推导新 surface。
+
+这个规则是当前状态机正确性的前置条件之一。否则同一个飞书私聊用户可能被裂成两个 surface：
+
+1. 一个 surface 已 attach workspace / thread。
+2. 另一个 surface 仍是 detached。
+3. 用户随后发送 `/detach`、`/use`、普通文本或继续点卡片时，会命中不同 surface，表现成“界面看起来已接管，但命令又说当前没有接管中的工作区”。
+
+## 3. 当前状态机的五层结构与运行时 overlay
+
+surface 不是单一枚举，而是五层正交状态叠加。
+
+### 3.1 产品模式 / backend overlay
+
+| 代号 | 条件 | 用户语义 |
+| --- | --- | --- |
+| `M0 HeadlessCodex` | `ProductMode=normal`，`Backend=codex` | headless 主链的 Codex 分支；也是新 surface 默认值。当前会开启 workspace claim 仲裁，并把已占用 workspace 投影到 `/status` |
+| `M1 HeadlessClaude` | `ProductMode=normal`，`Backend=claude` | headless 主链的 Claude 分支。workspace defaults、surface resume 与 detached catalog context 都按 Claude backend 分区；surface 还会额外携带当前 `ClaudeProfileID`，并按 `workspace+profile` 恢复飞书显式 `reasoning / access` override；`plan` 不从这套快照恢复；不进入 VS Code 语义，但已经共享 headless exact-thread 恢复主链，并在需要时通过 Claude 原生 `--resume` 恢复旧 session |
+| `M2 HeadlessOpenCode` | `ProductMode=normal`，`Backend=opencode` | headless 主链的 OpenCode 分支。workspace defaults、surface resume 与 detached catalog context 按 OpenCode backend 分区；detached catalog context 会读取 OpenCode 本地 SQLite persisted session/project metadata，而不是启动 OpenCode instance 后调用 ACP `session/list`；surface 携带当前 `OpenCodeProfileID`、可选 `OpenCodeAdmissionRef`、`/permission` desired runtime access 与 `/reasoning` desired ACP effort override；API profile 启动必须匹配 frozen revision，声明 reasoning 的 API profile 会给模型暴露固定 `low/medium/high/xhigh/max` variants；不进入 VS Code 语义，复用 headless workspace/session route contract |
+| `M3 VSCode` | `ProductMode=vscode`，`Backend=codex` | VS Code 专属分支；只能显式 `/mode vscode` 进入。当前不参与 workspace claim，仍保留既有 instance/thread-first 路由语义 |
+
+补充说明：
+
+1. 对合法 Feishu surface，`ProductMode` / `Backend` / provider/profile / prompt override / plan override 的业务事实属于 gateway 级 `BotCapabilitySettings`；surface 上的同名字段只是当前 action、restart、dispatch 和快照转换需要的执行投影。非 Feishu 或非 canonical identity surface 仍以本地字段为 owner；`/detach` 不清掉当前能力投影。
+2. daemon 级 `surface resume state` 负责恢复 surface 路由和执行上下文，不是 Feishu bot capability 的第二写源：
+   1. 进程内已有 Feishu surface 会在 bot record 更新、bot store materialize、surface resume materialize 和下一次 ingress 时刷新能力投影。
+   2. daemon 重启后，startup 可以先从 `surface resume state` materialize latent surface，但 bot capability store materialize 后会以 gateway record 覆盖其能力投影。
+   3. `surface resume state` 当前仍携带 `ProductMode` / `Backend` / `ClaudeProfileID` / `OpenCodeProfileID` / `OpenCodeAdmissionRef` 作为 latent route materialize 的执行 hint，并记录 `Verbosity` / instance / thread / workspace / route 及 headless thread restore 所需的 thread title / thread cwd / `ResumeHeadless` 标记；它不是 Feishu bot capability 的持久化 owner，也不再持久化或恢复 `PlanMode`。合法 Feishu surface 在 bot store materialize 后必须由 gateway record 覆盖前三项能力投影。其中 `ResumeWorkspaceKey` 表示稳定 workspace root，`ResumeThreadCWD` 表示最近活跃 cwd；两者在 load/write 时都使用 claim-key canonicalization，避免同一宿主目录因路径别名被当成不同 workspace。当 headless entry 的 workspace 不是 CWD 的祖先时，前者属于过期 surface context，load/save canonicalization 会改正为 CWD，避免跨仓库恢复。这里的 `ResumeHeadless` 现在只代表“恢复一个 concrete headless thread”，不再复用来表示 `fresh workspace prepare`。旧 entry 缺失 `Backend` 时会 lazy 默认成 `codex`；若 backend 是 `claude` 且 entry 缺失 profile，则会 lazy 默认成内置 `default`；若 backend 是 `opencode` 且 entry 缺失 profile，则会 lazy 默认成 `op_default`；若旧 entry 带着非空 `ClaudeProfileID` 或 `OpenCodeProfileID`，load/save canonicalization 会反向把 headless backend 纠正回对应 backend，避免 exact-thread 恢复目标误投到其它路由；若旧 entry 误把 `pending fresh workspace` 写成 `ResumeHeadless=true + ResumeRouteMode=pinned + ResumeThreadID=\"\"`，load 时会自动迁回 workspace-owned `new_thread_ready` 语义。
+   - Codex route desired 只保存 canonical `CodexProfileID`；带 concrete resume thread 的迁移记录还保存 definition + preference 两类 Revision 组成的 `CodexAdmissionRef`。通用 surface projector 只有在 thread 与 Profile 都未变化时才保留这份精确 ref，不能用浮动 desired 重建后把它清掉。
+   - Feishu P2P identity canonicalization 若合并到同一 gateway/chat 的旧 entry 带有不同 Codex 选择，合并 entry 持久化 `CodexProfileSelectionStatus=profile_selection_conflict`。Profile migration 同步写入结构化诊断且不生成 admission ref；该 surface 的 Codex launch fail closed。用户在私聊显式重选后，更新后的 canonical bot record 会清除冲突状态；即使重选 ID 与当前显示值相同，这次显式动作仍写入新的 selection evidence，但保持 runtime no-op，不触发无意义 restart。
+   4. 对合法 Feishu surface，resume entry 里的能力字段只作为 materialize 顺序中的执行 hint；gateway 级 bot capability record 载入后必须覆盖这些投影，且 resume entry 不能反向写回 record。
+   5. headless surface（当前 persisted token 仍是 `ProductMode=normal`）随后会按 persisted resume target 继续尝试恢复：
+      1. 优先 exact visible thread 恢复。
+      2. 只允许消费同 backend 的 visible instance / workspace；不会再把 `codex` 的 headless resume target 恢复到 `claude`，反之亦然。managed headless 的复用候选也会先按 backend 过滤，attach / resume 路径若发现 thread view 与目标实例 backend 不一致，会直接拒绝这次恢复绑定，而不是把错配状态继续写回 surface resume。
+      3. visible 与 compatibility 当前明确拆层：visible mismatch 目标仍然保留在 `/list`、`/use`、workspace recency、target picker 的候选里，但 exact-thread restore、workspace resume、backend switch、profile/provider switch 不会再把它们当成“可直接接管”的目标。解析核会统一先判定 `attach compatible visible -> reuse compatible managed headless -> restart incompatible managed headless -> fresh-start matching headless -> reject`。其中 Claude managed headless 只有在目标 session `cwd` 仍属于该 instance 当前 workspace 时才允许走 `reuse managed`；若目标 session 已经跨到别的 workspace，则必须 restart/fresh-start，不能继续 silent retarget 当前 attached Claude instance。
+      4. exact thread 当前不可见但仍存在同 backend 的 persisted thread/session metadata 时，headless resume、detached `/use` 与 managed headless exact-thread continuation 仍会继续消费这份 metadata，不再退回 Codex-only lookup。
+      5. 若 persisted route 本身就是 workspace-owned 的 `ResumeRouteMode=unbound|new_thread_ready`，则会优先按同 backend workspace 继续恢复：已有同 workspace 兼容实例时直接回到 `R1 AttachedUnbound` 或 `R5 NewThreadReady`；若只剩 incompatible managed headless，则先 restart 成匹配合同；若还没有兼容实例，则会 fresh-start managed headless，并保留同一条 workspace route intent。
+      6. 若 persisted target 是普通 pinned thread 且当前 visible thread 不可见，则允许降级回原 workspace 的 same-backend 续接语义：已有同 workspace 兼容实例时 attach 回 `R1 AttachedUnbound`；若只剩 incompatible managed headless，则 restart 成 matching headless；若还没有兼容实例，则会 fresh-start managed headless，并进入 `new_thread_ready`。
+      7. 只有 `ResumeHeadless=true` 且 `ResumeThreadID != ""` 的 concrete managed-headless thread-restore 目标，visible exact-thread 路径没恢复成功时才会继续留在 exact-thread continuation，而不是降级进 workspace fallback。
+      8. 这条 managed-headless exact-thread continuation 当前仍按 backend 生效：Codex 继续走 sqlite/persisted-thread + child-restore 语义；Claude 会把同 backend persisted session metadata 转成 launch-time `ResumeThreadID`，最终由 wrapper 用 `claude --resume <session_id>` 恢复旧 session；OpenCode 会从 OpenCode 本地 SQLite catalog 取得同 backend persisted session metadata，再由 OpenCode ACP load/resume 路径恢复。
+      8. 若持久化目标里包含 `ResumeThreadID`，则在 daemon 启动后的首轮 `threads.refresh -> threads.snapshot` 完成前，会先保持 detached 并静默等待，避免过早降级或过早报失败。
+      9. 若同时带着 `ResumeHeadless=true` 且 `ResumeInstanceID` 指向一个已连回的 visible instance，managed-headless exact-thread continuation 也会让出这一轮 startup refresh，先给 exact visible thread 恢复机会，避免刚收到 snapshot 前就抢先拉起新的 headless。
+      10. 同一条 persisted target 的 auto-resume 当前已经具备 episode 级失败 provenance：
+         1. daemon 只对仍可能随运行态变化的失败记录最新 failure code 并按 backoff 重试；
+         2. `profile_definition_incomplete`、`profile_secret_missing`、`oauth_missing`、`oauth_probe_unknown`、`oauth_deployment_unsupported`、`codex_capability_unsupported`、`codex_probe_contract_mismatch`、`managed_model_catalog_missing`、`profile_revision_unavailable` 以及 restore workspace/cwd/runtime 等确定性失败会成为该 episode 的 terminal cause，发出一次具体提示后不再由 tick 重试；`codex_binary_unavailable`、`codex_probe_timeout`、`codex_probe_unavailable` 属于环境类失败，在后台自动恢复里只记录 backoff，TTL 到期后重新探测，不立即打扰用户；`thread_not_found` / `headless_restore_thread_not_found` 不属于 terminal cause，在后台自动恢复里只记录 backoff；
+         3. 真正恢复成功，或 persisted target / backend / profile/provider 发生变化时，会清掉 terminal/sticky failure；用户显式重新选择或恢复仍可发起新的执行尝试；
+         4. retryable 失败后续即使观测到 `workspace_busy` / `thread_busy` / `thread_not_found` 这类派生状态，也不会改写已经建立的更具体根因；同一根因在同一恢复 episode 里不会重复刷失败卡。
+         5. daemon 同步 headless 恢复运行态时，只把 `surfaceID / ProductMode / Backend / provider/profile / ResumeThreadID / ResumeThreadCWD / ResumeWorkspaceKey / ResumeRouteMode / ResumeHeadless` 视为“恢复目标身份”；`ResumeInstanceID` 只作为 exact visible instance 优先尝试的执行 hint，不再决定 headless episode identity；`ResumeThreadTitle`、gateway/chat/actor、verbosity、更新时间等展示或投递元数据变化只刷新 entry，不重置 `NextAttemptAt`、`LastNoticeCode` 或 sticky failure。
+         6. daemon 在 auto-restore 启动 managed headless 前会检查最终 `WorkDir` 是否仍存在且是目录；不存在时返回 `headless_restore_workspace_missing`，发一次可诊断提示并把本 episode 标为 terminal，直到用户 `/list`、`/use`、`/new` 或目标合同改变前不再按 tick 盲 retry。
+   5. `vscode` mode surface 会按 persisted `ResumeInstanceID` 继续尝试恢复：
+      1. 先做本机 VS Code 兼容性检查：
+         1. 若检测到旧版 `settings.json` override，或当前 managed shim 已失效，则保持 detached，并发迁移/修复卡片。
+         2. 若兼容性检查通过，才继续 exact-instance 恢复。
+      2. 只允许恢复到 exact VS Code instance，不做 workspace fallback。
+      3. 恢复成功后直接回到现有 vscode attach/follow-local 路径。
+      4. 若当前还没有新的 VS Code 活动可继续 follow，会保留 follow waiting，并明确提示用户去 VS Code 再说一句话或手动 `/use`。
+      5. VS Code 恢复失败也使用 daemon recovery episode 记账；例如 exact instance 已被其它 surface 占用时，只在同一 episode 第一次发 busy failure notice，后续 backoff 到期仍 busy 时保持静默，直到恢复成功或 target 改变。
+      6. `vscode` 不会参与 managed-headless exact-thread continuation；`surface resume state` 在 load/write 时也会把所有非 headless entry（当前即 `ProductMode!=normal`）的 `ResumeHeadless` 强制归零，因此 `vscode` surface 不会保留可继续触发这条恢复分支的持久化目标。
+3. `/mode` 当前只在没有 live remote work 的 surface 上执行切换：
+   1. 接受 `normal|codex|claude|opencode|vscode` 五种字面值；其中 `normal` 是 `codex` 的兼容 alias。
+   2. `codex = Backend=codex + ProductMode=normal`，`claude = Backend=claude + ProductMode=normal`，`opencode = Backend=opencode + ProductMode=normal`，`vscode = Backend=codex + ProductMode=vscode`。
+   1. 会先走 detach-like 清理。
+   2. 清掉 attachment / workspace claim / thread claim、`PromptOverride`、`PendingRequest`、`RequestCapture`、`PreparedThread*`、staged image / staged file 与 queued draft。
+   3. 如果切换前后都处于 headless 主链（当前 persisted token 仍是 `ProductMode=normal`），且 backend 在 `codex` / `claude` / `opencode` 之间变化，只要切换前已经存在当前 workspace，则 surface 会恢复这份 workspace claim，并立即优先 attach 目标 backend 下同 workspace 的在线 instance；若当前还没有可 attach 的目标 backend instance，则直接启动 fresh managed headless，并保留 `new_thread_ready` 意图，而不是停在 detached idle。Claude fresh headless 仍会显式走 `claude-app-server`，OpenCode fresh headless 显式走 `opencode-acp`，都不复用 Codex `app-server` 入口再靠 env 猜 backend。
+   4. 如果切换前后发生了 backend 或 `ProductMode` 变化，会清掉 `surface resume state` 里的旧 resume target，避免 `codex` / `claude` / `opencode` 之间串恢复。
+   5. 如果当时还带着 `PendingHeadless`，会先显式 kill 当前 headless 启动流程，并清掉 `surface resume state` 里的 headless 恢复目标与内存恢复状态。
+4. 若当前仍有 live remote work，则 `/mode` 直接拒绝，并明确提示用户 `/stop` 或 `/detach`。
+5. `Abandoning` 仍是更高优先级 gate；但 `PendingHeadless` 不再阻塞 `/mode`，用户可以直接切到 `vscode` 终止恢复流程。
+6. 当前工作会话命令已经按主运行面分流：
+   1. `codex` 的主展示命令是 `workspace` 命令族：`/workspace` / `/workspace new` 负责父页导航，`/workspace list` / `/workspace new dir` / `/workspace new git` / `/workspace new worktree` 打开四张独立业务卡；旧 `/list` / `/use` / `/useall` 只是 alias。
+   2. `claude` 的主展示也已收口到同一套 `workspace` 命令族：菜单里的 `switch_target` 现在和 `codex` 一样直接进入 `/workspace` 父页，并显示 `切换`、`从目录新建`、`从 GIT URL 新建`、`从 Worktree 新建`、`解除接管` 五个入口；`/list`、`/use`、`/useall` 继续保留为 hidden + allow 兼容 alias，`current_work` 仍保留 `/new`，`常用工具` 继续显示 `/history` 与 `/sendfile`；`/review` 与 `/bendtomywill` 当前已经退出 Claude 主展示面，回到 hidden + reject。
+   3. `vscode` 主链继续列在线 VS Code instance。
+7. `Verbosity` 当前也是 surface 级偏好：
+   1. `/verbose quiet|normal|verbose|chatty` 直接改当前 surface。
+   2. `/detach` 不会清掉它。
+   3. daemon 重启后，latent surface 会从 `surface resume state` 恢复之前的 `Verbosity`。
+8. 合法 Feishu surface 的 `PlanMode` 业务事实位于 gateway/bot 级 `BotCapabilitySettings`；私聊与群聊都读取该 record，非 canonical surface 才保留本地偏好。headless 与 `vscode` 的下发语义不同：
+   1. 私聊 `/plan on|off` 对最新 bot record 做 plan 字段事务，只影响后续新 turn；`/plan clear` 会清掉显式 plan 覆盖并把同 gateway surface 投影恢复成 `off`。群聊不能直接执行这些配置命令，但提案计划执行和已确认的 Claude `ExitPlanMode` 属于运行生命周期转移：record 已存在时通过 lifecycle 字段事务更新 plan，record 缺失时只更新当前 surface 的 route-derived 状态，不拥有首建权。
+   2. 当前 running turn、已入队消息、当前 turn 的 `/steer` 与 reply auto-steer 都不受新设置追溯改写。
+   3. Codex/Claude headless 主链的 queue item 会在入队时冻结 `PlanMode`，dispatch `turn/start` 时再把它落到 `PromptOverrides.PlanMode -> collaborationMode.mode=plan/default`。
+   4. OpenCode 主链接受 Feishu `PlanMode` 显式 override；`/plan on|off` 只影响后续新 turn，queue item 冻结 `FrozenPlanMode` 后在 ACP translator 中映射为 `session/set_config_option configId=mode value=plan|build`，且必须在 `session/prompt` 前成功。`/plan clear` 后 `FrozenPlanMode` 保持 empty，dispatch 不再下发 mode。若同一 prompt 同时冻结 `PlanMode` 与 OpenCode reasoning override，translator 先设置 `mode`，再设置 `effort`，最后才发送 `session/prompt`；任一 set-config 失败都不会继续 prompt。
+   5. `vscode` 主链同样属于 shared-authority：只有用户显式 `/plan on|off` 后才会冻结 `PlanMode`；若未设置或已 `/plan clear`，queue item 的 `FrozenPlanMode` 保持 empty，dispatch 时不下发 plan override，让 VS Code/backend 保持当前状态。
+   6. `/detach`、`/new`、`/use`、`/mode normal|codex|claude|opencode|vscode` 不会顺手清掉 bot record 里的 `PlanMode`；daemon 重启后，latent surface 不从 `surface resume state` 恢复 `PlanMode`，而由 bot capability store 重新投影，旧 surface resume entry 里的 `planMode` 会被忽略并在下一次保存时清理。
+   7. 在 `claude` 模式下，`PlanMode` 也不进入 `workspace+profile` 快照：
+      1. 进入某个 Claude workspace 时，会按 `workspace + ClaudeProfileID` 恢复最近一次飞书临时 `ReasoningEffort / AccessMode` 覆盖；已有 bot record 时结果经 lifecycle 字段事务写回并投影到同 gateway surface，无 record 时只保留为当前 surface 的 route-derived 执行状态。
+      2. 离开该 workspace 或切走该 profile 前，会把当前显式 `ReasoningEffort / AccessMode` 覆盖写回独立的 `workspace+profile` 持久化 store。
+      3. 若目标 `workspace+profile` 没有快照，则会恢复成空 override + `PlanMode=off`，不会沿用别的 workspace/profile 残留值。
+      4. `Model` 与 `PlanMode` 明确不在这套快照里；Claude workspace/profile 恢复时会主动清掉这些临时运行态，不把它们当作可持久化热改能力。
+   8. Claude `ExitPlanMode` 被批准后，不会在“用户点了批准”时立刻清掉 bot record 的 `PlanMode`；只有等到对应 `request.resolved(plan_confirmation + accept)` 真正到达，才会通过生命周期字段事务清理显式 plan override。`decline` / `revise` / cancel / 过期都不会误清。
+   9. 若某轮 turn 结束时存在 completed plan item text（或仅作为兼容兜底的 `item/plan/delta` 草稿），surface 会在 final 落完后追加一张“提案计划”手动 handoff 卡；completed item text 优先于 delta 草稿。这张卡不是 request gate，不阻塞后续输入，但命中新的输入、route 变化、turn 变化或用户显式点击动作后都会 seal。
+      对 `keep_surface_selection` 的 detached-branch turn，这张卡仍回原 surface，并按 source/main thread 判断是否 suppress，不会因为 execution thread 不同而被误吞。
+   10. 点击提案计划卡的 `直接执行` / `清空上下文并执行`，会先把 gateway bot record 的 `PlanMode` 切回显式 `off`，再继续派发 follow-up turn；`取消` 只 seal 卡片，不改 route。
+9. `PromptOverride` 当前承载飞书侧显式 model / reasoning / access requested override；合法私聊命令从最新 gateway/bot 级 `BotCapabilitySettings` 开始只更新对应字段，群聊 effective prompt summary、queue freeze 与 headless launch 使用同一 bot 级 override：
+   1. headless Codex 主链的 queue item 仍会冻结最终 effective model / access；reasoning 只冻结用户显式 override，空 `ReasoningEffort` 表示自动，不再把 backend 全局默认 `xhigh`、thread observed/base reasoning 或动态目录里的 `defaultReasoningEffort` 当成要下发的 prompt override。
+   2. Codex API Profile 声明的模型和推理强度会作为 profile base 进入下一轮 prompt config summary 与 queue freeze；fixed/dynamic 只决定是否允许用户再通过 `model.list` catalog 覆盖。Codex `/model` 与 `/reasoning` 会先按当前 Codex Profile 判定模型目录模式：native/OAuth、未配置模型的 API Profile、模型名看起来属于 GPT/OpenAI 系的 API Profile，以及 DeepSeek/MiMo endpoint 或 `deepseek-` / `mimo-` 模型名前缀识别出的 catalog-backed API Profile，继续使用当前 instance-scoped `model.list` 目录。DeepSeek/MiMo API Profile 的目录由 daemon 在启动 child 前写入 Remote 管理的 state 目录，并通过 `model_catalog_json` 注入给 Codex；普通 GPT/OpenAI-like profile 不生成 generic managed catalog，继续使用 Codex 自身目录和默认模型元数据；其它配置了非 GPT/OpenAI 系模型且未识别 catalog backing 的 API Profile 视为 fixed，只信 Profile 配置的模型和推理强度。fixed Profile 下手输其它模型或非 Profile 配置的推理强度会被拒绝，切到 fixed Profile 时会清掉旧 model/reasoning override，保留 access/plan。
+   3. 非 fixed 场景下，Codex `/model` 与 `/reasoning` 继续按当前 instance-scoped `model.list` 目录校验 `model + reasoning` tuple：已知不支持时普通命令拒绝，已知模型切换时清掉不兼容的旧 reasoning override；未知模型、目录不可用或模型未声明 efforts 时只提示无法本地校验，保留高级手输能力。
+   4. Codex queue dispatch 与 auto-continue dispatch 在真正生成 `prompt.send` 前会再次检查 frozen override；fixed Profile 下若残留不匹配的 model override，会清空这次 command 的 model/reasoning override、保留 access，并追加 `prompt_override_model_dropped` 全局 runtime notice；非 fixed 场景下若动态目录可判定 `model + reasoning` 不兼容，会清空这次 command 的 reasoning override，保留 model/access，并追加 `prompt_override_reasoning_dropped` 全局 runtime notice。这两类 notice 使用 `prompt_override_guard` family 和 dedupe key，避免同一不兼容组合连续刷屏。
+   5. Codex headless 的跨模型组检查先发生在 `/codexprofile` continuation 规划阶段：若当前 pinned thread 的 source 组与目标 Profile 组分别可判定且一个是 `gpt`、另一个是 `non_gpt`，切换不会生成 exact-thread restore，也不会借用 `fresh_workspace` onboarding；它会转换成 `PendingHeadless(Purpose=workspace_route_restart, PrepareNewThread=true)`。该 pending 与 daemon start command 不携带旧 `ThreadID`，`WorkspaceKey` / `ThreadCWD` 进入同一条 `ResolveHeadlessResumeWorkspaceKey(...)` 边界：cwd 位于 workspace root 下时保留稳定 root，cwd 已不属于旧 root 时改以 cwd 作为 workspace claim；旧 managed child 仍会被显式 kill，连回后直接进入 `R5 NewThreadReady`。
+   6. 普通 `resume_existing + follow_execution_thread` dispatch 仍保留第二道兼容检查：旧 thread 模型优先取 `CodexEffectiveThread.Model`，再取 `ExplicitModel` / `ThreadSettings.Model` / `LastModelReroute.ToModel`；目标模型优先取非 thread 来源的 prompt config，再取当前 `CodexThreadPolicy` 的 explicit/default 目标。若旧组与目标组分别可判定且不同，本次输入会改写为 `start_new`，surface 同步进入 `R5 NewThreadReady`，`PreparedFromThreadID` 记录旧 thread，`PreparedThreadCWD` 保留原 cwd，并追加 `codex_model_group_new_thread` notice。不可判定或同组时继续复用旧 thread。
+   7. 跨模型组自动新会话不进入 detour / review / keep-selection 临时会话路径，也不在 adapter 清理 Codex 历史。若目标模型来自 `CodexThreadPolicy`，dispatch 会清掉由旧 thread base config 推导出的 model override，避免 prompt override 反向覆盖目标 Profile policy。
+   8. headless 主链的 base config 当前只读取 thread explicit config、backend/profile-scoped workspace defaults、fixed Codex API Profile 的 profile 模型策略与 surface override；旧 `InstanceRecord.CWDDefaults` 和旧 workspace-defaults storage key 都不再参与 headless fallback。`CWDDefaults` 仅保留给 `vscode` 的 observed-config 展示与 freeze 语义。
+   9. Claude headless 的 runtime `permissionMode` 现在会通过标准 `config.observed(thread)` 回填 thread observed access/plan；`/status`、`/permission`、`/plan` 和 headless prompt freeze 都读这条 observed state，而不是把它误持久成 workspace default。
+   10. Claude headless 在没有飞书显式 `/permission` override 时，下一条 prompt 的 base access 会优先跟随当前 thread observed access；旧的 Claude workspace default access 不再参与这条解析。
+   11. OpenCode `/permission` 只保留 `full_access` / `confirm` runtime desired；queue item 冻结该字段用于 dispatch preflight 的 launch-contract 比较，但 `prompt.send` 不携带 ACP per-turn `AccessMode` override。空 `AccessMode` 表示继承 OpenCode 本机默认，并要求 current child 的 `OpenCodeRuntimeAccessMode` 同样为空才算兼容。
+   12. OpenCode `/reasoning` 保留 `low/medium/high/xhigh/max` runtime desired；queue item 冻结该字段用于 ACP `effort` preflight，`prompt.send` 只携带 `ReasoningEffort`，不携带 OpenCode model/access override。bare `/reasoning` 的按钮优先来自当前模型通过 ACP `configOptions id=effort` 暴露的 options；当前模型没有 `effort` options 时只显示自动并给出不支持/等待刷新提示。带参数 `/reasoning` 在 OpenCode 下必须能按当前 model catalog 证明 `effort` 支持，否则拒绝且不写 override。`config_option_update id=effort` 会写入 thread observed reasoning，`/status` / config summary 会把 observed current effort 与下条飞书消息 explicit override 分开显示。
+   13. Claude reasoning 仍由 profile/default + surface explicit override 生成 headless launch contract；本轮 Codex “自动=不下发 reasoning override”不改变 Claude 的 `workspace+profile` snapshot、`prompt_dispatch_restart` 或 profile default reasoning 语义。
+   14. `vscode` 主链只冻结飞书显式 requested override；observed cwd/thread config 仍可用于 `/status` / 参数卡展示，但不会在没有本地显式覆盖时被重新下发给 backend。
+   15. Codex translator 收到 empty access override 时不会改写 `approvalPolicy` / `sandboxPolicy`；只有显式 `full` / `confirm` 才会下发对应权限策略。
+10. headless workspace-first 主链当前已经完成这一轮产品收窄：
+   1. bare `/workspace` 是工作会话父页，固定展示 `切换`、`从目录新建`、`从 GIT URL 新建`、`从 Worktree 新建`、`解除接管` 五个入口；bare `/workspace new` 是只含三条新建路径的子页。
+   2. `/workspace list` 与 alias `/list` / `/use` / `/useall` / `show_workspace_threads` 都收敛到同一张 `切换工作会话` 卡。
+   3. 这张切换卡直接落在“工作区 + 会话 / 操作”同页：
+      1. 工作区候选只出现真实 workspace，不再混入动作型来源项。
+      2. 工作区 label 足够时只显示 label；只有 basename 冲突时，才额外补路径 meta 做消歧。
+      3. 会话 / 操作候选始终基于当前选中的 workspace 重新生成：`/workspace list` 与 alias `/list` 会把 `新建会话` 放在第一项，并继续保留已有会话列表；Git workspace 额外追加 `worktree_create` 操作；busy Git workspace 只作为 Worktree base 显示且只暴露这一项，busy 非 Git workspace 不进入下拉；`/use`、`/useall`、`show_workspace_threads` 与锁定当前工作区的恢复 picker 则继续追加 `新建会话` fallback，避免坏会话把用户卡死，但不放宽 busy workspace 成可接管。
+      4. session 默认值按 source 收口：`/workspace list` 与 alias `/list` 只要当前工作区允许 `new_thread` 就会默认选中新建会话；若 busy Git workspace 只有 `worktree_create` 一个操作，则默认选中它；`/use` / `/useall` 仍只会在 surface 已经绑定到同一 thread 时保守预填该 thread，detached / unbound 即使只剩一个候选也不会自动代填。
+      5. confirm 既有会话时，会复用现有 `/use` / cross-workspace attach 语义；必要时会先统一经过 `resolveWorkspaceContract(...)` 与对应的 workspace continuation owner，再落到 attach / restart-managed / fresh-start 的单一路径。
+   4. `/workspace new dir`、`/workspace new git` 与 `/workspace new worktree` 是三张独立业务卡：
+      1. `从目录新建` 主卡会显示路径字段、`选择目录` 按钮与 `接入并继续` 主按钮；`target_picker_open_path_picker` 会把主卡 inline replace 成目录模式 path picker，confirm/cancel 后再返回主卡。
+      2. `从目录新建` 在主卡上回填出有效目录后即可继续；若命中已知 workspace，会直接复用该工作区，并进入新会话待命，而不是把用户打回“切换”路径。
+      3. `从 GIT URL 新建` 主卡会内联收集 `repo_url`、可选 `directory_name` 与父目录；父目录会在表单里和右侧的 `选择目录` 按钮同行显示，底部动作区则统一收口成带分隔线的横排按钮。这些草稿跟随同一个 active target picker runtime 保存，不会进入 `PendingRequest`。
+      4. `从 GIT URL 新建` 的主卡 confirm 会直接下发 daemon-side `workspace.git_import` 命令；真正的 `git clone` 在 daemon 持锁外执行，不阻塞主锁。
+      5. confirm 后 owner card 立即进入 processing：先显示“正在导入 Git 工作区”，clone 成功后若 flow 仍有效，则继续 patch 成“正在接入工作区”；success / failure / cancel 都封回同卡 terminal。
+      6. clone / prepare 期间，surface 会进入 coarse-grained `target_picker` gate：普通输入与 competing route mutation 被拒绝，只保留 `/status`、reaction/recall 与同卡 `取消导入`。
+      7. `取消导入` 会优先停止业务流，并对 clone / fresh-workspace prepare 做 best-effort 取消；若本地已留下目录残留，不自动清理，只在 terminal card 提醒用户按需手动处理。
+      8. clone 成功但 flow stale 时，只保留本地目录并回 stale notice；后续接入失败时，则同卡显示失败 terminal，并明确目录已保留。
+      9. 当本机缺少 `git` 时，`从 GIT URL 新建` 仍可直接打开；`克隆并继续` 保持 submit-time validation 语义，点击后服务端会把不可用说明回写到同一张卡，不会进入死流程。
+      10. `从 Worktree 新建` 主卡会显示基准工作区 dropdown、新分支名 input、可选目录名 input 与只读目标路径预览；底部动作为 `取消 / 返回上一层 / 创建并进入`。
+      11. 这张卡的工作区候选会从当前可见 / 可恢复 workspace 中筛出可识别的 Git workspace；busy Git workspace 也可以作为 Worktree base 出现，但这里只能用于派生新 workspace，不能顺带 attach / 接管原 workspace。如果当前 attached workspace 不是 Git 目录，不会继续把它伪装成默认项，而是回退到第一个可用 Git workspace。
+      12. `从 Worktree 新建` 不打开 path picker；branch / directory 草稿始终保存在 active target picker runtime 里，并跟随同卡 workspace dropdown 刷新保留。
+      13. `从 Worktree 新建` 的主卡 confirm 会先 dry-run 检查群 workspace change gate；primary/busy 不满足时只在同卡回写错误，不下发 daemon create。通过后才下发 daemon-side `workspace.git_worktree.create` 命令；真正的 `git worktree add` 在 daemon 持锁外执行，不阻塞主锁。
+      14. confirm 后 owner card 立即进入 processing：先显示“正在创建 Worktree 工作区”，创建成功且 flow 仍有效时继续 patch 成“正在接入工作区”；success / failure / cancel 都封回同卡 terminal。
+      15. `取消创建` 会优先停止业务流，并对 `git worktree add` / fresh-workspace prepare 做 best-effort 取消；若本地目录已经留下，不自动清理，只在 terminal card 提醒用户按需手动处理。
+      16. worktree 的目标路径预览 / 最终路径 / 失败文案当前统一由 `gitmeta.PreviewWorktree`（含空 branch 草稿态，草稿只给 destination 预览且 `CanConfirm=false`）与 `gitmeta.WorktreeCreateErrorText` 提供：target picker 只投影 core 输出，不再重复 `InspectWorkspace` / `filepath.Join` / `os.Stat` / 错误文案推导；daemon 入口只保留 `WorkspaceKey` / `BranchName` 缺失等 protocol 校验，业务错误 notice 的 code 与 text 均直接来自 `gitmeta.WorktreeCreateError` / `WorktreeCreateErrorText`。`internal/app/gitworkspace.CreateWorktree` 也完全消费 core preview 结果（含 `CanConfirm` 守卫），实际 `git worktree add` 的 cwd / branch / destination 与 preview 一致。
+   5. `target_picker_select_workspace` / `target_picker_select_session` / `target_picker_open_path_picker` / `target_picker_back` 都只刷新同一张卡或其子步骤，不会立即 attach 或 switch；其中 `target_picker_back` 只服务 `/workspace list` 内部 Worktree 子页返回 target 页。旧 `target_picker_select_mode` / `target_picker_select_source` 回调与 mode/source 中间页已删除，不再是 transport contract。
+   6. `target_picker_cancel` 是当前四张工作会话业务卡的显式退出路径：编辑态会把当前卡封成 `已取消` 终态；若 Git / Worktree 长链路正处于 processing，则会封成 `已取消导入` / `已取消创建` 并执行 best-effort cancel。
+   7. `show_threads` / `show_all_threads` / `show_scoped_threads` / `show_workspace_threads` / `show_all_workspaces` / `show_recent_workspaces` / `show_all_thread_workspaces` / `show_recent_thread_workspaces` 在 headless 主链下当前都只负责“重新打开或刷新 `/workspace list` 切换卡”，不再维持旧的分页 selection-card 主路径。
+   8. 被动恢复入口也统一复用 target picker，而不是旧的 scoped selection prompt：
+      1. `attach unbound`、`selected_thread_lost`、`thread_claim_lost` 当前都会打开“锁定当前工作区”的 target picker。
+      2. 这类卡片会隐藏工作区下拉，只保留当前工作区的会话候选；若当前工作区只剩 `new_thread` 可走，会自动预选这一个候选。
+      3. 用户若尝试从旧卡切到别的工作区，或确认一个已经不属于当前工作区的旧候选，服务端不会 cross-workspace fallback，而是刷新同一张锁定卡，并明确提示“当前工作区已锁定”。
+   9. `/new` 已变成 workspace-owned prepared state。
+   10. `/follow` 在 headless 主链下只返回迁移提示，不再进入 follow route。
+11. `vscode` 主链当前已经完成这一轮收窄：
+   1. `/list` attach/switch instance 后默认进入 follow-first，而不是落回 pinned/unbound。
+   2. 默认跟随目标只看 `ObservedFocusedThreadID`，不再回落 `ActiveThreadID`。
+   3. detached `vscode /use` / `/useall` 会直接拒绝，并要求先 `/list`。
+   4. attached `vscode /use` / `/useall` 只看当前 attached instance 的已知 thread 集合；`/use` 显示最近 5 个，`/useall` 显示当前实例全部会话，两者都统一成当前实例内的 dropdown 选择。
+   5. dropdown 当前不会再把不可切换 thread 作为 disabled 选项渲染在卡面里，而是直接隐藏，并在卡片正文追加 plain-text 提示说明“已省略当前不可切换的会话”。
+   6. `vscode /use` 的 one-shot force-pick 会保留 `RouteMode=follow_local`，后续 observed focus 仍可覆盖。
+   7. 若 `/list`、`/use`、`/useall` 来自带 `daemon_lifecycle_id` 的当前菜单卡 callback，实例列表 / 线程列表 / attach 结果 / use 结果会继续沿当前菜单卡时间线收口，不再退回 submission-anchor 或额外 detached notice。
+   8. 若 stamped `/mode vscode` 在切换后立刻命中 legacy `editor_settings` 且存在可接管入口，daemon 会先静默自动迁到 `managed_shim`，成功后直接继续 open prompt / resume failure 等后续链路；只有缺 target、自动迁移失败、或需要修复的 managed shim，才会把首张可投影提示卡优先替换当前卡。纯文本 `/mode vscode` 仍保留原来的异步提示语义。
+
+### 3.2 路由主状态
+
+| 代号 | 条件 | 用户语义 |
+| --- | --- | --- |
+| `R0 Detached` | `AttachedInstanceID == ""` | 当前没有接管任何目标；headless 主链下表现为“未接管工作区”，`vscode` 下表现为“未接管实例” |
+| `R1 AttachedUnbound` | `AttachedInstanceID != ""`，`RouteMode=unbound`，`SelectedThreadID == ""` | 已接管目标但当前没有可发送 thread；headless 主链下通常表示“已接管 workspace、未选 thread” |
+| `R2 AttachedPinned` | `AttachedInstanceID != ""`，`RouteMode=pinned`，`SelectedThreadID != ""`，且持有 thread claim | 当前输入固定发到该 thread |
+| `R3 FollowWaiting` | `AttachedInstanceID != ""`，`RouteMode=follow_local`，`SelectedThreadID == ""` | 仅 `vscode` 合法：已进入 follow，但当前没有可接管 thread |
+| `R4 FollowBound` | `AttachedInstanceID != ""`，`RouteMode=follow_local`，`SelectedThreadID != ""`，且持有 thread claim | 仅 `vscode` 合法：已跟随到一个 thread |
+| `R5 NewThreadReady` | `AttachedInstanceID != ""`，`RouteMode=new_thread_ready`，`SelectedThreadID == ""`，`PreparedThreadCWD != ""` | 仅 headless 主链合法：已准备一个待 materialize 的新 thread；下一条普通文本会创建新 thread |
+
+补充说明：
+
+1. 从 2026-05-03 起，`R1~R5` 的 live mutation 已收口到同一个 route-core transition seam：
+   1. `AttachedInstanceID`、`SelectedThreadID`、`RouteMode`、`PreparedThread*` 与 `PreparedAt` 不再允许由 attach/use/follow/new/detach/kick/thread-lost 各自平行直写；进入或刷新 `R5 NewThreadReady`、清理 prepared route 都必须走 route-core-owned API。
+   2. 真正发生 attachment 变更时，会在同一处重做 workspace / instance / thread claim 对齐。
+   3. 仅在同一 attachment 内切换 route 时，不再重复改写 instance claim；这类 transition 只重排 thread claim 与 route 主字段，避免把历史兼容态或 kick-thread 迁移路径卡死在“instance claim 必须先转移”的半状态。
+   4. detached recovery / reattach cleanup 若需要丢弃 `PreparedThread*`，会通过 route core 归一到 `R0 Detached` + workspace continuation memory，而不是只清 prepared 字段后留下 `RouteMode=new_thread_ready` 的半状态。
+2. detached 态当前仍允许保留一个“记住当前 workspace”的弱 carrier：`AttachedInstanceID == ""` 时 `ClaimedWorkspaceKey` 可以仅作为 continuation intent 存在，但它不等价于 active workspace claim。
+3. `R0 Detached` 现在允许存在一种 daemon materialize 出来的 latent surface：
+   1. surface 有 `gateway/chat/user` 路由信息。
+   2. surface 的 `ProductMode`、`Backend` 与 `Verbosity` 已从持久化 `surface resume state` 恢复；`PlanMode` 不再跨 daemon 恢复。
+   3. surface 可能还带有持久化的 resume target 元数据（instance / thread / workspace / route 语义）；它们不会在 materialize 当下直接投影成 live attach。daemon 随后只会对允许后台恢复的 surface 异步评估恢复；Feishu 群聊 surface 会保留 latent context，但不进入无人触发的 background recovery。
+   4. 对 headless 主链来说，这个 latent detached 可能是短暂中间态：
+      1. exact visible thread 恢复成功后会进入 `R2 AttachedPinned`。
+      2. visible thread 不可见但同 backend workspace 仍可接管时，会进入 `R1 AttachedUnbound`。
+      3. 若 persisted route 本身就是 workspace-owned `new_thread_ready`，且同 backend 当前已有对应 workspace 实例，则会直接进入 `R5 NewThreadReady`。
+      4. visible/workspace 路径需要 fresh workspace prepare 时，会先进入 `G1 PendingHeadlessStarting`；fresh headless 完成后再回到 `R1 AttachedUnbound` 或带 `PreparedThreadCWD` 的 `R5 NewThreadReady`。
+      5. 若还在等待 daemon 启动后的首轮 refresh，则会暂时保持 `R0 Detached` 并静默等待；若 persisted target 还带着 `ResumeHeadless=true` + 已连回的 visible `ResumeInstanceID`，managed-headless continuation 也会一起等待这轮 refresh。
+   5. 对 `vscode` 来说，这个 latent detached 也可能是短暂中间态：
+      1. 若本机 VS Code 集成仍是旧版 `settings.json` override，或 managed shim 因扩展升级而失效，会保持 `R0 Detached` 并改发迁移/修复卡片。
+      2. 兼容性检查通过后，exact instance 恢复成功会进入 `R3 FollowWaiting` 或 `R4 FollowBound`。
+      3. 若目标 instance 还没重新连回，会保持 `R0 Detached` 并静默等待。
+      4. 不做 workspace fallback，也不会进入 headless 恢复。
+   6. 若该 surface 的 `surface resume state` 里仍带有 `ResumeHeadless=true` 的 concrete thread-restore 目标，daemon 会在同一条 headless recovery 主链里先尝试 exact visible attach；只有 visible 路径没恢复成功时，才继续进入 managed-headless exact-thread continuation；`vscode` 不会进入这条分支。这里的 continuation 已按 backend 生效，不再只限 Codex。
+2. 这种 latent surface 在 route 维度上仍然是 `R0 Detached`，不是新的 route state。
+3. 当前 startup 阶段不会因为 resume target 元数据而在 materialize 当下直接进入 `R1~R5`；是否进入后台恢复、是否转入 `G1 PendingHeadlessStarting`，仍取决于 daemon 后续恢复调度与 surface recovery policy，而不是 materialize 本身。Feishu 群聊当前不进入后台恢复，后续只由被 @ 的 on-demand 路径承接。
+4. Feishu 群聊 data-plane 输入在 `R0 Detached` 且没有 `AttachedInstanceID` 时走 room-workspace gate / continuation：
+   1. 若同 room 尚未绑定 workspace，普通文本、图片、文件和 backend-bound action 直接返回 `room_workspace_required`；不会保存 pending text，不会打开 target picker，也不会 stage 图片/文件。
+   2. 若同 room 已绑定 workspace，则先检查同 room active reservation budget；命中时返回 `room_workspace_active`，不启动第二个 bot 的执行，也不创建 queue/staged input。
+   3. 未命中 active reservation 时，文本、图片、文件入口通过 workspace continuation 复用现有 workspace contract resolution / claim / room binding 路径接管当前 bot 自己的 headless context；若可用实例只被同 room sibling claim，则该实例不会作为 direct attach candidate，而是进入 fresh headless start。
+   4. 文本 attach 成功后继续按 `R1 AttachedUnbound` 的 headless 普通文本规则隐式进入 `R5 NewThreadReady` 并创建新会话；若进入 fresh headless start，则保持 `G1 PendingHeadlessStarting`，等实例连回后通过统一 ingress episode replay 原文本。
+   5. 图片/文件 attach 成功后会在当前 bot surface 上按普通 staged input 规则进入 `ImageStaged` / `FileStaged`；若进入 fresh headless start，则先保持 staged input + `G1 PendingHeadlessStarting`，等后续文本或恢复链路继续推进。两类路径都只继承 room workspace，不继承同 room 其它 bot 的 selected thread。
+5. Feishu 群聊 on-demand resume 路径当前只在这些条件同时成立时从 `R0 Detached` 进入恢复：
+   1. 入站动作已经通过 gateway 的 @ 当前 bot gate。
+   2. 动作是普通 `ActionTextMessage`；若文本附带文件，原 action 会连同 `Files` 一起进入 continuation，恢复后再由统一 ingress 文件暂存逻辑处理。
+   3. surface 是 Feishu group surface，当前没有 attached instance，也没有 pending headless。
+   4. `surface resume state` 中存在 headless-compatible resume target。
+   5. surface 不是 `vscode` mode；VS Code 群聊 lazy recovery 当前只返回不支持提示，不自动恢复。
+6. Feishu 群聊 on-demand resume 启动 headless 时，daemon 会把当前文本 action 作为短生命周期内存 continuation 保存到 `surfaceResumeRuntime`。headless attach 成功后，daemon 先删除 continuation，再进入统一 locked ingress episode，并仅禁用再次 on-demand recovery；因此原消息会重新经过 rejected inbound、room workspace conflict、upgrade owner flow、turn patch transaction/flow 等当前动态 gate。启动失败或 pending timeout 会清掉 continuation，并把本次恢复失败反馈给当前交互。
+7. 群聊 on-demand 恢复的 terminal 失败（与后台自动恢复同一套 `isTerminalSurfaceResumeFailure` 判定）在同一恢复目标下跨消息只发一次失败卡：daemon 用 `surfaceResumeRuntime.groupTerminalFailureNotices` 记录最后一次 terminal 通知码，直接失败（`TryAutoResumeHeadlessSurface` 返回 Failed）与 daemon 启动失败（`handleManagedHeadlessLaunchFailure` 消费 group continuation）两条路径都先经过该去重；恢复目标内容变化（resume entry 持久化变化）、恢复成功或用户显式重选（`/list`、`/use`、`/new` 等会改写 resume target 的路径）会清掉该记录，允许重新通知。非 terminal 失败（如 `thread_not_found`）不受此去重影响，每次触发消息仍按当前交互反馈。
+
+### 3.2.1 thread 运行时状态 overlay
+
+thread 自身现在还有一层**authoritative runtime status overlay**，来源只认 upstream `thread.status`：
+
+| 代号 | 来源 | 当前实现语义 |
+| --- | --- | --- |
+| `T0 notLoaded` | `thread/list` / `thread/read` / `thread/started.thread.status` / `thread/status/changed` | thread 当前未 loaded 在某个实例里；会同步成 `ThreadRecord.Loaded=false`，但不会因此把 thread 从可见列表里删掉 |
+| `T1 idle` | 同上 | thread 当前 loaded 且空闲 |
+| `T2 systemError` | 同上 | thread 当前 loaded，但处于上游 system error 语义 |
+| `T3 active` | 同上 | thread 当前 loaded 且 active；额外 activeFlags 当前包括 `waitingOnApproval`、`waitingOnUserInput` |
+
+补充说明：
+
+1. 这层 overlay 当前承载在 `ThreadRecord.RuntimeStatus`，并投影到 `control.ThreadSummary.RuntimeStatus`、`WaitingOnApproval`、`WaitingOnUserInput`。
+2. 兼容旧展示链路时，thread summary 的 `State` 只在 `RuntimeStatus` 存在时按权威运行态投影 legacy 字面值；它不再回退到旧 `thread.State` 存储：
+   1. `active -> running`
+   2. `notLoaded -> not_loaded`
+   3. `systemError -> system_error`
+3. `notLoaded` 的当前产品语义是“thread 目前没 loaded 在实例里”，不是“thread 不可恢复”：
+   1. `threadVisible(...)` 仍只看 `Archived` 与 `TrafficClass`。
+   2. 只要 thread 仍然可见且保留 `CWD/workspace` 恢复锚点，headless `/use` 仍会走现有 resolver：当前可见 thread、复用 headless、或创建 headless。
+   3. detached `/use` 命中这类 thread 时，允许直接进入 preselected headless 恢复。
+4. `active(waitingOnApproval|waitingOnUserInput)` 当前只影响 thread 运行态投影与 claimed-thread busy 文案细化：
+   1. 若目标 thread 已被别的 surface claim，且 authoritative runtime status 仍是 `active`，kick 判定会落到 `thread_busy_running`。
+   2. 这不会单独新增 workspace/thread claim 冲突；没有 claim 的 thread 不会因为 `waitingOnApproval` 就额外变成跨 surface blocker。
+5. surface 交互 gate 仍由本地 queue/request/path-picker/capture 事实决定：
+   1. `PendingRequest` / `RequestCapture` 继续冻结 route mutation。
+   2. thread runtime status 不直接替代 `DispatchMode`、`ActiveQueueItemID`、`PendingRequests`。
+   3. 因此允许出现“thread authoritative status 已 idle，但当前 surface 仍有 queued/running queue item”的短暂并存态；两者分别回答不同问题。
+6. thread lifecycle notification 进入 state-only carrier，不等同于用户显式 route command：
+   1. `thread/archived` / `thread/unarchived` 只更新 `ThreadRecord.Archived`，影响列表可见性；不会立即 detach surface。
+   2. `thread/deleted` 会把命中该 thread 的 attached surface 清到 `R1 AttachedUnbound`，释放 thread claim，避免下一条输入继续发到已删除 thread；instance / workspace attachment 仍保留。
+   3. `thread/closed` 只通过 `RuntimeStatus=notLoaded` 表达 upstream unload，不会 detach surface，也不会清空当前 selection；后续 `/use` / 恢复仍按 notLoaded 规则处理。
+   4. `thread/goal/*` 只保存 latest state，不参与 route gate。`thread/settings/updated` 同步最新已确认的模型与强度，覆盖旧 snapshot 的同名值；共享 Codex 的精确选中会话会追加只读模型设置提示，重复值不重复投递。
+
+### 3.3 执行状态
+
+| 代号 | 条件 | 含义 |
+| --- | --- | --- |
+| `E0 Idle` | `DispatchMode=normal`，无 active，无 queued | 空闲 |
+| `E1 Queued` | `QueuedQueueItemIDs` 非空，`ActiveQueueItemID == ""` | 有待派发远端输入 |
+| `E2 Dispatching` | `ActiveQueueItemID` 指向 `dispatching` | prompt 已发给 wrapper，turn 尚未建立 |
+| `E3 Running` | `ActiveQueueItemID` 指向 `running` | turn 已进入执行 |
+| `E4 PausedForLocal` | `DispatchMode=paused_for_local` | 当前 surface 的远端派发被暂停；现有来源包括本地 VS Code 活动，以及 daemon 显式发起的 standalone Codex 升级或 current-thread patch 事务暂停 |
+| `E5 HandoffWait` | `DispatchMode=handoff_wait` | 本地刚结束，等待短窗口后恢复远端队列 |
+| `E6 Abandoning` | `Abandoning=true` | surface 已放弃接管，等待已有 turn 收尾后最终 detach |
+
+补充说明：
+
+1. 从 `2026-05-03` 起，`执行态 carrier` 与 `恢复态 carrier` 的 live mutation 已显式分到两个 sibling seam：
+   1. dispatch core 统一 owner `DispatchMode / ActiveQueueItemID / QueuedQueueItemIDs / pendingRemote / activeRemote / queue item fail-complete-promote`。
+   2. recovery core 统一 owner `PendingHeadless / attach-fail-expire / prompt-dispatch-restart reattach / disconnect-degraded-timeout teardown`。
+   3. 两者交界只保留显式 handshake：dispatch 在真正 `prompt.send` 前可以请求 recovery 先做 `prompt_dispatch_restart`，但 queue item 与 remote binding 的最终归属仍回到 dispatch core 收口。
+   4. 非 turn agent command（当前包括 `/model` 打开时触发的后台 `model.list`）不会调用 `BindPendingRemoteCommand`，也不会建立 `pendingRemote` 或进入 steer trace；其 response 只更新对应能力缓存，不参与 `E2/E3` 执行态。
+2. `E2 Dispatching` 当前只表示“本地 active queue item 已派发，真实 remote turn 还没完成建联”；它并不自动等价于“已有 live turn”。
+3. 从 `E1 Queued` 被前序 turn 完成、显式 resume、watchdog resume 或 instance reconnect 等非本次 enqueue 入口推进到 `E2 Dispatching` 时，若 queue item `SourceKind=user` 且有原消息 reply anchor，会追加 `TimelineTextQueuedMessageStarted` 回复原消息；同一次 enqueue 立即 dispatch、AutoWhip / AutoContinue 等内部来源不触发这条可见提示。
+4. 对 Claude backend，pre-start remote turn 的 stage-0 关联键当前先用 dispatch `CommandID`，再回退 `Initiator.SurfaceSessionID` 与 thread 信息；Claude translator 也会把 remote-surface initiator 显式带进 turn lifecycle。即使某些早期事件仍带 blank initiator，daemon 也会先把它视为 unknown，再通过 `CommandID` 命中 pending turn 并提升成真实 turn lifecycle；因此 backend/runtime 的早失败与 `start_new` 首条消息都不会再把 surface 永久卡在 `dispatching`。
+4.1. Feishu MCP 发送类工具和 Drive comments 工具当前也消费这套 remote turn 绑定：wrapper 发布 MCP URL 时只附带 caller instance id，daemon 在 tool call 时先按该 instance 查询 `activeRemote`，再查询 `pendingRemote`，并把产物或评论读取上下文绑定到命中的 `SurfaceSessionID`。工具参数里的 legacy `surface_session_id` 不参与路由；如果 caller instance 当前没有 active/pending remote turn，工具会 fail closed，不回退到 workspace surface context。
+5. `/detach` 在 `E2 Dispatching` 下当前分两类处理：
+   1. 若仍是 pre-start dispatch（`pendingRemote` 还没有 `TurnID`、没有 output、active item 仍是 `dispatching`），会立即把 active item 标成 failed、清掉 pending remote ownership，并直接 detach。
+   2. 只有已经存在真实 started remote turn、或 compact/steer 等仍需等待的 live work 时，才会进入 `E6 Abandoning`。
+6. `E6 Abandoning` 现在只覆盖“确实还有 live work 在收尾”的场景，不再把 pre-start dispatching 残留也一并塞进 watchdog-only 等待路径。
+7. `E6 Abandoning` 是 detach 的取消门，不是可恢复的 detached 状态：headless/VS Code 的自动恢复入口必须跳过 `Abandoning=true` 的 surface；detach-like action 的 durable resume target 清理必须先于任何可能释放 app mutex 的事件派发。
+8. Feishu room active reservations 不是新的 surface 执行态，而是 room context coordination overlay；当前 surface 自己的 `E2/E3` 不会被自己的 reservation 重复阻挡，但同 room 其它 surface 的普通 queued dispatch、AutoContinue scheduled dispatch、AutoWhip scheduled dispatch、review start/apply 和 headless replay 会在真正创建新 turn 前检查预算，并收到 `room_workspace_active` notice；其中自动 tick 路径会复用 active notice cooldown，避免每轮 tick 都追加同一条提示。
+9. reservation 的释放收口到各自 owner 的终止路径：queue item 的 turn completed/failed、pre-start detach abort、system/recovery fail、finalizeDetachedSurface 释放 queue-owned reservation；review session、pending headless/replay、Claude restart failure/timeout/disconnect 分别释放自己的 reservation；destructive room workspace reset 会额外清掉 room-level reservations。transport degraded 若仍保留真实 queue/remote ownership，保留对应 queue reservation，不提前放行同 room 新 turn。
+
+### 3.4 审阅态 overlay
+
+review mode 第一版当前不是新的 route state，而是挂在 surface 上的一层 detached review session overlay。没有 `ReviewSession` 时不在该 overlay；session 建立后按 `pending -> active -> ready` 推进。
+
+| 代号 | 条件 | 当前实现语义 |
+| --- | --- | --- |
+| `V0 Pending` | `ReviewSession.Phase=pending`；已记录 parent / target / source message，但 review thread 尚未由上游建立 | review start 已派发；普通文字、图片、文件均不进入业务路由。用户可等待建立，或通过 `/new`、detach-like route change 清理 overlay |
+| `V1 Active` | `ReviewSession.Phase=active`，且 `ParentThreadID`、`ReviewThreadID`、`AttachedInstanceID` 都非空；正常不变量是 `SelectedThreadID == ParentThreadID`，兼容恢复路径允许识别 `SelectedThreadID == ReviewThreadID` | review runtime 已建立但初始结果尚未固化，或 ready 后的显式追问已收到 `turn.started`；普通输入被 gate 拦截，已有 turn 可用 `/stop` 中断 |
+| `V2 Ready` | `ReviewSession.Phase=ready`，上述 thread / instance 字段完整，`LastReviewText` 已固化 | 初始审阅结果已固化；普通输入不会自动发往 review thread。只有最新结果卡的 `继续追问审阅` 可开启一次性纯文字 capture；追问 queued / dispatching 时 phase 暂时保持 ready，`turn.started` 后转 active，完成后恢复 ready |
+
+补充说明：
+
+1. `ReviewSession` 当前挂在 `SurfaceConsoleRecord`，字段包括：
+   1. `ParentThreadID`
+   2. `ReviewThreadID`
+   3. `InitialTurnID`
+   4. `ActiveTurnID`
+   5. `ThreadCWD`
+   6. `SourceMessageID`
+   7. `TargetLabel`
+   8. `PendingReviewText`
+   9. `LastReviewText`
+   10. `AwaitingFollowUpText`
+   11. `ActionMessageID`
+   12. `FrozenAccessMode`
+2. review thread 当前必须有显式 `ThreadRecord.Source.Kind=review`；parent thread 关系优先来自 `ForkedFromID`，其次来自 `ThreadSourceRecord.ParentThreadID`。Codex 原生 review 若先发出不带 `threadSource` 的 `thread/started`，随后 `review/start` result 再带回 `reviewThreadId` / `turn.id`，translator 会补发一条只承载 review metadata 的 `thread.discovered(remote_surface)`，由 orchestrator merge 到同一个 thread record。Claude/OpenCode review 则通过 queue item / `PromptDispatchPlan` / remote binding 上的 typed `Purpose=review` 物化相同 provenance；OpenCode 的 fork response 在 prompt/config gate 前就携带原 command/initiator correlation，因此 `thread.discovered` 阶段已经标记 `source=review`，即使后续 mode gate 失败也不会混进普通 picker。普通 `fork_ephemeral` 不会被推断成 review。
+3. 当前激活条件不是“点了某个前台按钮”，而是更底层的 runtime 事实：
+   1. 同一 attached instance 上已知某个 review thread
+   2. 该 review thread 命中了当前 surface 的 review runtime 事件：优先是 `turn.started(remote_surface)`；若 `review/start` result 晚于无 source 的 `thread/started`，则带 `reviewThreadId` / `turn.id` 的 late `thread.discovered(remote_surface)` 也能把 pending session 提升成 active；若上游这轮 `turn.started` 还没带回 surface 归属，则 `entered_review_mode` / `exited_review_mode` 生命周期 item 也会把 pending session 提升成 active
+4. 结果就绪有两种明确合同，不能互相替代：
+   1. detached review 是 review thread 上的普通 item / turn 流；首次激活时固化 `InitialTurnID`，该 turn 的非空 `agent_message item.completed` 会按 item id 去重并有序聚合到 review session 自己的 `PendingReviewText`，不依赖可被 plan / request / tool / compaction 提前消费的 UI pending-text buffer。只有同一 turn 成功 `turn.completed`，服务端才把聚合结果固化为 `LastReviewText` 并进入 `V2 Ready`；初始 turn 失败、中断或无结果完成会释放 reservation 并清掉 overlay，不留下 dead session
+   2. inline review 才消费 `entered_review_mode` / `exited_review_mode`；completed `exited_review_mode` 携带的非空 `review` 只在 `LastReviewText` 尚未固化时写入，后续追问 lifecycle 不得覆盖初始 apply payload
+   3. 2026-08-15 补充：detached 初始 review turn 失败时，orchestrator 会先向 surface 追加 `review_failed` 错误 notice（带 `临时会话 · 审阅` 标签），再释放 reservation 并清掉 overlay；没有可显示结果时不静默结束
+5. `SelectedThreadID == ParentThreadID` 是 detached review session 的选择不变量，不再是判断 `ReviewSession` 是否存在的唯一依据。若旧版本或异常投影曾把 `SelectedThreadID` 污染成 `ReviewThreadID`，显式追问、`退出审阅`、`按审阅意见继续修改` 会先尝试恢复 parent selection，再继续处理。
+6. 新发起 review 时，若当前候选线程本身是 `source=review`，服务端必须先回溯到它的 parent thread，再把 `review.start` 发给 parent；review thread 不能作为新的 review 启动目标。
+7. `V1 Active` / `V2 Ready` 都不会把 surface route 从 `pinned/follow` 改成新的 route 值。普通聊天框始终属于主线程；Review overlay 只负责在未显式选择动作时阻断普通文字/图片/文件，以及在 `AwaitingFollowUpText=true` 时消费恰好一条纯文字。图片和文件在 staging 前拒绝，不会变成后续主线程草稿。
+8. `继续追问审阅` 只接受最新 `ActionMessageID` 对应结果卡、ready 且无 queued / dispatching / running review work 的 session；按钮本身不发送 prompt，只设置一次性 capture。下一条纯文字冻结为 `resume_existing + ReviewThreadID + SourceThreadID=ParentThreadID + keep_surface_selection`，随后立即清 capture；capture 尚未消费时可用 `/stop` 取消本次追问输入并保留 ReviewSession。追问结果和 lifecycle 都不会覆盖初始 `LastReviewText`。
+9. `退出审阅` 在 ready 时直接退出；active turn 上会先按 review thread / turn 发送一次 interrupt，并保持 overlay 与 room reservation，直到匹配终态到达后再清理。queued / dispatching 但尚无可中断 turn id 时拒绝提前清理，避免孤儿 review child。`按审阅意见继续修改` 只接受 ready 且 review work 全部为空的 session，随后清理 overlay，并以新的 `prompt.send(resume_existing)` 把固化结果发回 parent thread。三个结果卡动作都要求命中最新 `ActionMessageID`；同 daemon 下的旧结果卡返回 `review_action_card_expired`，不能再改写当前 session。
+10. `ReviewSession` 明确记录 `Backend` 与 `ExecutorKind`，当前允许 `codex_native_detached`、`claude_fork_session` 和 `opencode_acp_fork`；surface backend、attached instance backend、session backend/executor 必须一致。backend mismatch 的文字、图片、文件和结果卡动作统一 fail closed；idle mismatch 会释放 reservation 并清 overlay。三种 backend 的 `/review` 均可见，OpenCode 以 approximation 暴露 ACP fork executor。
+11. 当前 review session 没有独立的 attach/list 暴露语义，也不会自动把 review thread 变成 surface 默认选中 thread；普通 attach/list/use 候选现在会显式过滤 `source=review` 的 detached review thread。OpenCode ACP 的 `thread.focused` 仍可更新 instance-level observed focus，但 follow surface 会把 `source=review` 视为不可跟随目标并保留当前 parent selection；review 结束或失败后也不会延迟误绑到 fork。
+12. 当 `ReviewSession.ActiveTurnID` 非空时，这层 overlay 还会进入统一 route-mutation blocker seam：`/use`、`/follow`、`/new`、`/claudeprofile`、`/codexprofile`、`/compact` 等会改工作目标的动作都会直接拒绝，并返回 `review_running`；只有 idle review session 会在 detach-like cleanup 或 route change 时被自动清掉。
+13. Claude `/review` 复用普通 queue/dispatch 生命周期，但启动 plan 固定为 `fork_ephemeral + SourceThreadID=parent + keep_surface_selection + Purpose=review`。wrapper 按同一 command id 重启 child，并以 `--resume parent --fork-session` 创建新 session；restart 后同一 command 的第二次翻译只发送 prompt，不会重复 fork。review child 使用专用 reviewer agent，工具面只开放 `Read/Glob/Grep`，明确禁用 Bash/Edit/Write/Task 等写入或任意执行能力；普通 Claude start/resume/fork 不继承 reviewer flags。
+14. OpenCode `/review` 使用同样的 typed fork plan。ACP 必须先收到 `session/fork` 的新 session，再确认其 `configOptions.mode` 含 `review`，依次发送 `session/set_config_option mode=review`、可选 `effort`，全部成功后才发送 `session/prompt`；review intent 忽略普通 plan override，不能把 fork 切回 `plan/build`。mode 缺失、set-config RPC error 或 prompt 前其他关联 `system.error` 都按 command id 回滚 dispatching queue item、ReviewSession、remote ownership 与 room reservation，不留下半死 overlay。
+15. OpenCode profile compiler 始终生成 `agent.review(mode=primary)`；API profile 的 `ReviewModel` 仅映射到 `agent.review.model`，空值继承主模型，不生成顶层 `review_model`。review agent 的 tools/access 均默认 deny，只显式允许 Read/Glob/Grep；translator 还会对 typed review session 的 permission request 与 `fs/write_text_file` 直接 fail closed，旧写授权也不能旁路。
+16. Claude/OpenCode 类 reviewer 不依赖 shell 读取 target。orchestrator 生成受控上下文：未提交 target 包含完整 changed-file manifest、staged/unstaged patch 与 untracked 内容；commit target 包含 manifest、元信息与 patch。超限时显式标注截断，manifest 保持完整，reviewer 可用只读工具补读文件。
+17. Codex 原生 detached review 在启动时按 parent thread、review CWD 与 surface capability settings 复用普通 prompt 的有效配置解析，并把结果写入 `FrozenAccessMode`；后续 `/permission` 只改变新 prompt 的 desired state，不追溯正在执行或 ready 后追问的该次 Review。旧/人工状态缺少冻结值时 fail closed。`ReviewSession` 是 daemon 内临时 overlay，当前 surface resume store 不跨 daemon 重启恢复它，本规则不新增持久化迁移。
+18. 2026-08-15 补充：API profile 的 headless launch 与 thread/resume 现在都会把 `review_model` 固定下来：显式 review 模型用 `ReviewModel`，`same_as_main` 用主模型，避免底层 Codex 回退到全局默认模型导致 review 以模型不支持失败。
+18. 只有 `Backend=codex + ExecutorKind=codex_native_detached + FrozenAccessMode=full_access`，且 instance、`ReviewThreadID`、当前非空 `ActiveTurnID` 与 request 精确匹配时，orchestrator 才可能在 request 入队前进入静默批准分支。白名单仅含 typed `approval_command`、`approval_file_change`、`approval_network`、`permissions_request_approval`，以及 request method 明确为 `execCommandApproval` / `applyPatchApproval` 的 legacy approval；typed approval 还必须实际暴露 `accept`。泛化 approval、plan confirmation、`request_user_input`、MCP elicitation、tool callback、Claude `can_use_tool` 和未知类型均按普通 request 路径展示或 fail closed。
+19. 静默批准不绕过 request lifecycle：approval 返回 `decision=accept`，permissions 返回原请求权限集合与 `scope=turn`；record 仍进入 pending/submitting 并等待 command ack 与上游 `request.resolved`，只是正常路径不生成 Feishu request card。surface 已有另一条 pending request 时不抢占，回退普通队列。若自动 response 的 command 被 translator/transport 拒绝，现有 restore 路径会把同一 request 转回可见 editing card 并追加失败 notice，因此不会形成无 UI 的永久 request gate。
+
+补充说明：
+
+1. 当前还存在一个**可叠加**的 steering overlay：
+   1. 某个 queued item 被点赞升级后，会离开 `QueuedQueueItemIDs`
+   2. 或者用户 reply 当前 processing 的 source message，且 reply 内容属于当前 v1 支持的文本 / 本地图片输入时，会创建一个临时 steering item；独立文件 reply 当前不会走 steering，而是保留为 staged file
+   3. 该 item 进入 `QueueItemStatus=steering`
+   4. 相关命令记录在 `pendingSteers`
+   5. OpenCode backend 当前不进入这层 overlay：`/steerall` hidden + reject，queued 点赞或 reply auto-steer 命中时返回 `opencode_steer_not_supported`，不创建 steering item、不发送 `turn.steer`
+2. 这个 overlay 不占用 `ActiveQueueItemID`，所以可以与 `E3 Running` 并存。
+3. steering ack 成功后，item 进入 `steered`；失败时恢复回普通语义：
+   1. 文本 / 图文 reply 恢复为普通 queued item
+   2. 独立图片 reply 恢复为 `ImageStaged`
+4. `E4 PausedForLocal` 当前有三条来源分支：
+   1. local-activity 分支由 `pauseForLocal(...)` 写入 `pausedUntil`，因此仍有 watchdog，并且后续可能进入 `E5 HandoffWait`。
+   2. standalone Codex 升级分支由 daemon 通过 `PauseSurfaceDispatch(...)` 显式写入；这条路径会主动清掉 `pausedUntil/handoffUntil`，因此不会被 `Tick()` watchdog 自动恢复，只会在升级事务显式 `ResumeSurfaceDispatch(...)` 时继续派发。
+   3. current-thread patch 事务同样由 daemon 通过 `PauseSurfaceDispatch(...)` 显式写入；它会暂停同一 instance 上所有 attached surface 的 dispatch，直到 patch apply / rollback 成功或失败收口后再显式 `ResumeSurfaceDispatch(...)`。
+
+### 3.4 输入门禁状态
+
+| 代号 | 条件 | 作用 |
+| --- | --- | --- |
+| `G0 None` | 无附加门禁 | 普通输入按主路由走 |
+| `G1 PendingHeadlessStarting` | `PendingHeadless.Status=starting` | headless 仍在启动 |
+| `G2 PendingRequest` | `PendingRequests` 非空 | 普通文本/图片/文件会被待处理请求门禁挡住；当前仍只有一套 pending request substrate，但卡面语义会按 `SemanticKind` 区分为 approval、`approval_command`、`approval_file_change`、`approval_network`、`request_user_input`、`permissions_request_approval`、`mcp_server_elicitation_form`、`mcp_server_elicitation_url`、`mcp_server_elicitation_approval`、`tool_callback` 等变体。顶层 `tool/requestUserInput` 与 `item` 形式共用同一 `request_user_input` gate；`mcp_server_elicitation_approval` 仍是 `mcpServer/elicitation/request` wire family，只把 `_meta.codex_approval_kind=mcp_tool_call` 的 approval 语义产品化为本次/本会话允许，`persist=always` 不开放持久授权；`tool_callback` 当前不会等待用户作答，而是以只读提示 + 自动 unsupported 回写的 fail-closed 方式短暂占用 gate，直到上游 `request.resolved` 清理 |
+| `G3 RequestCapture` | `ActiveRequestCapture != nil` | 下一条普通文本会被当成拒绝反馈 |
+| `G4 PathPicker` | 当前 surface 的 active path picker runtime 非空 | 当前存在一个仍有效的飞书路径选择器；core 只关心“gate 是否存在、是否阻断 competing UI / route mutation、confirm/cancel 后如何交给 consumer”，不关心目录浏览细节 |
+| `G5 TargetPickerProcessing` | 当前 surface 的 active target picker 处于 Git import 或 Worktree create processing | 当前存在一个仍有效的 Git/Worktree owner-card 业务流；普通文本/图片/文件、`/list`、`/use`、`/useall`、`/new`、`/follow`、`/detach`、bare config 与其它 competing card flow 都会被挡住并提示等待完成、取消，或使用 `/status`；只保留 `/status`、reaction/recall 与 `target_picker_cancel` |
+| `G6 AbandoningGate` | `Abandoning=true` | 只有 `/status`、`/autowhip` 与 `/autocontinue` 继续正常，其余动作被挡 |
+| `G7 VSCodeCompatibilityBlocked` | `ProductMode=vscode`，surface detached，且本机检测到“不能安全自动收口”的 VS Code 兼容性问题 | daemon 不再自动恢复 exact instance，也不再发普通“请先打开 VS Code”提示，而是改发必要的修复/失败反馈；legacy `editor_settings` 若已存在可接管入口，会先静默自动迁到 `managed_shim`，只有缺 target、自动迁移失败或 stale managed shim 时才真正停在这个 gate。若这张提示由 stamped `/mode vscode` 当前卡同步触发，则优先承接到当前卡，否则保持独立 runtime 提示 |
+| `G8 TurnPatchEditing` | daemon 侧存在当前 surface 的 active turn-patch flow，且 `stage=editing` | 当前 frontstage 被 patch 卡占用；只有同一张 patch 卡的 `request_respond` / `request_control` 与 reaction/recall 可以继续，其它动作会被挡住并提示先提交或取消 |
+| `G9 UpgradeOwnerFlowRunning` | daemon 侧 active upgrade owner-flow 处于 `running` / `cancelling` / `restarting` | 这是 daemon 顶层的独立升级 gate；只允许 `/status`、`/upgrade`、`/debug`、reaction/recall 与同一张升级卡自身动作继续，其它 competing 输入会被拒绝 |
+| `G10 StandaloneCodexUpgradeRunning` | daemon 侧 active standalone Codex upgrade transaction 非空 | 这是 daemon 顶层的独立 upgrade gate，不复用现有 `codex-feishu-relay` owner-flow。发起 surface 的普通输入会被直接挡住；其它真正依赖 standalone Codex 的 attached surface 会继续走“写入队列 + notice + `paused_for_local`”语义；VS Code surface / instance 当前完全排除在这条 gate 之外；非 queueable 命令/卡片动作当前仍直接拒绝。事务只有在 install 完成、child restart `ack` 已确认、且匹配的 restore outcome 成功/失败/超时收口后才会退出，不会在 bare restart ack 后提前解 gate |
+| `G11 TurnPatchTransactionRunning` | daemon 侧存在当前 instance 的 active turn-patch transaction | 发起 surface 与同 instance 上其它 attached surface 的状态改写类输入都会被挡住；当前只保留 `/status`、`/list`、`/help`、`/menu`、`/history`、`/debug`、reaction/recall 等查看类动作，直到 patch apply / rollback 收口。事务只会在 rollout 写盘后对应的 child restart 最终 outcome 成功，或在失败/超时后自动回滚并完成恢复 restart 收口后退出 |
+| `G12 BotCapabilitySettingsInvalid` | 合法 Feishu surface 对应的 gateway record 已存在，但 record 无法规范化或 storage key 与 record gateway 不一致 | capability effective read、配置与 lifecycle mutation、普通 action、queue 和 AutoContinue dispatch 全部 fail closed，不回退 raw surface；只保留 `/stop`、`/detach` 与 `/workspace detach` 释放执行和 route 资源。详细节流与恢复规则见 6.2 覆盖门禁 |
+
+补充说明：
+
+1. `ActivePathPicker` 当前是一个 coarse-grained modal overlay：
+   1. root / current / selected path、owner、expiresAt、consumer 元数据当前由 orchestrator service 持有的 per-surface runtime 记录承载，不再直接挂在 `core/state.SurfaceConsoleRecord` 上。
+   2. core 不引入新的 route mode，也不追踪“当前浏览到了第几层目录”这类 UI 细节。
+   3. core 只在两类地方感知它：
+      1. route-mutation / competing Feishu card flow gate
+      2. confirm / cancel 的 gate 清理与 consumer handoff
+      3. unauthorized 只回拒绝 notice，不清当前 gate
+   4. `ApplySurfaceAction()` 入口当前会先做一次 expired picker 清理：
+      1. 若 active path picker runtime 的 `ExpiresAt <= now`，先清 gate，再继续处理当前 action。
+      2. 这样即使用户不再点击旧 picker 卡片，只要发任意新动作，也不会卡在长期 `path_picker_active`。
+2. route-mutation blocker 当前不再由 `/use`、`/follow`、`/new`、`/compact`、`/claudeprofile`、`/codexprofile`等各自横向拼装，而是统一走一条查询 seam：
+   1. 当前 blocker 只会回答 `target_picker`、`path_picker`、`request_capture`、`pending_request`、`review_running` 这五类原因。
+   2. `review_running` 只在 `ReviewSession.ActiveTurnID` 非空时成立；idle review session 不再长期占用 gate，而是交给 route-change / detach-like cleanup 清掉。
+3. `G2 PendingRequest` 的 runtime source of truth 现在已经从 `Phase` / `PendingDispatchCommandID` 散写，收口到 `RequestPromptRecord.LifecycleState`：
+   1. 当前 live lifecycle 只认 `queued_inactive`、`awaiting_visibility`、`editing_visible`、`submitting`、`awaiting_backend_consume`、`resolved`、`aborted`。
+   2. queue promote 只在前一条 request 进入 terminal（`resolved/aborted`）后才发生；单纯 `command_ack.accepted` 不会放行后续 request。
+   3. `FeishuRequestView.Phase` 现在只是 frontstage 投影：`submitting` 与 `awaiting_backend_consume` 都映射成只读 `waiting_dispatch`；但卡面状态文案已进一步区分为“正在提交，等待本地后端接收”与“已提交，等待后端继续处理”两种语义。`PendingDispatchCommandID` 只保留为“本地尚未收到 accept/reject 的关联键”，不再是 gate source of truth。
+   4. 因此 `command_ack.accepted` 后，即使 `PendingDispatchCommandID` 已清空，surface 仍会继续被 `awaiting_backend_consume` gate 挡住，直到上游 `request.resolved` 或 owner terminal 路径显式 abort；若当前 request card 已拿到 `MessageID` owner anchor，daemon 还会继续 patch 同一张 sealed `waiting_dispatch` 卡，把状态文案从“正在提交”推进到“已提交，等待继续”。
+   5. `/status` snapshot gate 当前也不再只看 visibility：`GateSummary` 会同时投影 `PendingRequestLifecycle` 与 `PendingRequestVisibility`。因此 `/status` 既能说明队头 request 正处于 `submitting` / `awaiting_backend_consume`，也能继续说明卡片是在前台显示中、已可见，还是最近一次投递失败。
+   6. turn complete、detach、route lost、instance offline/transport degraded 这类 owner terminal 清理路径，当前都会先把命中的 request 标成 `aborted(+expired/cancelled phase)`，再移出 `PendingRequests`，不再直接 silent delete。
+
+### 3.4.1 context-bound overlay cleanup seam
+
+除了真正阻断路由的 gate 之外，surface 当前还有一组“随当前 attach / route 上下文生效”的 overlay runtime：target picker、path picker、thread history、review commit picker、workspace page，以及 idle review session。
+
+当前规则：
+
+1. 这些 overlay 的清理不再散落在 detach / `/use` / `/follow` / `/new` 各处，而是统一经由 cleanup seam 处理。
+2. 会触发这条 seam 的路径包括：
+   1. `finalizeDetachedSurface(...)`
+   2. `prepareSurfaceForExecutionReattach(...)`
+   3. `/use`、`/follow`、`/new`
+   4. `selected_thread_lost`、`thread_claim_lost`、follow retarget、victim release 这类 route retarget
+3. cleanup seam 同时负责两件事：
+   1. 清掉 runtime carrier。
+   2. 若旧 overlay 仍持有稳定 `message_id` / owner anchor，则主动把旧卡 patch 成 sealed `已失效` / 只读失败态，而不是等用户再点一次旧卡才发现失效。
+4. 当前会主动 seal 的 overlay 有：
+   1. workspace page
+   2. target picker
+   3. path picker
+   4. thread history
+   5. review commit picker
+5. 若旧 overlay 已失去稳定 anchor，则允许退化为“只清 runtime + 后续 callback fail-closed”；不会伪造补封。
+6. target-picker owner-subpage 里的 path picker 额外有一条优先级规则：
+   1. 若当前可见的是 path picker 子步骤，而 target picker 父卡其实隐藏在同一张 owner message 后面，则 cleanup 只 patch 可见子步骤。
+   2. 隐藏的 target picker runtime 只静默清掉，避免对同一张消息做重复或相互覆盖的失效 patch。
+7. 少数明确仍要让 target picker 持续接管当前卡的路径，会显式声明 `PreserveTargetPicker`：
+   1. target picker confirm 直接进入 `/use` / `/new`
+   2. fresh workspace headless prepare
+   3. pending headless reconnect 重新接回同一张 target picker owner card
+   4. 这些路径若还需要继续走内部 route mutation（例如 Git clone / worktree create 成功后，继续 attach 新 workspace 并进入 `new_thread_ready`），也必须把同一份 `PreserveTargetPicker` 语义贯穿到后续 continuation；否则会被 `G5 TargetPickerProcessing` 误判成 competing route mutation，形成“业务流自己挡住自己”的死状态。
+8. detach-like cleanup 还会统一清掉 idle review session；只有 running review turn 会保留 review runtime 并改走前面的 `review_running` blocker。
+
+### 3.5 草稿状态
+
+| 代号 | 条件 | 含义 |
+| --- | --- | --- |
+| `D0 NoDraft` | 无 staged image / staged file，无 queued draft | 没有待绑定输入 |
+| `D1 StagedAttachments` | `StagedImages` 中存在 `ImageStaged`，或 `StagedFiles` 中存在 `FileStaged` | 附件已到达，但尚未冻结到 queue item；图片直接作为 image input 带入，文件则会在真正 dispatch 时生成本地路径引用块 |
+| `D2 QueuedDrafts` | `QueuedQueueItemIDs` 非空 | 已冻结 route/cwd/override，等待派发 |
+| `D3 NewThreadFirstInput` | `RouteMode=new_thread_ready` 且已存在 queued/dispatching/running 的首条消息 | 新 thread 尚未落地，但本轮创建已占用 |
+
+关键区别：
+
+1. `D2` 已冻结路由。
+2. `D1` 还没有冻结路由，所以 route change 时必须显式处理。
+3. `D3` 不是独立 route state，而是 `R5` 上的附加约束。
+
+### 3.6 autowhip overlay
+
+`AutoWhipRuntimeRecord` 当前不是新的 route state，而是 surface 上附加的一层运行时 overlay；用户可见命令面当前统一叫 `autowhip`：
+
+| 代号 | 条件 | 含义 |
+| --- | --- | --- |
+| `A0 Disabled` | `AutoWhip.Enabled=false` | 当前 surface 不做 autowhip |
+| `A1 EnabledIdle` | `AutoWhip.Enabled=true`，`PendingReason==""` | 已开启，但当前没有待触发的 autowhip |
+| `A2 Scheduled` | `AutoWhip.Enabled=true`，`PendingReason!= ""`，`PendingDueAt` 非空 | 已记录一次待触发 autowhip，等待 backoff 到期并再次过门禁 |
+
+补充说明：
+
+1. `A2 Scheduled` 不会直接占用 `ActiveQueueItemID`。
+2. 真正 enqueue autowhip item 发生在 `Tick()`，而不是 `turn.completed` 同步路径里。
+3. `A2 Scheduled` 只有在下列条件同时满足时才会真正发出：
+   1. surface 仍 attached
+   2. `DispatchMode=normal`
+   3. 没有 `PendingHeadless` / `PendingRequest` / `RequestCapture` / `Abandoning`
+   4. 当前没有 live remote work
+4. autowhip queue item 的 reply anchor 与 pending projection 当前已显式拆开：
+   1. 最终回复仍挂回原用户消息
+   2. queue / typing / reaction 不再回写到原用户消息
+5. autowhip 的系统提示当前分三类：
+   1. `incomplete_stop` 不会在 schedule 瞬间发 notice，而是在真正从 `A2 Scheduled` 转成实际补打时发一条 `AutoWhip` notice：`Codex疑似偷懒,已抽打 N次`
+   2. 若 final assistant 文本命中收工口令，则不会继续 schedule / dispatch，而是立刻发一条 `AutoWhip` notice：`Codex 已经把活干完了，老板放过他吧`
+   3. 若 `incomplete_stop` 已达到连续补打上限，则会回一条停止 notice，并清空当前 autowhip runtime
+
+### 3.7 autoContinue overlay
+
+`AutoContinueRuntimeRecord` 当前也是 surface 上附加的一层运行时 overlay；用户可见命令面当前统一叫 `autocontinue`：
+
+| 代号 | 条件 | 含义 |
+| --- | --- | --- |
+| `R0 Disabled` | `AutoContinue.Enabled=false` | 当前 surface 不做上游失败自动继续 |
+| `R1 EnabledIdle` | `AutoContinue.Enabled=true`，`Episode==nil` | 已开启，但当前没有待自动继续的 episode |
+| `R2 Scheduled` | `AutoContinue.Enabled=true`，`Episode.State=scheduled` | 已记录一次待自动继续 episode，等待可派发或 backoff 到期 |
+| `R3 Running` | `AutoContinue.Enabled=true`，`Episode.State=running` | 当前正在执行一次自动继续尝试 |
+| `R4 TerminalRetained` | `AutoContinue.Enabled=true`，`Episode.State=failed/cancelled` | 当前 episode 已停止；保留最后一次状态，等待用户切换目标、关闭 `/autocontinue`，或新的 episode 覆盖 |
+
+补充说明：
+
+1. autoContinue 只承接 `terminalCause=autocontinue_eligible_failure`：
+   1. `completed`、`user_interrupted`、`startup_failed`、`nonretryable_failure`、`transport_lost` 都不会进入这条 overlay。
+   2. 这层资格由 orchestrator 本地 `problem -> terminalCause` 分类统一拥有；当前只接受 layer 属于 `""/codex/gateway`，且 code 命中 `responseStreamDisconnected`、`responseTooManyFailedAttempts`、`serverOverloaded`、`other` 的问题，不再依赖 upstream `willRetry/problem.Retryable`。
+   3. translator 已把 `turn.start/thread.resume` 前置拒绝与真正 runtime failure 分开，因此 autoContinue 不会误接管“turn 还没真正开始”的失败。
+2. autoContinue queue item 是独立来源：
+   1. `SourceKind=auto_continue`
+   2. 真正 dispatch 前不会伪造用户 pending / typing / reaction
+   3. 恢复 prompt 固定为系统生成的“请从中断处继续”
+3. autoContinue 的 dry-failure backoff 当前固定为：
+   1. 第 1、2 次连续空失败：立即重试
+   2. 第 3 次：`2s`
+   3. 第 4 次：`5s`
+   4. 第 5 次：`10s`
+   5. 第 6 次连续空失败：直接进入 `failed`
+4. 一旦某次恢复尝试出现任何输出，下一次再失败时会把 dry-failure 计数重置回“第一次立即重试”。
+5. autoContinue 调度优先级高于普通 queued item：
+   1. `dispatchNext(...)` 会先检查 pending autoContinue，再考虑普通 queue
+   2. 用户新消息与已排队消息会保留在原队列里，不会被丢弃
+6. autoContinue 状态卡与真正业务输出当前显式拆开：
+   1. 状态卡 reply 到原始用户消息
+   2. 后续自动继续链路里的 final / request / plan / image / progress 继续沿用原始 reply anchor，不会改挂到状态卡下面
+   3. 状态卡只允许在自己仍是当前 surface 尾消息时 patch；一旦后面出现更新消息，就冻结旧卡，后续状态改为 append 新卡
+7. autoContinue episode 当前不会跨目标长期悬挂：
+   1. `/detach`
+   2. `/new`
+   3. `/use` / `/follow` 等显式 route mutation
+   4. 目标 thread 丢失或被强踢
+   以上路径都会清掉当前 episode，只保留 `/autocontinue` 的 enable 开关
+8. 若某个 episode 来自 `keep_surface_selection` detour：
+   1. surface 当前选中的 thread 仍以 source/main thread 为准
+   2. 但真正的 retry 目标仍会继续打到 execution thread
+   3. 因此 detour 的 autoContinue 不会因为 `SelectedThreadID != executionThreadID` 被误清理
+
+## 4. 当前已实现的不变量
+
+### 4.1 `codex` 的 `workspace` 命令族先打开工作会话页面或业务卡，confirm 后再改 route
+
+当前 `codex` 的工作会话主展示已经切到 `workspace` 命令族：bare `/workspace` / `/workspace new` 负责父页导航，`/workspace list` / `/workspace new dir` / `/workspace new git` / `/workspace new worktree` 负责四张独立业务卡；`/list` / `/use` / `/useall` 只保留 alias，并在 `codex` 下汇合到 `/workspace list`。
+
+对应实现里：
+
+1. target picker 的 workspace 候选按入口分成 attach / list / worktree-base 三种模式。
+   1. 在线实例先按 thread 真实 `CWD` 判断实例归属，再按有效 `WorkspaceKey` 归并 workspace；稳定 `WorkspaceKey` 仅在等于 `CWD` 或为其父目录时保留，两者脱节时回退到 `CWD`。全局 `threads.snapshot` 中未指定工作区的 thread，只有 `CWD` 属于当前实例时才继承实例工作区，否则使用其真实 `CWD`，避免预热池或无关实例污染会话归属。只有当某个 instance 当前完全没有可见 thread，或 thread 侧缺失稳定 root 时，才回退到该 instance 的 `WorkspaceKey/WorkspaceRoot`。
+   2. merged thread views / persisted recent threads 仍会把 recoverable-only workspace 补进候选。
+   3. attach 模式仍会过滤 busy workspace，以及既不能 attach 也没有 recoverable thread 支撑的 workspace。
+   4. `/workspace list` / `/list` 的 list 模式会把 busy Git workspace 保留为 Worktree base；它不会暴露旧会话或新建会话，只暴露 `worktree_create` 操作。busy 非 Git workspace 仍过滤。
+   5. `/workspace new worktree` 与 list 内部 Worktree 子页使用 worktree-base 模式，只保留可识别的 Git workspace；busy Git workspace 可以作为基准工作区。
+   6. 若 surface 带有 `PendingHeadless`，target picker 默认高亮、`new_thread` success 判断、Git import / Worktree processing continuation 与 cancel 匹配，都用 `state.ResolveHeadlessResumeWorkspaceKey(pending.WorkspaceKey, pending.ThreadCWD)` 判定工作区身份；不再直接 `FirstNonEmpty(WorkspaceKey, ThreadCWD)`。当 `ThreadCWD` 不在 `WorkspaceKey` 下时，以 `ThreadCWD` 作为当前 workspace claim，避免旧 workspace root 误接管新路径。
+2. bare `/workspace` / `/workspace new` 的直接动作，以及 `codex headless` 下从菜单首页点 `工作会话`，当前都会先产出 `UIEventFeishuPageView`。
+   1. bare `/workspace` 固定打开工作会话父页，展示 `切换`、`从目录新建`、`从 GIT URL 新建`、`从 Worktree 新建`、`解除接管` 五个入口。
+   2. bare `/workspace new` 固定打开新建方式子页，展示 `从目录新建`、`从 GIT URL 新建` 与 `从 Worktree 新建` 三个入口。
+3. `/workspace list` 的直接动作，以及 headless 主链下的 `show_*` 同上下文导航，现在都会产出 `UIEventFeishuTargetPicker`。
+   1. `/workspace list` 与 alias `/list` / `/use` / `/useall` / `show_workspace_threads` 都直接打开 `Page=target`。
+   2. attached `/use` 会预填当前 workspace；`/useall` 与 workspace-scoped 入口仍允许跨 workspace，但不会锁死选择。
+   3. 当前没有已有 workspace 时，不会再退回旧的 `模式` / `来源` 页；切换卡会直接落在 `目标` 页，并通过阻塞消息告诉用户先走新建路径。
+   4. `attach unbound`、`selected_thread_lost`、`thread_claim_lost` 这类被动恢复入口当前也走同一套 `UIEventFeishuTargetPicker`，但会打开锁定当前工作区的变体：隐藏工作区下拉，只允许在当前工作区内重新确认会话或继续 `new_thread`。
+4. `目标` 页下，“会话 / 操作”下拉始终基于当前选中的 workspace 动态重建。
+   1. 对可接管 workspace，先列该 workspace 下当前可接管或可恢复的 thread。
+   2. picker 首次打开时，只有 surface 当前已经绑定到该 workspace 的某个 `SelectedThreadID`，且该 thread 仍在候选里，才默认选中该 thread。
+   3. 如果当前 workspace 虽然已选中，但 surface 处于 unbound / detached，或者当前路由并不属于这个 workspace，则会话下拉保持空值，不再回退到“第一个可恢复 thread”。
+   4. 只要用户随后切换了工作区，当前会话选择就会被显式清空，卡片回到“未选会话”占位态；必须重新选择后才能 confirm，不再 silent fallback 到新的默认会话。
+   5. 工作区下拉只显示真实 workspace，不再混入动作型来源项；busy Git workspace 在 `/workspace list` / `/list` 中会以“仅 Worktree base”能力出现，busy 非 Git workspace 与不可接管 workspace 不进入主路径。
+   6. workspace label 足够时只显示 label；只有 basename 冲突时，才会额外补路径 meta 做消歧。
+5. `/workspace new dir`、`/workspace new git` 与 `/workspace new worktree` 的主卡会直接打开各自业务页，不再先经过共同的模式 / 来源向导。
+   1. `从目录新建` 主卡会显示路径字段、`选择目录` 按钮与 `接入并继续` 主按钮。
+   2. `从 GIT URL 新建` 主卡会内联保存 `repo_url` / `directory_name` 草稿，并通过 `target_picker_open_path_picker` 选择父目录；底部动作为 `取消 / 上一步 / 克隆并继续`。
+   3. `从 Worktree 新建` 主卡会显示基准工作区 dropdown、新分支名 input、可选目录名 input 与只读目标路径预览；底部动作为 `取消 / 返回上一层 / 创建并进入`。
+   4. Git / Worktree 两条路径都把草稿保存在 active target picker runtime 里，不进入 `PendingRequest`。
+6. 选择工作区、选择会话，或从主卡打开 path picker 子步骤时，只会刷新 target picker 本身或其子步骤，不会立即 attach / switch。
+   1. `/workspace list` 主路径用的是 `target_picker_select_workspace` / `target_picker_select_session`。
+   2. `/workspace new dir` / `/workspace new git` 主路径用的是 `target_picker_open_path_picker`；`/workspace new worktree` 主路径则复用 `target_picker_select_workspace` / `target_picker_page` 刷新基准工作区 dropdown。
+   3. `/workspace list` 中选择 `worktree_create` 后，当前 owner card 会进入 Worktree 子页；`target_picker_back` 只在这条内部子页路径上返回原 target 页。
+   4. 这些回调属于 same-context pure navigation，满足 daemon freshness 时会 inline replace 当前卡；`target_picker_cancel` 也会 inline replace，但它的效果是把当前 owner card 收束成 sealed terminal，并清掉 active picker / owner-card flow。
+7. 真正的产品状态变化只发生在 `target_picker_confirm`。
+   1. `/workspace list` 选既有会话时，复用现有 `/use` / `use_thread` / cross-workspace attach 语义；必要时会先统一经过 `resolveWorkspaceContract(...)` 与对应的 workspace continuation owner，再落到 attach / restart-managed / fresh-start 的单一路径。
+   2. `/workspace list` 选 `worktree_create` 时，只切到同一 owner card 的 Worktree 子页，不创建目录、不改 route；用户在子页填写分支名/目录名并再次确认后才进入 Worktree 创建链路。
+   3. `/workspace new dir` 下，`target_picker_open_path_picker` 会先打开目录 path picker；confirm/cancel 回调会先异步 ack，再把最新主卡 patch 回同一张 owner card。主卡只要已经回填出有效目录，`target_picker_confirm` 就会继续：若命中已知 workspace，则直接复用该工作区并进入新会话待命；若不是已知 workspace，则把该目录解析成 workspace，并按 `PrepareNewThread=true` 的语义进入 `R5` / fresh headless `R5` 路径。
+   4. `/workspace new git` 下，主卡会内联保存 `repo_url` / `directory_name` 草稿，并通过 `target_picker_open_path_picker` 选择父目录；`target_picker_confirm` 随后直接下发 daemon-side `workspace.git_import` 命令。
+   5. `/workspace new worktree` 下，主卡会内联保存 `target_picker_worktree_branch_name` / `target_picker_worktree_directory_name` 草稿，并允许同卡切换基准工作区；`target_picker_confirm` 会先 dry-run 检查群 workspace change gate，通过后才下发 daemon-side `workspace.git_worktree.create` 命令。
+   6. Git import 的 path picker cancel 不会改 route，只会回到 target picker 主卡；clone 成功但 flow stale 时会回 stale notice 并保留本地目录；若后续 attach / prepare 失败，则会把同一张 owner card 封成 failed terminal，并明确目录已保留。
+8. `target_picker_confirm` 当前还有一条显式防呆。
+   1. 若用户按下确认时，工作区或会话候选已经变化到不再包含原选择，服务端不会再 silent fallback 到别的默认候选。
+   2. 当前行为是追加一张最新 target picker + `target_picker_selection_changed` notice，要求用户在最新卡片上重新确认。
+8. 旧的 headless grouped workspace/thread selection cards 不再是主路径。
+   1. 当前不再保留旧 `create_workspace` transport 兼容入口；headless 主链的新工作区路径统一走 `/workspace new dir` / `/workspace new git` / `/workspace new worktree` 这三张业务卡。
+   2. `show_all_workspaces` / `show_recent_workspaces` / `show_workspace_threads` / `show_all_thread_workspaces` / `show_recent_thread_workspaces` 在 headless 主链下当前都退化成“用指定 source / workspace 重新打开 target picker”的兼容导航入口。
+   3. 被动恢复路径也不再回到旧 scoped selection prompt；一律刷新锁定当前工作区的 target picker，并拒绝 silent fallback。
+9. confirm 后真正 attach / switch 时，`attachWorkspace()`、`attachSurfaceToKnownThread()` 与 `startHeadlessForResolvedThread()` 在 headless 主链下仍然会先走 `workspaceClaims`，再进入现有 `instanceClaims` / `threadClaims`。
+
+结果：
+
+1. 同一个 workspace 当前最多只允许一个 headless surface 占有。
+2. 第二个 headless surface 如果试图通过 target picker attach/switch 到同 workspace，或通过 `/use` / headless 恢复到该 workspace，会直接收到 `workspace_busy`。
+3. 同一个 instance 仍然只能被一个飞书 surface attach；也就是说 instance claim 还在，只是已经退回到 workspace claim 之后。
+4. 不会进入“workspace 仲裁层已经冲突，但仍然 attach 成功”的半 attach 状态。
+5. 通过旧 `attach_workspace` 兼容入口时，成功后仍会落到 `R1 AttachedUnbound`；而 `/workspace list` confirm 既有会话时会直接落到 `R2`，`/workspace new dir` / `git` / `worktree` confirm 成功时则会进入 `R5`。
+6. managed headless instance 一旦已经被 retarget 到某个精确 workspace，后续 `thread.focused` / `threads.snapshot` 里的更宽父目录 `cwd` 当前不会再把它的 `WorkspaceRoot` 回退成父目录，避免 `/status` 与 `/use` 再次出现“实例显示是 A，实际 thread 在 B”的分裂态。
+
+### 4.1.1 当前 live 的 `claude` 命令面继续复用同一工作会话壳，但已回退 review / patch 主展示入口
+
+当前 `claude` 不再沿用 `codex` 的 `workspace` 主入口投影，但会继续复用同一套 workspace/session route contract 与 target picker 壳。
+
+注意：这段描述的是 **当前 live code** 的一轮 dev-only Claude 暴露面，不是 2026-04-29 已批准的下一轮 MVP 产品边界；后者改以 [Claude Backend Integration Plan](../inprogress/claude-backend-integration-plan.md) 第 `7.6` 节为准。
+
+对应实现里：
+
+   1. `ResolveFeishuCommandSupport()`、`ResolveFeishuCommandDisplayProfileForContext()` 与 display-group projection 当前共用同一 command support profile，把 Claude visible MVP 与静态 dispatch 支持固定为：
+   1. `current_work` 只保留 `/stop`、`/new`、`/status`。
+   2. `switch_target` 保留 `/workspace new dir`、`/workspace detach`、`/list`、`/use`。
+   3. `send_settings` 当前显式开放 `/reasoning`、`/permission`、`/plan`、`/verbose` 与 backend 互斥的 profile 入口：
+      - `codex headless` 可见 `/codexprofile`
+      - `claude headless` 可见 `/claudeprofile`
+      - `opencode headless` 可见 `/opencodeprofile`
+      - `vscode` 不显示这些 backend profile 入口
+      - Feishu 群聊 context 下会隐藏 `/mode`、provider/profile、`/model`、`/reasoning`、`/permission`、`/plan` 这些 bot 能力设置入口，只保留 `/verbose` 等 surface/context 设置
+   4. `common_tools` 当前显式开放 `/history` 与 `/sendfile`。
+   5. `/review`、`/bendtomywill` 与 `/autocontinue` 继续 hidden + reject，不会在 Claude mode 下伪装成可用入口。
+   6. 裸 `/detach`、其余 `workspace*` 与 `/useall` 当前是 hidden + allow 兼容入口：不出现在 Claude 主展示菜单里，但仍由同一 support profile 显式允许，供 target picker / 旧 slash / 子页回退继续复用同一工作区与会话壳。
+2. `/list` 与 `/use` 当前继续复用 headless workspace-session target picker 壳，不另造一套 Claude 专用卡。
+3. 但 target picker 的 workspace/session 候选已经只按当前 backend 过滤：
+   1. `mergedThreadViews()` 只合并当前 headless backend 的在线实例。
+   2. `normalModeListWorkspaceSetWithViews()`、`targetPickerWorkspaceEntries()` 与 `buildWorkspaceSelectionModel()` 只保留当前 backend 的在线 workspace。
+   3. workspace/session 候选现在统一依赖 backend-scoped online/recoverable workspace 集合与 `resolveWorkspaceContract(...)` 结果；不再保留按 `ClaudeProfileID` 缩窄同 backend 候选的旧 helper 路径。
+   4. Claude headless 不再把 persisted Codex recent threads/workspaces 混进 `/list` / `/use` 候选。
+   5. detached `/use`、headless startup resume 与 concrete headless restore 现在也会按当前 backend 读取 persisted exact-thread metadata；Claude 可以消费 persisted Claude session，但不会误吃 Codex sqlite thread。
+4. `/mode claude` 若切换前已有当前 workspace，不会只留下 detached surface：
+   1. 优先 attach 同 workspace 的在线 Claude instance。
+   2. 若当前没有可 attach 的 Claude instance，则直接起 fresh managed headless，并把该 workspace 记成 `PendingHeadless.ThreadCWD`。
+5. Claude runtime 只有在目标 thread 能解析成“当前 workspace 下真实可恢复的 Claude session”时，才会为了 `prompt.send` 触发内部 child restart；普通新会话的目标 thread 壳值不会误判成 session switch。若当前 child 正处于一个通过 `--resume` 恢复出来的旧 session，而 surface 显式要求 `PromptExecutionMode=start_new + threadID=""`，wrapper 会先 fresh-restart child，并同步清掉旧的 expected-resume 影子状态，保证 `/new` 首条消息真正创建新 Claude session，而不是被旧 session 吞回去。
+6. `/claudeprofile` 当前是 Claude headless 专属的 gateway/bot 级配置入口，只允许在私聊发起；当前 surface 负责承接切换后的 route 清理与重启：
+   1. bare `/claudeprofile` 会打开 dropdown 参数卡，候选固定为内置 `default` 加当前持久化 profile 列表。
+   2. 只有 `ProductMode=normal && Backend=claude` 时允许切换；其他 mode/backend 会直接拒绝并要求先 `/mode claude`。
+   3. request gate、`PendingHeadless`、live remote work 与 delayed-detach 当前都会阻断 profile 切换，不会让 surface 进入半重启状态。
+   4. detached idle 私聊切 profile 时，canonical bot transaction 只更新 record 的 `ClaudeProfileID`，保留其它私聊最新写入的 `PlanMode / PromptOverride`；结果投影到同 gateway surface，不从发起 surface 整记录覆盖其它字段。只有不使用 bot capability record 的 non-canonical local surface 会在没有当前 workspace 时沿用本地 `PlanMode / PromptOverride` reset，这条 local cleanup 不会写入 gateway record。
+   5. 当前 workspace 已占用时，切 profile 会先 detach-like 清理旧 runtime，再按目标 `workspace+profile` 快照恢复飞书临时 `ReasoningEffort / AccessMode` override，并把 `PlanMode` 归零、`Model` 清空；随后按切换前的 continuation intent 直接重启到新 profile：原来只是 workspace-owned `unbound/new_thread_ready` 时走 `workspace_route_restart`，保留当前 workspace claim 并在连回后恢复 workspace route；原来已经 pinned 到某个 Claude thread 时，会保留该 exact-thread 恢复目标并直接拉起新的 thread-restore headless，而不会要求用户重新 `/use`。
+   6. 若切换前当前 surface 接着的正是一个 Claude managed headless，切 profile 时还会先显式 kill 旧 child，再启动新 profile 对应的 child，避免 surface 被错误地重新 attach 回“旧 profile 但同 workspace”的在线实例。
+7. `ClaudeProfileID` 的业务 owner 是 gateway/bot record，surface 同名字段只是 runtime projection：
+   1. `/mode claude`、workspace attach、visible resume 与 fresh/preselected headless launch 都读取 effective bot contract，并把 profile 投影冻结到当前执行合同。
+   2. bot record 的 Claude profile 为空时会规范化为内置 `default`；切到其它 backend 时仍保留这份非活动选择。
+   3. daemon 重启时 `surface resume state` 里的 `ClaudeProfileID` 只用于 latent route materialize 的执行 hint；bot capability store 随后覆盖合法 Feishu surface 的能力投影，resume entry 不能反向写回或成为第二 owner。
+8. daemon 在 fresh/preselected headless launch 时，会只消费 orchestrator 已冻结下来的 headless launch contract：
+   1. `PendingHeadless` 与 `DaemonCommandStartHeadless` 当前都会显式携带 `Backend / CodexProfileID / ClaudeProfileID / OpenCodeProfileID / OpenCodeAdmissionRef / OpenCodeRuntimeAccessMode`；若 frozen backend 是 `claude`，还会额外带 `ClaudeReasoningEffort`。`OpenCodeRuntimeAccessMode` 为空表示不写 OpenCode permission overlay，继承本机默认。
+   2. daemon 不再在真正启动时回读 live surface backend；若 `headless.start` 命令本身缺少 frozen backend contract，会直接按启动失败收口，而不是再隐式借值。
+   3. 实际注入环境时仍会落 `CODEX_FEISHU_RELAY_INSTANCE_BACKEND=<frozen backend>`；若当前 frozen backend 是 `claude`，daemon 会把 `ClaudeProfileID` 与显式 reasoning 冻结成 wrapper-private Claude runtime settings contract，wrapper 再把它写成临时 `--settings <file>` overlay。contract 中的 reasoning 仍遵循统一规则：始终设置 `CLAUDE_CODE_EFFORT_LEVEL`，`high / max` 额外设置 `CLAUDE_CODE_DISABLE_ADAPTIVE_THINKING=1`，并清掉 `CLAUDE_CODE_DISABLE_THINKING`。这样 Claude headless 会按正确 profile 与显式推理强度启动，而不是默回 Codex、默回别的 Claude profile，或继续沿用旧 reasoning；同时 built-in `default` 不会平白把当前 shell 里的 Claude env 固化成 overlay。若 frozen backend 是 `opencode`，daemon 会按 frozen `OpenCodeProfileID/OpenCodeAdmissionRef/OpenCodeRuntimeAccessMode` 编译 `opencode-acp` launch env；API profile 缺少 matching admission ref 或 revision 不存在时 fail closed，默认 `op_default` inherit profile 允许无 ref 启动，runtime access 非空时额外写 OpenCode permission overlay。
+9. Claude profile 只改变启动时冻结给 wrapper/Claude child 的 endpoint、auth token、model 与 reasoning contract；它不会改写或创建 profile 专属 `CLAUDE_CONFIG_DIR`。wrapper 只会为 managed keys 额外写临时 `--settings` overlay，用来盖过用户 Claude config 里的同名 `settings.env`，不会切断其他用户配置。因此 exact-thread 恢复、session catalog 与 history 继续共享同一个 Claude 会话目录视图，不能因为切换 `ClaudeProfileID` 把同一组 session 分裂成多套。
+10. Claude `/reasoning` 当前也已并入统一的 dispatch 前 preflight，而不再只是 surface 上的 UI 值：
+   1. 当前 turn 与已冻结 queue item 不会被 `/reasoning` 回改。
+   2. Claude 可选档位是 `low / medium / high / max / clear`；`xhigh` 只属于 Codex/VS Code 投影，Claude 下会被拒绝。
+   3. `workspace+ClaudeProfileID` 快照会保存 Claude reasoning override，`/reasoning clear` 会同步删除空快照；fresh workspace 与 concrete thread restore 都在生成 `PendingHeadless` 和 daemon start command 前先恢复快照。
+   4. 普通 queue dispatch、auto-continue 与 review apply 都会在真正 `prompt.send` 前，用各自 frozen override 生成 `desired headless launch contract`，再与 wrapper hello 上报的 observed runtime contract 比较。
+   5. 合同一致时直接发送；不一致时会进入 `PendingHeadless(Purpose=prompt_dispatch_restart)`，先显式 kill 当前 managed headless，再 fresh-start 匹配 reasoning 的新实例。
+   6. 新实例连回后只做最小 reattach，不会重置 queue、review session 或 auto-continue runtime；统一 dispatch owner 会继续把原始 prompt 发出去。
+   7. Claude `/permission` 与 `/plan` 仍保留动态 permission-mode 通道，不并入这条 Claude reasoning restart-only 合同；OpenCode `/permission` 另按 `OpenCodeRuntimeAccessMode` relaunch-backed 合同处理。
+   8. `/model` 在 Claude 模式下 hidden + reject；Claude 模型只来自 profile 注入，Codex 默认模型与模型覆盖不会投影成 Claude prompt 配置。
+11. `/codexprofile` 当前是 Codex headless 专属的 gateway/bot 级 Profile 配置入口，只允许在私聊发起；旧 `/codexprovider` 不再解析为有效命令。当前 surface 负责承接切换后的 route 清理与重启：
+   1. bare `/codexprofile` 会打开可分页 dropdown 参数卡，候选来自 daemon materialized canonical Codex Profile catalog：native Profile、可用 OAuth Profile 与可用 API Profile 可选；legacy Provider catalog 不会反向合成 Profile 候选。缺 secret、OAuth 不可用或探测未知的 Profile 只作为只读状态说明展示，不进入 callback 可选项。
+   2. 只有 `ProductMode=normal && Backend=codex` 时允许切换；其他 mode/backend 会直接拒绝并要求先 `/mode codex`。
+   3. request gate、`PendingHeadless`、live remote work 与 delayed-detach 当前都会阻断 Profile 切换，不会让 surface 进入半重启状态。
+   4. detached idle 私聊切 Profile 时，只更新 bot record 的 canonical `CodexProfileID`；结果投影到同 gateway surface，但不会从发起 surface 整记录覆盖其它参数。
+   5. 当前 workspace 已占用时，切 Profile 会先按切换前状态规划 continuation，再 detach-like 清理旧 runtime，并重启到新 Profile：原来只是 workspace-owned `unbound/new_thread_ready` 时走 `workspace_route_restart`，保留当前 workspace claim 并在连回后恢复 workspace route；原来已经 pinned 到某个 Codex thread 且模型组不变时，会保留该 exact-thread 恢复目标并直接拉起新的 thread-restore headless；若模型组从 `gpt` 切到 `non_gpt` 或反向切换，则不恢复旧 thread，而是保留 workspace、走 `workspace_route_restart + PrepareNewThread=true` 并进入新会话待命。
+   6. 若切换前当前 surface 接着的正是一个 Codex managed headless，切 Profile 时还会先显式 kill 旧 child，再启动新 Profile 对应的 child，避免 surface 被错误地重新 attach 回“旧 Profile 但同 workspace”的在线实例。
+
+### 4.1.2 `opencode` 复用 headless 工作会话壳，但 profile/admission 独立冻结
+
+当前 `opencode` 是第三条 headless backend，不是泛化 `acp` 模式。它复用 `codex`/`claude` 已有的 workspace/session route contract、target picker、`PendingHeadless`、queue/dispatch/request gate，但 profile、launcher、observed config 和 unknown slash preflight 都是 OpenCode 私有规则。
+
+对应实现里：
+
+1. command display profile 当前固定为：
+   1. `current_work` 显示 `/stop`、`/new`、`/status`；`/new` 标为 approximation，沿用现有会话控制壳；`/steerall` hidden + reject，OpenCode ACP 当前不支持把补充输入并入当前执行。
+   2. `send_settings` 显示 `/reasoning`、`/permission`、`/plan`、`/verbose`、`/opencodeprofile`；`/model` hidden + reject。OpenCode 模型仍来自 profile 或原生配置；`/reasoning` 通过 ACP session `effort` 动态切换，`/plan` 通过 ACP session `mode` 动态切换。
+   3. `switch_target` 显示 `workspace` 命令族；`/list`、`/use`、`/useall`、裸 `/detach` hidden + allow，继续作为旧 slash / target picker 回退入口。
+   4. `/history`、`/sendfile`、`/mode`、`/admin`、`/upgrade`、`/debug`、`/help`、`/menu` 继续显示；`/compact`、`/review`、`/bendtomywill`、`/autowhip`、`/autocontinue`、`/follow`、`/cron` hidden + reject，不伪装成 OpenCode 原生能力。
+2. OpenCode target picker 候选只合并 `Backend=opencode` 的在线实例和 OpenCode 本地 SQLite catalog 可恢复 metadata；不会读取 Codex SQLite 或 Claude session store，也不会把 Codex/Claude 会话混进 `/list` / `/use`。
+3. `/mode opencode` 若切换前已有当前 workspace，不会只留下 detached surface：
+   1. 优先 attach 同 workspace 的在线 OpenCode instance。
+   2. 若当前没有可 attach 的 OpenCode instance，则直接起 fresh managed headless，`PendingHeadless.Backend=opencode`，`OpenCodeProfileID` 和 `OpenCodeAdmissionRef` 来自当前 effective bot contract，并保留 workspace route intent。
+4. `/opencodeprofile` 当前是 OpenCode headless 专属的 gateway/bot 级配置入口，只允许在私聊发起：
+   1. bare `/opencodeprofile` 打开 dropdown 参数卡，候选来自 daemon materialized canonical OpenCode Profile catalog；内置 `op_default` 始终可用。
+   2. 只有 `ProductMode=normal && Backend=opencode` 时允许切换；其他 mode/backend 会直接拒绝并要求先 `/mode opencode`。
+   3. request gate、`PendingHeadless`、live remote work 与 delayed-detach 会阻断 profile 切换，避免 surface 进入半重启状态。
+   4. detached idle 私聊切 Profile 时，只更新 bot record 的 canonical `OpenCodeProfileID`，并把 matching `OpenCodeAdmissionRef` 投影给同 gateway surface；缺 revision 的 profile 不可被选择。
+   5. 当前 workspace 已占用时，切 Profile 会先按切换前状态规划旧 managed child 的 kill，再 detach-like 清理旧 runtime 并重启到新 Profile。OpenCode session 会持久化创建时的 provider/model，因此无论切换的是 Profile ID 还是同一 Profile 的 revision，都不会把旧 exact thread 恢复到新 overlay；当前 workspace claim 会保留，并统一走 `workspace_route_restart + PrepareNewThread=true`，连回后进入 `R5 NewThreadReady`。旧 session 不删除，仍可在切回兼容 Profile 后从历史列表重新选择。
+5. `/permission full|confirm|clear` 当前是 OpenCode headless 专属的 runtime desired 设置入口，只允许合法私聊修改 gateway/bot record：
+   1. `full` 规范化为 `full_access`，编译成 OpenCode `permission: {"*":"allow"}`；`confirm` 编译成 `{"*":"ask"}`；`clear` 清空 desired access，不写 permission overlay。
+   2. detached idle 只保存 desired state 并投影给同 gateway surface。
+   3. 当前 workspace 空闲时，发起 surface 先按切换前 continuation 规划 exact-thread/workspace restart，再保存 access desired，随后重启当前 managed OpenCode child；pending launch 和 daemon start command 都携带 `OpenCodeRuntimeAccessMode`。
+   4. 正在执行 turn / 有排队消息 / pending headless / route gate 时不硬杀；新 desired state 已保存，下一条普通 prompt 入队时冻结 access，dispatch 前比较 current child hello 的 `OpenCodeRuntimeAccessMode`，不一致则进入 `prompt_dispatch_restart`，新 child 连回后继续原消息。
+6. OpenCode observed config 不写回 workspace/default model/reasoning/access，避免把某个 OpenCode 实例的 runtime snapshot 污染 Codex/Claude 默认值。
+7. OpenCode 模式下未知 slash command 不直接送进 backend：只有登记在本地 command catalog 的命令会进入 action path；未登记 `/xxx` 会被本地 preflight 拒绝，避免 OpenCode 空 `end_turn` 被误投影成成功。
+8. Plan/sandbox/context meter 缺口按 Claude 当前产品基线处理：普通计划文本按 assistant text，稳定 todo 才投影 plan snapshot；不展示“OpenCode 不支持内部 carrier”这类提示。
+
+### 4.1.3 `vscode` `/list` 先选 instance，并显式投影“当前实例”
+
+当前 `vscode` 的 `/list` 仍然只列在线 VS Code instance，但卡片展示已经切到 instance-aware 的专用布局。
+
+对应实现里：
+
+1. `presentInstanceSelection()` 只保留在线且 `source=vscode` 的实例，不再夹带 headless。
+2. Feishu 卡片当前走专用 `grouped_attach_instance` 布局，不再复用旧的通用 selection 模板。
+   1. 若 surface 当前已 attach instance，会先在顶部投影“当前实例”摘要，格式为 `实例标签 + 当前跟随状态`，并附带“换实例才用 /list”的短提示。
+   2. 当前实例不会再混进下面的可点击列表。
+   3. 其他实例按“可接管 / 其他状态”分组，按钮使用全宽动作前缀文案，例如 `接管 · web`、`切换 · admin`、`不可接管 · ops`。
+   4. 每个实例的第二行状态压缩为短元信息，例如 `2分前 · 当前焦点可跟随`、`1小时前 · 等待 VS Code 焦点`、`30分前 · 当前被其他飞书会话接管`。
+   5. 组内排序优先 `ObservedFocusedThreadID` 非空的实例，再按该实例可见 thread 的最近活跃时间倒序；无时间时再回退到 `InstanceID`。
+3. 卡片按钮仍走 `attach_instance -> ActionAttachInstance`，但这条 action 当前只允许作为 VS Code instance 兼容入口改变 route。若同一张旧卡片回调到已经切回 headless 的 surface，orchestrator 会返回 `attach_instance_headless_rejected` notice，并保持当前 workspace claim、attached instance、selected thread 与 route mode 不变。
+4. attach / switch 成功后，surface 仍会进入既有的 follow-local 语义：有 observed focus 时进入 `R4 FollowBound`，否则进入 `R3 FollowWaiting`。
+5. 若 `attach_instance` 来自 stamped 菜单卡 callback，attach 成功 / 失败结果会直接替换当前实例选择卡；若同一动作后面还带 thread-selection follow-up，daemon 会抑制这张重复 append，避免菜单卡已经收口后又补第二张卡。
+
+### 4.1.4 vscode `/use` / `/useall` 仍是 instance-scoped thread 选择，但菜单路径会把结果留在原卡
+
+当前 `vscode` 的 `/use` / `/useall` 产品语义没有放宽，仍然只围绕当前 attached VS Code instance 的 thread 集合展开。
+
+对应实现里：
+
+1. detached `/use` / `/useall` 仍直接拒绝，并提示先 `/list` 选择一个 VS Code 实例；若入口来自 stamped 菜单卡，这张提示卡会直接替换当前菜单卡，不再外跳提交态锚点。
+2. attached `/use` 当前显示当前实例最近 5 个 thread 的 dropdown；`/useall` 显示当前实例全部 thread 的 dropdown。
+3. dropdown 当前会直接过滤掉不可切换 thread，不再把它们作为 disabled 选项留在卡面里；若发生过滤，卡片正文会追加 plain-text 提示。
+4. thread 选择仍走 `use_thread -> ActionUseThread`；只是 Feishu 投影从旧按钮/分页 prompt 收敛成当前实例内的结构化 dropdown。
+5. 选择 thread 后，same-thread / busy / attach-known-thread / visible-thread 切换等既有产品语义保持不变；但若入口来自 stamped 菜单卡，首张可投影结果卡会继续替回当前菜单卡，不再额外 append 一张 detached notice 或“命令已提交”锚点卡。
+
+### 4.1.5 stamped `/mode vscode` 与 `/vscode-migrate` 的 owner-card 收口边界
+
+这轮实现没有改 `vscode` 兼容性检查本身的产品语义，只改了它在 card callback 场景下的承接 carrier。
+
+对应实现里：
+
+1. 若 `/mode vscode` 来自带 `daemon_lifecycle_id` 的当前参数卡 / 菜单卡 callback，daemon 会在切换成功后立即失效旧缓存，并对 VS Code 兼容性做一次同步判定。
+2. 若这次同步判定发现 legacy `editor_settings` 且已存在可接管入口，daemon 会先同步静默自动迁到 `managed_shim`，不再先弹“确认迁移”主提示卡。
+3. 若自动迁移成功且不再残留兼容性问题，后续继续走原有 `open VS Code` / recover 流；若缺 target、自动迁移失败、迁移后状态仍异常，或本来就是 stale managed shim 修复，daemon 才会把首张可投影提示卡直接替换当前卡，而不是再走独立 runtime notice / catalog。
+4. 若 `/mode vscode` 是纯文本 slash 入口，仍保持原来的异步检测与提示语义，不把普通文本入口升级成 current-card replace。
+5. `/vscode-migrate` 当前会先进入 `ActionVSCodeMigrateCommand -> DaemonCommandVSCodeMigrateCommand`，打开同一套 VS Code 迁移 page root；若入口来自 stamped current-card callback，root page / 校验失败页会直接同位替回当前卡。
+6. 真正执行迁移的按钮当前不再发旧的文本重解析回调，而是显式发 `vscode_migrate_owner_flow -> ActionVSCodeMigrate`；迁移结果与后续 guidance 会继续 patch 在同一张 guidance card 上。
+
+### 4.2 thread claim 仍是全局的，但在 headless 主链下退回 workspace 内仲裁
+
+当前 `threadClaims` 仍按 `threadID` 做全局仲裁。
+
+结果：
+
+1. 一个 thread 同时只能被一个飞书 surface 占有。
+2. headless 主链下，如果目标 thread 所在 workspace 已被其他 headless surface 占有，会先在 workspace 层被禁用，不再进入 thread kick 逻辑。
+3. `/use` 命中已被他人占用的 thread 时：
+   1. 如果目标 thread 在**当前 attached instance 内可见，且仍属于该 instance 当前 workspace**，仍保留现有强踢逻辑：
+      1. 对方 idle 才会弹强踢确认。
+      2. 对方 queued/running 会直接拒绝。
+   2. 如果目标 thread 走的是 global thread-first attach 路径，不提供强踢，只会在列表里显示 busy 并禁用。
+
+### 4.3 `PendingHeadless` 仍是 dominant gate
+
+只要 `PendingHeadless != nil`：
+
+1. 允许：`/status`、`/autowhip`、`/autocontinue`、`/debug`、`/upgrade`、`/mode`、`/detach`、消息撤回、reaction。
+2. 其余 surface action 全部在 `ApplySurfaceAction()` 顶层被拦截。
+
+这意味着：
+
+1. `starting` 时不能旁路 attach/use/follow/new。
+2. detached `/use` 触发的 preselected headless，在实例连上后会直接落到目标 thread，不会再进入手工 selecting。
+3. `/mode vscode` 与 `/detach` 都会主动取消当前恢复流程，并回到 detached 态；此外还有启动超时 watchdog。
+4. `PendingHeadless` 当前有四类产品语义：
+   1. `Purpose=thread_restore`：显式 `/use` 一个需要后台恢复的 thread，或 auto-restore。
+   2. `Purpose=fresh_workspace`：`/workspace new dir` 流程选了一个当前没有可复用实例的目录。
+   3. `Purpose=prompt_dispatch_restart`：Claude queue / auto-continue / review apply 在 dispatch 前发现 frozen reasoning 与当前 runtime contract 不一致，需要先 restart 成匹配实例。
+   4. `Purpose=workspace_route_restart`：当前 workspace 已确定，但 profile/backend/runtime contract 变化需要启动新的 managed headless，并在连回后恢复原 workspace route intent；`PrepareNewThread=true` 时直接进入 `R5 NewThreadReady`，不打开 `/list` picker，不发送 workspace onboarding 成功提示。
+5. 旧 `/newinstance`、旧 `/killinstance` 当前都不再进入 parser；若实例连上时读到历史兼容残留的 pending headless，只会自动结束并提示改用 `/use` / `/useall`。
+6. 后台 auto-restore 触发的 pending headless 也复用同一个 `G1` gate：
+   1. 启动阶段默认静默，不额外发 “headless_starting”。
+   2. 成功后只发一条恢复成功 notice。
+   3. 若 managed headless 已连回但 exact-thread 接管失败，连接结果会被视为本轮 auto-restore 的 terminal outcome：清掉 `PendingHeadless`，kill 这次拉起的 headless，保留持久化恢复目标，并交给 daemon backoff 后再试。
+   4. exact-thread 接管成功后会以当前连接实例上的 thread metadata 与 pending restore target 为准，不使用全局 merged thread view，避免同名 thread 从其它实例泄漏 workspace/CWD。
+   5. 失败或超时会先进入 daemon recovery notice gate，由同一套 `LastFailureCode` / `LastNoticeCode` / sticky failure / backoff 记账决定是否投递恢复失败 notice；normal/headless 后台自动恢复中，`start_timeout`、`workspace_busy`、`thread_busy`、`thread_not_found` 等仍可能随启动顺序或 catalog 刷新变化的失败只记录 backoff 并静默等待下一轮 evidence，不立即打断用户；确定性的 workspace/cwd 缺失、provider/profile/runtime 不可用才会投递一次恢复失败 notice。VS Code resume failure 仍保留首个 busy/not-found 可见提示。
+7. `PendingHeadless.AutoRestore=true` 时，手动 `/upgrade latest` 与允许 dev feed 的 flavor（源码 `dev` 与 release `alpha`）下的 `/upgrade dev` 检查结果 prompt 不再因为这条后台恢复占位被判成“当前窗口不空闲”；自动升级提示仍保持保守，不会优先挑这种 surface 弹卡。
+8. `Purpose=prompt_dispatch_restart` 的 attach 完成后不会重走 fresh workspace / exact-thread restore 的大路径；surface 只做最小 reattach，然后由统一 dispatch owner 继续原本那条 queued 或 auto-continue 发送，避免在“切推理强度”时把 queue/runtime 状态清空。
+
+### 4.4 选择卡片不再是服务端持久 modal 状态
+
+当前服务端已经不再保存 `FeishuDirectSelectionPrompt` 状态，也不再把“纯数字文本”解释成选择。
+
+当前行为：
+
+1. attach/use/kick confirm 都改成**直达动作**。
+2. Feishu 卡片按钮直接携带：
+   1. `attach_workspace`
+   2. `attach_instance`（VS Code instance 兼容入口；headless 收到旧卡回调时 fail closed）
+   3. `use_thread`
+   4. `show_scoped_threads`
+   5. `show_workspace_threads`
+   6. `show_all_threads`
+   7. `show_all_thread_workspaces`
+   8. `show_recent_thread_workspaces`
+   9. `kick_thread_confirm`
+   10. `kick_thread_cancel`
+3. `use_thread` 会按卡片来源附带额外上下文：
+   1. `codex headless` `/useall` 与 detached/global `/use` 会携带 `allow_cross_workspace=true`
+   2. attached current-scope `/use` 不会带这个标记，因此仍只允许留在当前 workspace / 当前 instance 内
+5. `"1"`、`"2"` 这类纯数字文本现在就是普通文本。
+
+### 4.5 route change 与 `/new` 都会显式处理未发送草稿
+
+当前有两类固定规则：
+
+1. 普通 route change，例如 `/use`、`vscode /follow`、follow 自动切换、claim 丢失回退：
+   1. 丢 staged image 与 staged file。
+   2. 不会静默把未冻结附件串到新 thread。
+2. clear 语义，例如 `/stop`、`/detach`、`/mode`、`/new`、`R5` 下的 `/use` / `vscode /follow`：
+   1. staged image / staged file 和 queued draft 都会被显式丢弃。
+   2. 会发 discard reaction / notice。
+
+当前实现不允许未发送草稿在 route change 时 silently retarget。
+
+### 4.5.1 共享桌面模型跟随与可见性
+
+- 共享 Codex 已有 thread 的飞书输入只冻结用户明确设置的模型、推理强度；清除覆盖（`/model clear`）后，不从 workspace default 或旧 snapshot 冻结模型，也不重放旧 turn template / resume policy 中的模型与强度。没有显式 plan override 时不强制切换 collaboration mode，交给桌面当前会话继续执行。
+- 订阅 ready、每轮 `turn.started`、会话模型/强度变化和本轮 `model/rerouted` 分别追加只读 notice，仅投递给持有相同 instance + thread 的 surface，quiet 也可见。只有 backend observation 可标为确认值；未知值显示“未确认”，不把 bot override 或请求参数当作执行事实。
+- 每个订阅只保留最近的模型提示状态与已提示 turn ID；重复 start/settings/reroute 去重。其它 thread、其它 proxy、helper traffic、过期 turn 的 reroute 不生成当前模型提示。切换/断线后的新订阅重建此瞬时状态。
+- 后台模型切换提示显示 from/to/reason；未报告新强度时显示“未确认”。仍有飞书显式覆盖时列出后续请求设置；本轮冻结请求与已确认执行值不一致时单独说明。设置通知属于会话设置观察，不承诺改写正在执行的 turn。
+
+### 4.6 共享桌面活动 turn 自动 steering、queued 点赞 / reply steering 保留输入顺序
+
+当前 steering 入口的产品语义已经固定：
+
+1. queued 点赞入口：
+   1. 只有 `ThumbsUp` 才会触发。
+   2. 只有 queued item 的主文本 `SourceMessageID` 能触发。
+   3. 图片消息上的点赞不会单独触发任何状态迁移。
+   4. OpenCode backend 命中这些条件时只返回不支持提示，不把 queued item 移出普通队列。
+2. reply 自动 steering 入口：
+   1. 只有 reply 目标命中**当前 surface 正在 processing 的 source message**时才会触发。
+   2. 必须命中当前 surface 自己的 active running turn；仅 instance 有 active turn 但 surface 不拥有该 running item 时不会触发。
+   3. 当前只支持文本 / 本地图片内容；被 reply 的原消息不会再作为 quoted input 重新 steer 进去。
+   4. OpenCode backend 命中这些条件时只返回不支持提示，不创建 fallback steering item。
+3. 共享桌面 Codex 普通输入自动 steering：
+   1. 仅限 Codex `SharedAppServer` 已连接、精确 thread 订阅 ready、当前 surface 拥有该 thread 的活动 turn。
+   2. 普通文本先进入 surface queue，再把同一 thread 上仍 queued 的用户输入按 queue 顺序并入一次 `turn/steer`；不夹带自动化 queue item，也不跨 thread。
+   3. 若当前 surface 已有 steer command 在途，新输入保留在 queue；前一 steer 获得 command ack 后，系统自动检查并发送下一批。active goal / goal interlock 阻止自动发送，输入仍遵循原队列与 pause 行为。
+   4. steering dispatch reject / failure 使用既有 pending-steer 恢复路径，恢复原队列位置；只有 steer command 失败时不会自动无限重试。
+4. 无论哪种入口：
+   1. 目标 item / reply fallback item 都必须和当前 active running turn 属于同一 `FrozenThreadID`。
+   2. 命中后不会改写其他 queued item 的相对顺序，也不会跨 thread 偷偷 retarget。
+   3. steering 失败时，目标输入必须恢复回普通语义，不能 silently 消失。
+5. 图片 reply 回退成 staged image 时，必须保留原始发送者归属；后续仍只允许同一个 actor 的下一条文本消费它，不能被别的 actor 抢绑。
+
+### 4.7 `R5 NewThreadReady` 是稳定态，不是半成品
+
+当前 `/new` 已实现为 clear-and-prepare：
+
+1. headless 主链下，只要 surface 已 attach 且当前 workspace 已知，就允许进入。
+2. `vscode` 下，`/new` 直接拒绝，并明确提示用户先 `/mode codex`、`/mode claude` 或 `/mode opencode`，或继续 follow / `/use` 当前 VS Code 会话。
+3. 不允许 fallback 到 home。
+4. 进入时会释放旧 thread claim，但保留 instance attachment 与 `PromptOverride`。
+5. `PreparedThreadCWD`、`PreparedFromThreadID`、`PreparedAt` 会显式保存。
+6. 若 surface 处于空闲 detached review session，进入 `/new` 会同时清掉 `ReviewSession`；若 review turn 仍在运行，则 `/new` 会拒绝并提示等待或 `/stop`，避免新会话首条文本被旧 review overlay 截获。
+
+这带来三个关键性质：
+
+1. `R5` 没有“attach 成功但用户无路可走”的问题。
+2. `R5` 下第一条普通文本合法，且会创建新 thread。
+3. `R5` 下如果只有 staged/queued draft，用户仍然能 `/use`、`/detach`、`/stop` 或重复 `/new`。
+
+### 4.8 空 thread turn 不再靠 `ActiveThreadID` 猜归属
+
+当前 empty-thread 首条消息的 turn 归属已经改成显式相关性：
+
+1. queue item 仍以 `FrozenDispatchPlan.ExecutionThreadID == ""` 派发。
+2. translator 在 `turn.started` 时提供 `InitiatorRemoteSurface + SurfaceSessionID`。
+3. orchestrator 优先用 `Initiator.SurfaceSessionID` 命中 pending remote item。
+4. 命中后会先 materialize 这个新 thread 的最小运行时元数据：至少把真实 `threadID`、继承的 `cwd` 与 primary traffic class 写进 state，然后再把 surface 从 `R5` 切回 `R2 AttachedPinned`。
+
+当前不再用“`FrozenDispatchPlan.ExecutionThreadID == ""` 时退化匹配 `inst.ActiveThreadID`”来猜归属。
+
+### 4.9 local-activity `PausedForLocal` 和 `Abandoning` 都有 watchdog
+
+当前 `Tick()` 已经提供两类 watchdog 恢复：
+
+1. local-activity 来源的 `paused_for_local` 超时后：
+   1. 自动回到 `normal`
+   2. 发 `local_activity_watchdog_resumed`
+   3. 继续 `dispatchNext`
+2. `abandoning` 超时后：
+   1. 强制 `finalizeDetachedSurface`
+   2. 发 `detach_timeout_forced`
+
+补充说明：
+
+1. 这条 watchdog 只覆盖 `pauseForLocal(...)` 写入的 local-activity 分支。
+2. standalone Codex 升级事务复用 `DispatchMode=paused_for_local` 时，不会写 `pausedUntil`，因此不会被 `Tick()` 自动恢复；这条路径必须等待 daemon 显式 `ResumeSurfaceDispatch(...)`。
+3. `Abandoning` 仍保持原来的 watchdog 语义。
+
+### 4.10 thread 级未投递回放是 thread-global 单槽、内存态、一次性
+
+当前 `ThreadRecord` 增加了 `UndeliveredReplay`，但它不是完整历史，只是 thread 级的单槽候选。
+
+当前规则：
+
+1. 只记录两类内容：
+   1. 没有任何飞书 surface 可投递时产生的 final assistant block。
+   2. 没有任何目标 surface 时产生的 thread-scoped system/problem notice。
+2. 同一 `threadID` 的 replay 当前按 relay 全局单槽处理：
+   1. 一条新候选会覆盖旧候选，不保留 backlog。
+   2. cross-instance attach / `/use` 时会先从其他 instance 迁移到当前目标 thread，再尝试补发。
+3. 同一 thread 的内容一旦已经成功投递到当前 surface，就会清空所有已知 instance 上的旧 replay，避免后续重复补发。
+4. 只有两条显式入口会尝试回放：
+   1. `/attach` 成功后默认选中的 thread。
+   2. `/use` 选中的 thread。
+5. 回放前会检查该 thread 是否 idle：
+   1. 若 `inst.ActiveTurnID != ""` 且 `inst.ActiveThreadID == threadID`，则本次不补发。
+   2. 候选继续保留，等待后续 idle 的 `/attach` 或 `/use`。
+6. 回放成功后立即清空，因此同一条内容只会补发一次。
+7. 该状态仅保存在 relay 内存里；`relayd` 重启后丢失是当前已接受语义。
+8. 后台 managed-headless exact-thread resume attach 是明确例外：
+   1. 不会补发旧 replay。
+   2. 会直接清空该 thread 的旧 replay。
+   3. 用户只会看到一条新的恢复成功提示。
+
+### 4.11 `/status` 当前至少会显式投影 mode / profile / attach object / gate / dispatch / retained-offline
+
+当前 `Snapshot` 不再只展示 attachment 和 next prompt。
+
+现在至少会额外投影九类“决定下一条输入会发生什么”的状态：
+
+1. 当前 `ProductMode`
+   1. `normal`
+   2. `vscode`
+2. 当前 Claude profile（仅 `Backend=claude` 时）
+   1. 只读展示当前 `ClaudeProfileName / ClaudeProfileID`
+   2. 不承担切换或管理入口
+3. 当前 attach 对象类型
+   1. `工作区`
+   2. `VS Code 实例`
+   3. `headless 实例`
+   4. `实例`
+4. 当前已占用的 workspace（若有）
+5. request gate：
+   1. `PendingRequest`
+   2. `RequestCapture`
+   3. active path picker runtime
+6. dispatch / queue：
+   1. `Dispatching`
+   2. `Running`
+   3. `PausedForLocal`
+   4. `HandoffWait`
+   5. queued count
+7. autowhip runtime：
+   1. enabled / disabled
+   2. pending reason
+   3. pending due time
+   4. consecutive count
+8. autoContinue runtime：
+   1. enabled / disabled
+   2. current episode state
+   3. pending due time
+   4. attempt count / consecutive dry failure count
+9. transport degraded 后“attachment 仍保留但实例已离线”的 retained-offline 状态。
+
+它仍然不是完整调试面板，但已经能回答最关键的问题：
+
+1. 当前到底记住的是 `normal` 还是 `vscode`。
+2. Claude 当前到底是哪个 profile。
+3. 当前接管的是工作区、VS Code 实例，还是 headless/其他实例。
+4. 当前到底占着哪个 workspace。
+5. 下一条文本是不是会先被 request gate 吃掉。
+6. 下一条文本是不是会先被 legacy `/model` capture 兼容态吃掉。
+7. 现在是执行中、排队中，还是被本地 VS Code 暂停。
+8. autowhip 当前是关闭、待触发，还是刚因 backoff 暂缓。
+9. autoContinue 当前是 idle、等待自动继续，还是刚刚失败/取消。
+10. attachment 还在不在，以及当前是不是在等实例恢复。
+
+### 4.12 `/mode` 更新 gateway/bot 能力合同，当前 surface 承接 route 清理与切换
+
+当前 `/mode` 的实现边界已经固定为：
+
+1. bare `/mode` 当前不再直接回 `Snapshot`，而是返回当前模式 + `codex` / `claude` / `opencode` / `vscode` 切换卡；其中 `normal` 仍只作为 `codex` 的兼容 slash alias。
+2. `/mode normal|codex|claude|opencode|vscode` 允许在 detached、idle attached、或 `PendingHeadless` 尚未进入 live remote work 的 surface 上切换。
+3. 切换时一定先做 detach-like 清理；大多数目标会进入 detached 态，但若切到另一条 headless backend 且切换前已有当前 workspace，则会保留该 workspace claim，并立即进入“attach 已在线目标 backend instance”或“启动 fresh managed headless”的后续链路，而不是停在 detached idle。
+4. 若切换前存在 `PendingHeadless` 或 `surface resume state` 里仍带着 headless 恢复目标，会一并 kill / clear，避免 mode 切完以后又被后台恢复拉回 headless。
+5. `vscode` surface 不参与 managed-headless exact-thread continuation；而且 `surface resume state` 会把非 headless entry（当前即 `ProductMode!=normal`）的 `ResumeHeadless` 硬归零，避免 daemon 重启后从持久化状态重新长出这条恢复入口。
+6. 当前 mode 会通过 bot capability store 跨 daemon 重启保留：
+   1. startup 会先从 surface resume 恢复 latent route、`ProductMode` 执行 hint 与 `Verbosity`，随后由 bot capability store 覆盖合法 Feishu surface 的 mode/backend 投影
+   2. headless 主链会继续按 persisted target 尝试自动恢复：workspace-owned route 直恢复 workspace intent；thread target 先 exact visible attach；`ResumeHeadless=true` 时再继续 exact-thread continuation
+   3. 若存在 `ResumeThreadID`，在首轮 `threads.refresh -> threads.snapshot` 完成前会先静默等待，不会过早降级或直接报失败
+   4. `vscode` 会按 exact `ResumeInstanceID` 尝试恢复：恢复成功后回到 `follow_local`，若暂时缺少新的 VS Code 活动则明确提示用户去 VS Code 再说一句话或手动 `/use`
+7. 切换当前已经会改变 `/list` 的主交互语义：
+   1. `codex`、`claude` 与 `opencode` 下 `/list` 都是 workspace chooser。
+   2. `vscode` 下 `/list` 是 instance chooser。
+8. headless 主链下 `/follow` 已退出长期路径；`vscode` 当前则固定走 follow-first，并把 `/use` 收窄到当前 instance 内的一次性 force-pick。
+9. 若当前仍有 running / dispatching / queued work，则 `/mode` 会直接拒绝，而不是进入半切换状态。
+
+### 4.13 `/autowhip` 是 surface 级、内存态、跨 route 可查询的 overlay 开关
+
+当前 `/autowhip` 不要求 surface 已 attach：
+
+1. detached surface 也可以直接 bare `/autowhip` 查询并打开 on/off 参数卡；带参数时可直接切换。
+2. `PendingHeadless` 期间 `/autowhip` 仍然允许，不会被顶层 gate 挡住。
+3. `Abandoning` 期间 `/autowhip` 也仍然允许，用户可以查看或关闭当前 surface 的 autowhip。
+4. daemon 重启后不恢复该开关；当前已接受这是内存态语义。
+5. 旧命令 alias 已移除；主展示与实际命令统一只保留 `/autowhip`。
+
+### 4.14 `/autocontinue` 是 surface 级、内存态、跨 route 可查询的自动继续开关
+
+当前 `/autocontinue` 不要求 surface 已 attach：
+
+1. detached surface 也可以直接 bare `/autocontinue` 查询并打开 on/off 参数卡；带参数时可直接切换。
+2. `PendingHeadless` 期间 `/autocontinue` 仍然允许，不会被顶层 gate 挡住。
+3. `Abandoning` 期间 `/autocontinue` 也仍然允许，用户可以查看或关闭当前 surface 的 autoContinue。
+4. daemon 重启后不恢复该开关；当前已接受这是内存态语义。
+5. 旧 `recovery` / `autorecovery` alias 已移除，UI、文档与解析器统一只保留 `/autocontinue`。
+6. `/autocontinue` 只影响上游可重试失败自动继续，不影响 `autowhip` 的 `incomplete_stop` 语义。
+
+### 4.15 `/menu` 现在是阶段感知首页，不再是静态平铺目录
+
+当前 `/menu`、静态 bot 菜单和 slash parser 已经统一到同一套 canonical command metadata。
+
+当前行为：
+
+1. `/menu` 首页当前只保留分组导航，不再在首页额外平铺“常用操作”或“前排固定命令”：
+   1. `基本命令`
+   2. `参数设置`
+   3. `工作会话`
+   4. `常用工具`
+   5. `系统管理`
+2. 二级分组顺序稳定，但组内可见命令会按当前 `product mode + menu stage` 做 display projection：
+   1. `codex` 的菜单首页点击 `工作会话` 时，不再进入旧的命令分组页，而是直接打开 bare `/workspace` 父页。
+   2. bare `/workspace` 当前固定展示四个并列入口：`切换`、`从目录新建`、`从 GIT URL 新建`、`解除接管`。
+   3. bare `/workspace new` 当前是单独的新建方式页，展示 `从目录新建`、`从 GIT URL 新建` 与 `从 Worktree 新建`。
+   4. `codex` 下 `/list`、`/use`、`/useall`、`/detach` 不再作为主展示菜单项，但 alias / parser 兼容仍保留，并分别汇合到 `/workspace list` 与 `/workspace detach`。
+   5. `claude` 下 `current_work` 分组当前直接显示 `/new`、`/status`，`switch_target` 分组直接显示 `/workspace new dir`、`/workspace detach`、`/list`、`/use`；裸 `/detach`、其余 `workspace*`、`/useall`、`/review` 与 `/bendtomywill` 不再出现在主展示菜单里。
+   6. `vscode` 的 `工作会话` 仍分别显示 `/list`、`/use`、`/useall`。
+   7. headless 主链不展示 `/follow`；`vscode` 才展示 `/follow`。
+   8. `/new` 只在 headless working 可见；`/status` 当前在 `基本命令`，`/history` 在 `常用工具`，其中 `/status` 与 `/history` 在 headless / vscode 都可见；对 `claude`，解除接管当前改从 `switch_target` 分组里的 `/workspace detach` 进入，而 `/review` / `/bendtomywill` 已退出主展示面。
+3. `/help` 当前也复用同一套 display projection：
+   1. `codex` 下帮助文本里的主展示入口已经切到 `workspace` 命令族：`/workspace`、`/workspace list`、`/workspace new`、`/workspace new dir`、`/workspace new git`、`/workspace new worktree`、`/workspace detach`。
+   2. `claude` 下帮助文本的主展示入口当前会保留 `/new`、`/workspace new dir`、`/workspace detach`、`/list`、`/use` 这组 visible MVP 会话主链，并在 `常用工具` 展示 `/history` 与 `/sendfile`；`/review`、`/bendtomywill` 仍只存在于 parser / reject 兼容层，不作为主展示帮助入口；裸 `/detach`、其余 `workspace*` 与 `/useall` 是 hidden + allow 兼容入口，也不作为主展示帮助入口。
+   3. `vscode` 下帮助文本仍保留 `/list`、`/use`、`/useall` 三个独立入口。
+   4. `/mcpoauth <server>` 当前 help-visible、menu-hidden；它用于显式发起 MCP server OAuth login，不进入 `/menu` 主展示。
+4. bare 参数命令现在统一走“快捷按钮 + 单字段表单”：
+  1. `参数设置`：`/reasoning`、`/model`、`/permission`、`/plan`、`/verbose`、`/autocontinue`
+  2. `常用工具 / 系统管理`：`/autowhip`、`/mode`
+   3. 表单提交通过 card callback `page_submit` 直接回填结构化 `action_kind/field_name/action_arg_prefix`，再生成 canonical `Action.Text`。
+5. `常用工具` 分组里的 `/primary` 只在群聊 context 展示，并按 `PrimaryBotState` 投影为“设为本群主机器人 / 取消主机器人 / 切换为当前机器人 / 查看状态 / 刷新权限”；单聊菜单隐藏，但手输 `/primary...` 会提示只能在群聊使用。
+6. `常用工具` 分组里的 `/cron`、`/bendtomywill`，以及 `系统管理` 分组里的 `/debug`、`/upgrade` 当前仍然是直接触发 daemon 动作的命令入口，不属于参数卡表单；`/mcpoauth` 也是直接 daemon command，但当前不进菜单，只在 slash/help 路径暴露。
+7. 二级分组当前通过卡片按钮 + breadcrumb 返回首页实现，不依赖飞书后台把整棵导航树都铺成静态菜单。
+8. 同上下文菜单导航当前已经支持“替换当前卡片”而不是追加新卡，但只限窄范围：
+   1. `/menu` 首页 <-> 二级分组页
+  2. 从 `/menu` 分组页打开 bare `/mode`、`/autowhip`、`/autocontinue`、`/reasoning`、`/permission`、`/plan`、`/model`、`/verbose`
+   3. bare 参数卡里的“返回上一层”
+9. 这条原地替换链路当前只在动作来自带 `CardDaemonLifecycleID` 的飞书卡片时启用：
+   1. 网关通过 card callback 同步回包返回替换后的整张卡
+   2. 同样的命令如果由 slash 文本或飞书后台 bot 菜单触发，仍按普通 append-only UIEvent 新发卡片
+   3. `/help`、result/notice 类卡片不参与这条导航替换语义
+
+### 4.16 autowhip 调度只允许走显式 reply-anchor，不再伪造用户消息 pending/typing
+
+当前 autowhip queue item 仍沿用显式来源类型：
+
+1. `SourceKind=user`
+2. `SourceKind=auto_whip`
+
+当前行为已经固定为：
+
+1. 普通用户输入 item：
+   1. `SourceMessageID` / `SourceMessageIDs` 用于 pending、typing、revoke、reaction 投影。
+   2. 最终回复默认 reply 到同一条原用户消息。
+2. autowhip item：
+   1. `SourceMessageID` 为空，不再触发 pending / typing / thumbs projection。
+   2. `ReplyToMessageID` 单独保留原用户消息锚点。
+   3. 最终回复继续 reply 到原用户消息。
+
+### 4.17 autoContinue 调度走独立 queue lane，不借用状态卡 message id
+
+当前 autoContinue queue item 也沿用显式来源类型：
+
+1. `SourceKind=auto_continue`
+2. `ReplyToMessageID` 固定保留原始用户消息锚点
+3. `AutoContinueEpisodeID` 独立标识当前 autoContinue episode
+
+当前行为已经固定为：
+
+1. autoContinue 状态卡：
+   1. 首次发送显式走 reply-thread lane
+   2. 当前只在自己仍是尾消息时允许 patch
+   3. 一旦尾部已被后续消息占用，旧卡冻结；后续状态改为 append 新卡
+2. autoContinue item：
+   1. 不会把 autoContinue 状态卡自身的 `message_id` 反写成后续业务输出的 reply anchor
+   2. 真正的 final / request / plan / image / progress 输出仍 reply 到原用户消息
+3. dispatch 优先级高于普通 queued user item，但不会清空原队列
+
+### 4.18 `/bendtomywill` 是 headless 当前 thread 的前台事务卡，不回改已展示旧消息
+
+当前 `/bendtomywill` 的实现边界已经固定为：
+
+1. 入口与适用面：
+   1. bare `/bendtomywill` 与菜单里的 `修补当前会话` 是同一条 daemon-side 流程。
+   2. 只允许在 `headless + attached instance + selected thread` 下打开。
+   3. VS Code surface、未 attached surface、未选 thread、实例离线，或未启用 patch storage 时都会直接拒绝。
+2. 打开 patch 卡前的预检：
+   1. 当前 instance 必须空闲。
+   2. 除了自身正在编辑的 patch 卡外，不能存在 active turn-patch tx、upgrade tx、upgrade owner-flow、active remote、pending remote、compact、steer、pending request、request capture、queued item、非 `normal` dispatch mode、`PendingHeadless` 或 `Abandoning`。
+   3. 这使 `/bendtomywill` 成为强互斥的高风险事务入口，不走排队。
+3. 编辑阶段：
+   1. daemon 会从 rollout truth 读取当前 thread 的最新 completed assistant turn 预览，而不是改已展示消息。
+   2. 当前只对显式 refusal / placeholder 模式做候选点检测；若没有命中，会直接返回 notice，不打开卡。
+   3. 命中后会打开一张复用 `request_user_input` 载体的多题 patch 卡：每题只展示命中片段摘录与预填模板，不展示全文。
+   4. 同一张卡会按 `request_revision` 逐题 inline 刷新；只有发起者本人可以继续回答或取消。
+   5. 编辑期间当前 surface 进入 `G8 TurnPatchEditing`：除同一张卡的 `request_respond` / `request_control` 与 reaction/recall 外，其它动作都会被挡住。
+4. apply 事务：
+   1. 全部题目确认后，daemon 会再次确认当前 attached instance / thread 没有漂移。
+   2. 事务开始时会对同一 instance 上全部 attached surface 调 `PauseSurfaceDispatch(...)`，因此这些 surface 都会表现成 `E4 PausedForLocal`；但中间 child stop/start 噪音不会对上层额外翻译成 offline/online 提示。
+   3. 存储层只写 rollout JSONL：会先做 digest/turn 校验、写备份、记录 latest-only rollback ledger，再替换 latest assistant turn 命中的 message，并同步清掉该 turn 的 reasoning line。
+   4. 写盘完成后 daemon 会发送 `process.child.restart`，并通过 shared restart waiter 继续等待两段式结果：
+      1. `ack=true` 只代表新 child 已成功拉起并接管实例。
+      2. 只有后续收到匹配的 `process.child.restart.updated(status=succeeded)`，这次 apply 才算真正成功，前台才会切到 patch 成功页。
+      3. wrapper 会对 child stdout 做 generation fence，因此旧代 child 的晚到 restore/输出不会再回头污染当前 patch 事务。
+   5. 若 launch ack 被拒绝、restore outcome 明确失败，或 daemon 侧等待 outcome 超时，daemon 会先自动把 rollout 回滚到备份，再发第二次 child restart 尝试恢复运行态；失败页会明确区分“修补未生效，磁盘已恢复”与“运行态恢复也失败”。
+5. rollback 事务：
+   1. rollback 入口支持 `/bendtomywill rollback [patch_id]`，以及 patch 成功页上的回滚按钮。
+   2. 只允许回滚同一 thread 最近一次 patch；若 latest pointer 已变化，或 patch 后 rollout digest 已漂移，就会拒绝回滚。
+   3. rollback 同样要求原发起者、当前 attached thread 与 instance 仍然匹配，并复用与 apply 同级别的 dispatch freeze + child restart。
+6. 用户可见语义：
+   1. patch 与 rollback 成功后，后续输入会继续落在同一 thread。
+   2. 已经发出去的旧消息不会被回改；patch 只影响后续上下文。
+   3. 成功页会保留最近一次 rollback 按钮；失败页不会留下半活跃事务。
+
+## 5. 主要状态迁移
+
+### 5.1 attach / use / follow / new
+
+```text
+R0 Detached
+  -- /list(headless) --> 保持 R0 Detached，打开 target picker
+  -- /use(headless) --> 保持 R0 Detached，打开 target picker
+  -- /useall(headless substrate) --> 保持 R0 Detached，打开 target picker
+  -- target picker confirm(thread，headless 且可解析到当前可用实例) --> R2 AttachedPinned
+  -- target picker confirm(thread，headless 且需要新 headless) --> R0 + G1 PendingHeadlessStarting
+  -- target picker confirm(new_thread，headless 且 workspace 可直接 attach) --> R5 NewThreadReady
+  -- target picker confirm(new_thread，headless 且 workspace 仅 recoverable-only) --> R0 + G1 PendingHeadlessStarting
+  -- /list -> attach_instance(vscode 且 observed focus 可接管) --> R4 FollowBound
+  -- /list -> attach_instance(vscode 且尚无可接管 observed focus) --> R3 FollowWaiting
+  -- stale attach_instance card callback(headless) --> 保持当前 route/claim/selection，返回 attach_instance_headless_rejected
+  -- /use(thread，vscode) --> 拒绝 + migration to /list
+  -- daemon startup latent headless surface + exact visible thread restore --> R2 AttachedPinned
+  -- daemon startup latent headless surface + workspace fallback --> R1 AttachedUnbound
+  -- daemon startup latent headless surface + waiting first refresh --> 保持 R0 Detached
+  -- daemon startup latent vscode surface + exact instance resume --> R3 FollowWaiting 或 R4 FollowBound
+  -- Feishu 群聊 @ data-plane 输入(headless，同 room 无 workspace binding) --> 保持 R0 Detached，返回 room_workspace_required；不打开 target picker、不保存 pending text、不 stage 图片/文件
+  -- Feishu 群聊 @ 文本(headless，同 room 已有 workspace binding) --> workspace continuation 到 R1 或 G1；若进入 G1，attach 成功后通过统一 ingress episode replay 原消息并重新经过当前动态 gate；若只存在同 room sibling claimed instance，则 fresh-start 当前 bot 自己的 headless context；若同 room active reservation 命中则保持 R0 并提示 room_workspace_active
+  -- Feishu 群聊 @ 图片/文件(headless，同 room 已有 workspace binding) --> workspace continuation 到 R1 或 G1，并在当前 bot surface stage 图片/文件；不继承同 room sibling selected thread；若同 room active reservation 命中则保持 R0 并提示 room_workspace_active
+
+R1 AttachedUnbound
+  -- 普通文本(headless，workspace 已知) --> 隐式进入 R5 并立刻消费首条文本（R5 + E1/E2）
+  -- 图片消息(headless，workspace 已知) --> 隐式进入 R5，并先停留在 D1 StagedImages（不会仅凭图片创建新 thread）
+  -- 文件消息(headless，workspace 已知) --> 隐式进入 R5，并先停留在 D1 StagedAttachments（不会仅凭文件创建新 thread）
+  -- /list(headless) --> 保持 R1 AttachedUnbound，打开 target picker
+  -- /use(headless) --> 保持 R1 AttachedUnbound，打开 target picker（默认当前 workspace）
+  -- /useall(headless substrate) --> 保持 R1 AttachedUnbound，打开 target picker（允许跨 workspace）
+  -- target picker confirm(thread，同/跨 workspace) --> R2 AttachedPinned 或 G1 PendingHeadlessStarting
+  -- target picker confirm(new_thread，当前/其它可接管 workspace) --> R5 NewThreadReady
+  -- /follow(vscode) --> R4 FollowBound 或 R3 FollowWaiting
+  -- /follow(headless) --> 拒绝 + migration notice
+  -- /new(headless，workspace 已知) --> R5 NewThreadReady
+  -- /detach --> R0 Detached
+
+R2 AttachedPinned
+  -- /list(headless) --> 保持 R2 AttachedPinned，打开 target picker
+  -- /use(headless) --> 保持 R2 AttachedPinned，打开 target picker（默认当前 workspace）
+  -- /useall(headless substrate) --> 保持 R2 AttachedPinned，打开 target picker（允许跨 workspace）
+  -- target picker confirm(other thread，同/跨 workspace) --> R2 AttachedPinned 或 G1 PendingHeadlessStarting
+  -- target picker confirm(new_thread，同/跨 workspace) --> R5 NewThreadReady 或 G1 PendingHeadlessStarting
+  -- /follow(vscode) --> R4 FollowBound 或 R3 FollowWaiting
+  -- /follow(headless) --> 拒绝 + migration notice
+  -- /new(headless 且无 live remote work，workspace 已知) --> R5 NewThreadReady
+  -- selected thread claim 丢失 --> R1 AttachedUnbound 或 R3 FollowWaiting(vscode)
+  -- /detach(no live work) --> R0 Detached
+  -- /detach(live work) --> E6 Abandoning -> R0 Detached
+
+R3 FollowWaiting
+  -- VS Code focus 到可接管 thread --> R4 FollowBound
+  -- /use(thread，当前 attached instance 可见) --> R4 FollowBound
+  -- /use(thread，其他 instance / persisted global thread) --> 拒绝 + migration to /list
+  -- /detach --> R0 Detached
+
+R4 FollowBound
+  -- VS Code focus 切到其他可接管 thread --> R4 FollowBound
+  -- VS Code focus 消失或被别人占用 --> R3 FollowWaiting
+  -- /use(thread，当前 attached instance 可见) --> R4 FollowBound
+  -- /use(thread，其他 instance / persisted global thread) --> 拒绝 + migration to /list
+  -- /new --> 拒绝 + 提示先 `/mode codex`、`/mode claude` 或 `/mode opencode`，或继续 follow / `/use`
+  -- /detach(no live work) --> R0 Detached
+  -- /detach(live work) --> E6 Abandoning -> R0 Detached
+
+R5 NewThreadReady
+  -- 第一条普通文本 --> R5 + E1/E2，等待新 thread 落地
+  -- turn.started(remote_surface，新 thread) --> 保持 R5，turn 进入 running，但 surface 仍停留在 workspace-owned prepared state
+  -- 首轮 turn.completed(success，新 thread 已权威建立) --> R2 AttachedPinned
+  -- 首轮 turn.completed(任意终态，且新 thread 已权威建立) --> R2 AttachedPinned；若失败则同时展示对应 failure notice
+  -- /list(headless) --> 保持 R5 NewThreadReady，打开 target picker
+  -- /use / /useall(headless substrate) 且仅有 staged/queued draft --> 打开 target picker；confirm 后 discard drafts + 切换或重新准备
+  -- /use / /useall(headless substrate) 且首条消息已 dispatching/running --> 打开 target picker；confirm 时拒绝 route exit
+  -- /follow(headless) --> 拒绝 + migration notice
+  -- 重复 /new 且无 draft --> 保持 R5，仅回 already_new_thread_ready
+  -- 重复 /new 且仅有 staged/queued draft --> discard drafts，保持 R5
+  -- dispatch / command reject / thread-start reject / runtime fail(新 thread 尚未权威建立) --> 保持 R5
+  -- /detach(no live work 或仅 unsent draft) --> R0 Detached
+  -- /detach(dispatching/running 首条消息) --> E6 Abandoning -> R0 Detached
+```
+
+补充说明：
+
+1. `R5` 下首条文本 queued 后，第二条文本、新图片与新文件都会被拒绝，直到该新 thread 真正落地。
+2. `R5` 的 surface 提交点不再是 `turn.started`，而是“新 thread 的权威身份已经建立并且本轮 bootstrap 已经完成提交”。
+   这里的“已建立”当前不仅指拿到 `threadID`，还要求 daemon 侧已经把后续继续发送所需的最小 thread 元数据（尤其是继承 `cwd`）一起落进 state；否则 surface 不会停在一个“看起来 pinned 但下一条文本仍因为缺 cwd 被拒绝”的半绑定状态。
+3. 这意味着 `turn.started` 期间 surface 仍可能显示为 `new_thread_ready`；这是当前实现刻意保留的 bootstrap overlay，而不是卡死状态。
+4. 若首轮失败时 durable thread 尚未建立，surface 会自动回到可重试的 `R5`；下一条文本会再次尝试 create-thread。
+5. 若 durable thread 已建立但本轮仍失败，例如 `thread/start` 成功后 `turn/start` 被拒绝，则 surface 会提交到新 thread，并在该 thread 上展示失败。
+6. 若是在 `R1 AttachedUnbound` 下先发图片或文件，当前实现会先隐式进入 `R5` 并把附件保留为 staged；随后第一条文本会按“新 thread 首条输入”把 staged image / staged file + 文本一起发送。
+7. `R5` 下 `/use`、`/follow` 只会在首条消息已 `dispatching/running` 时被拒绝；若只是 staged/queued draft，会先丢弃再切走。
+8. `/attach` 或 `/use` 进入某个已选 thread 后，还会执行一次 thread replay 检查：
+   1. 该 thread idle 且存在 `UndeliveredReplay` 时，会立刻补发并清空。
+   2. 该 thread busy 时不会插入旧 final/旧 notice，候选保留到后续 idle 的 `/attach` 或 `/use`。
+5. headless 主链 `/list` / `/use` / `/useall` 当前共享同一套 workspace candidate / resolver 基础，但不同入口会套用不同 capability mode：
+   1. workspace 候选来自 runtime 可见 workspace 与 merged recent thread / persisted recent thread 导出的 recoverable workspace。
+   2. persisted sqlite 只负责补 freshness，不旁路 resolver；busy / claim / free-visible / reusable-headless / create-headless 仍只由现有 runtime resolver 决定。
+   3. sqlite read 失败或 schema 不兼容时，会安全回退到 runtime/catalog-only 行为。
+   4. attach/use 类入口仍会过滤 busy workspace，以及没有任何 merged thread / online instance 支撑的历史脏 workspace key；`/workspace list` / `/list` 会保留 busy Git workspace 作为仅 Worktree base 的候选，busy 非 Git workspace 仍过滤。
+6. target picker 当前承担的是 headless 主链下四张独立工作会话业务卡，而不是旧的 unified 大卡：
+   1. bare `/workspace` 是父页；bare `/workspace new` 是新建方式子页；它们都走 `FeishuPageView`，不直接承接目标选择。
+   2. `/workspace list` 与 alias `/list`、`/use`、`/useall` 当前共用同一张“切换工作会话”卡；attached `/use` 会默认当前 workspace，attached `/useall` 仍允许跨 workspace。
+   3. 这张切换卡现在只保留“工作区 + 会话 / 操作”两个下拉，不再出现模式切换、来源切换；`/workspace list` 与 alias `/list` 在工作区已确定后会把 `新建会话` 放在第一项并默认选中，已有会话保留在后面。Git workspace 额外追加 `worktree_create` 操作；busy Git workspace 只允许作为 Worktree base，因此只显示这一项；busy 非 Git workspace 不进入 workspace 下拉。`/use`、`/useall` 与锁定工作区的恢复 picker 继续保留各自既有 fallback，不把 busy workspace 放宽成可接管。
+   4. `/workspace new dir`、`/workspace new git` 与 `/workspace new worktree` 是三张独立业务卡：前者直接做目录接入，后两者分别做 Git URL 导入与 Worktree 派生；`/workspace new` 只负责把这三条路径并列展示出来。
+   5. headless 主链下的 `show_threads` / `show_all_threads` / `show_scoped_threads` / `show_workspace_threads` / `show_all_workspaces` / `show_recent_workspaces` / `show_all_thread_workspaces` / `show_recent_thread_workspaces` 当前都只负责在 same-context 中重新打开或刷新 `/workspace list` 这张切换卡。
+   6. `attach unbound`、`selected_thread_lost`、`thread_claim_lost` 当前也会复用这张切换卡，但会锁定在当前 workspace：工作区下拉隐藏、旧跨 workspace 选择会被驳回并刷新提示。
+   7. `/workspace list` 当前主路径会发出 `target_picker_select_workspace` / `target_picker_select_session` / `target_picker_back`；其中 `target_picker_back` 只服务 list 内部 Worktree 子页返回 target 页。`/workspace new dir` / `git` 会继续使用 `target_picker_open_path_picker` 打开目录子步骤；`/workspace new worktree` 则继续使用 `target_picker_select_workspace` / `target_picker_page` 切换与翻页基准工作区，并在同一张 owner card 内 inline replace 往返。
+   8. `target_picker_confirm` 虽然仍是异步产品动作，但四条业务卡都会把 processing / terminal 结果收回同一张 owner card，而不再额外 append 主结果卡。
+   9. 若 confirm 时原选择已经失效，当前会刷新一张最新 picker 并返回 `target_picker_selection_changed`，不会 silent fallback 到别的 thread / workspace；锁定当前工作区的恢复卡也遵守同一条规则。
+7. target picker confirm 的产品落点当前分三类：
+   1. `/workspace list` 既有会话：复用现有 resolver 顺序 `当前 attached instance 内可见 thread -> free existing visible instance -> reusable managed headless -> create managed headless`。
+   2. `/workspace list` 既有会话但需要跨 workspace / 跨实例：仍会先走 detach-like 清理，丢弃 staged/queued draft、清 request / capture / prompt override，再 attach 到新目标。
+   3. `/workspace list` 的 `worktree_create` 操作：不会直接创建目录，而是把同一张 owner card 切到 Worktree 子页，保留当前 base workspace。用户填写分支名/目录名并再次确认后，才进入下述 Worktree 创建链路；内部 `target_picker_back` 会回到原 target 页并按 list 默认规则恢复 `new_thread` 或唯一可用操作。
+   4. `/workspace new dir`：不会立即改 route，而是先打开目录 path picker；confirm/cancel 回调会先异步 ack，再把最新主卡 patch 回同一张 owner card。只有主卡确认时才真正进入 `R5` / fresh managed headless `R5`，cancel 则保持当前 route 不变。
+   5. `/workspace new git`：不会立即改 route，而是在同一张主卡上填写仓库地址/目录名、选择父目录，并由 daemon-side `workspace.git_import` 在持锁外执行 `git clone`；confirm 后 surface 进入 `G5 TargetPickerProcessing`，success / failure / cancel 都封回同卡 terminal，其中 success 最终进入 `R5`。
+   6. `/workspace new worktree` 与 list 内部 Worktree 子页：不会立即改 route，而是在同一张主卡上填写基准工作区、新分支名与可选目录名，并由 daemon-side `workspace.git_worktree.create` 在持锁外执行 `git worktree add`；confirm 会先 dry-run 检查群 workspace change gate，primary/busy 不满足时同卡回写错误且不创建目录；通过后才进入 `G5 TargetPickerProcessing`。success / failure / cancel 都封回同卡 terminal，其中 success 最终进入 `R5`。如果 worktree 创建完成后当前 surface 立即进入 `new_thread_ready`，此前由非 `RoomNoWorkspace` gate 路径合法保存的 pending text 会在同一 completion path 里重放；若仍等待 headless 连接，则保留 pending text 交给 snapshot runtime 重放。
+8. attached `vscode /use` / `/useall` 当前有两条额外约束：
+   1. 只展示当前 attached instance 的可见 thread，不再走 merged global thread view。
+   2. force-pick 后会保留 `RouteMode=follow_local`，后续 observed focus 变化仍可覆盖。
+   3. attached `vscode /use` / `/useall` 当前都会在顶部插入一个“当前实例”摘要，格式为 `实例标签 + 当前跟随状态`。
+   4. attached `vscode /list` 当前不再走旧 attach-instance prompt，而是直接渲染结构化 instance card：保留按钮式操作，但底层已经不再依赖 `FeishuDirectSelectionPrompt`。
+   5. attached `vscode /use` 当前会直接渲染结构化 thread dropdown，只保留最近 5 个可切换会话；选项文案改成 `workspace basename · 首条用户消息摘要`，不再保留旧分页 / “更多”按钮。
+   6. attached `vscode /useall` 当前会直接渲染结构化 thread dropdown，并列出当前实例全部可切换会话；不可切换项不再逐条展示，只在卡片下方补一条“已省略当前不可切换的会话”提示。
+   7. VS Code thread dropdown 当前直接把 `use_thread(field_name=selection_thread)` callback 发回 gateway；选择动作不再先回投旧 selection prompt 再取按钮 payload。
+9. target picker confirm 进入跨 workspace / cross-instance target 时，当前实现仍会先走 detach 语义清理：
+   1. queued / staged draft 会被清掉。
+   2. `PromptOverride`、pending request、request capture 会被清掉。
+   3. 当前 instance claim 会先释放，再 attach 到新目标。
+10. 当 surface 处于 `PendingRequest`、`RequestCapture` 或 active path picker runtime 存在时：
+   1. same-instance `/use`
+   2. `/follow`
+   3. follow-local 自动重绑定
+   当前都会被冻结，避免 UI 宣布的新目标和下一条普通输入的实际落点不一致。
+   4. 若是 active path picker runtime，当前还会额外把 `/list`、`/menu`、bare config cards、`/detach` 等 competing Feishu card flow 一并挡住，只保留 picker 自身回调与 `/status`。
+11. 若实例连上时发现历史兼容残留的 pending headless 且没有 preselected thread，只会自动 kill 该 headless、清 gate，并提示改用 `/use` / `/useall`。
+12. daemon 侧后台 auto-restore 使用的是 headless-only resolver：
+   1. 当前可见 thread 若只存在于 VS Code instance，不会被自动 attach 到 VS Code。
+   2. 它仍可复用该 thread 的 metadata / cwd。
+   3. 后续只允许落到 free visible headless、reusable managed headless，或 create managed headless。
+
+### 5.2 远端队列与 compact 生命周期
+
+```text
+E0 Idle
+  -- enqueue --> E1 Queued
+  -- dispatchNext --> E2 Dispatching
+  -- /compact(当前已绑定 thread，且无 queued/dispatching/running/steering/其他 compact) --> `CompactPending` overlay
+
+E1 Queued
+  -- queued 主文本被 `ThumbsUp`，且当前有同 thread active turn（OpenCode 除外） --> `SteerPending` overlay
+  -- `/steerall` 命中且存在同 thread queued 项（OpenCode 除外） --> `SteerPending` overlay
+
+E2 Dispatching
+  -- turn.started(remote_surface) --> E3 Running
+  -- command rejected / dispatch failure --> E0 Idle
+
+E3 Running
+  -- turn.completed(remote_surface) --> E0 Idle
+  -- reply 当前 processing source message（文本 / 本地图片，且命中当前 surface active running item，OpenCode 除外） --> `SteerPending` overlay
+
+`CompactPending` overlay
+  -- 显式 `/compact` 已提交 --> 同时创建前台 compact owner-card，首卡阶段为 `dispatching`
+  -- command dispatch accepted，等待 compact 对应 `turn.started` --> 保持 `CompactPending`
+  -- turn.started(remote_surface，命中当前 compact 请求) --> `CompactRunning` overlay，同时把 compact owner-card patch 到 `running`
+  -- command rejected / dispatch failure / `system.error(operation=thread.compact.start)` --> 清 compact overlay，把 compact owner-card patch 到 `failed`，并恢复后续 queue 出队
+  -- transport degraded / disconnect --> 清 compact overlay；若 surface 仍在且当前 flow 仍是 compact owner-card，则 best-effort patch 到 `failed`；disconnect 继续走 detach，degraded 保留 route 但不再视为 compact 进行中
+  -- remove instance --> 清 compact overlay；后续实例级移除语义继续按 detach / cleanup 处理，不再视为 compact 进行中
+
+`CompactRunning` overlay
+  -- `item.completed(context_compaction)` --> 若这是显式 `/compact` 的当前 turn，则直接把 compact owner-card patch 到 `completed`；若是被动 compact，则 quiet 保持静默，normal / verbose 继续并入共享过程卡
+  -- turn.completed(remote_surface) --> 清 compact overlay；若前面没收到 compact item，则按 `turn.completed` 的最终状态 fallback 把 compact owner-card patch 到 `completed` 或 `failed`；随后继续 dispatchNext / finishSurfaceAfterWork
+  -- compact 期间新文本 --> 先按普通 queued follow-up 入队，不立即派发
+  -- compact 期间 reply auto-steer / `/steerall` --> 不命中 compact turn
+  -- transport degraded / disconnect --> 清 compact overlay，并 best-effort 封 compact owner-card 为 `failed`；后续 reconnect 后可重新 `/compact`
+  -- remove instance --> 清 compact overlay；compact owner-card 不再继续 patch，surface 继续进入实例移除后的常规 cleanup
+
+`SteerPending` overlay
+  -- `turn.steer` command ack accepted --> 被并入的 item 逐条转 `steered`，并给对应主文本 + 已绑定图片补 `ThumbsUp`
+  -- `turn.steer` dispatch failure / command rejected --> 被并入的输入按普通语义恢复（queued item 按原顺序恢复；独立图片 reply 恢复为 staged image）
+  -- transport degraded / disconnect / remove instance --> 被并入的输入按普通语义恢复
+```
+
+补充说明：
+
+1. `pendingRemote` 先按 instance 保留“哪个 queue item 正在等 turn”，并同时保留 stage-0 dispatch `CommandID`。
+2. turn 建立后再提升到 `activeRemote`。
+3. 对空 thread 首条消息，promote 当前按 `CommandID -> Initiator.SurfaceSessionID -> thread 信息` 这个顺序命中；blank initiator 会先被视为 unknown，不会作为“可信非 remote initiator”直接绕过归并。
+4. 若 queue item 来自 `R5`，`turn.started` 只负责把 pending remote 提升到 running；surface 只有在 durable thread 已建立、且这个 thread 已被补齐最小可继续发送元数据后，才会在 bootstrap 提交时切回 `pinned`。
+5. instance 级 `ActiveTurnID/ActiveThreadID` 当前只跟踪“当前主交互面真正可中断的 turn”：
+   1. local UI turn 会更新它
+   2. 命中当前 `pendingRemote/activeRemote` 绑定、且 surface 策略是 `follow_execution_thread` 的 remote turn 也会更新它
+   3. 未绑定的 unknown/helper side-turn 不会再覆盖或清空它
+   4. `keep_surface_selection` 的 detached-branch turn 不会把 execution thread 写进 `ActiveThreadID`，因此不会污染后续 attach/resume 默认目标
+6. `/stop` 当前会优先看当前 surface 的 `activeRemote` 绑定：
+   1. 即使 instance 级 `ActiveTurnID` 暂时缺失，只要当前 surface 仍保留 active running remote binding，仍会对该主 turn 发 `turn.interrupt`
+   2. 若已进入 retained-offline / transport degraded，则仍以 offline notice 为准，不会因为 retained binding 存在而伪造 interrupt
+7. `pendingRemote/activeRemote` 当前显式保留两层信息：
+   1. runtime facts：dispatch command identity、actual execution thread
+   2. canonical dispatch contract：`PromptDispatchPlan`
+   这份 canonical plan 现在由 queue item、auto-continue、remote binding 与 wrapper restart/resume 共享，不再各自再解释一套 `FrozenThreadID/FrozenExecutionMode/CreateThreadIfMissing` 之类的平行 carrier。
+   这使 detour turn 可以在临时 thread 上跑完整轮 turn，同时 request / progress / image / final / interrupt 仍回原 surface，但不强制 surface 改绑到 execution thread
+8. `turn.steer` 不会占用 `ActiveQueueItemID`，它只复用当前已经存在的 active running turn。
+9. compact 当前不是普通 queue item，也不会占用 `ActiveQueueItemID`；它按 instance 级 `compactTurns` 单独跟踪 pending/running 状态。
+10. 显式 `/compact` 还会在当前 surface 建立一条 compact owner-card flow：
+   1. 首卡由 orchestrator 直接 append 一张 patchable `FeishuPageView`
+   2. 首次发送时靠 `TrackingKey` 回写 `message_id`
+   3. 后续 running / terminal 都继续 patch 同一张卡
+   4. 这条显式 owner-card 不受 verbosity 影响
+11. 只要 compact 仍在 pending/running，`dispatchNext` 就不会再把后续 queued 输入发给同一实例。
+12. `/steerall` 当前会把同一 active thread 下所有 queued 项聚合为一次 `turn.steer`；若没有可并入项，只返回 noop 提示，不改队列状态；compact turn 本身不会成为 steer 目标。OpenCode backend 例外：该命令 hidden + reject，不触发 `turn.steer`。
+13. compact pending/running 也属于 `surfaceHasLiveRemoteWork`：
+   1. `/mode` 会直接拒绝
+   2. `/detach` 会进入 delayed detach / abandoning
+   3. `/use`、`/follow`、`/new` 这类 route mutation 会被挡住，不会在 compact 期间偷偷切走当前 thread
+14. remote turn 在 `turn.completed` 时，若当前 item 满足 autowhip 触发条件：
+   1. surface 不会立刻同步 enqueue 新 item
+   2. 只会把 surface 置入 `A2 Scheduled`
+   3. 后续等 `Tick()` 到期后再真正 enqueue
+15. autowhip 当前只有一条触发通道：
+   1. final assistant 文本**不包含**收工口令 `老板不要再打我了，真的没有事情干了`
+16. 若 final assistant 文本命中收工口令：
+   1. 当前 surface 会回到 `A1 EnabledIdle`
+   2. 不会继续 schedule / dispatch autowhip
+   3. 会补一条 `AutoWhip` notice：`Codex 已经把活干完了，老板放过他吧`
+17. `/stop` 命中 live remote work 时，会给当前 surface 打一次 `SuppressOnce`：
+   1. 本轮 turn 收尾时不会触发 autowhip
+   2. suppress 只消费一次，之后 autowhip 恢复正常评估
+18. 当前 backoff 固定为：
+   1. `incomplete_stop`（文本未出现收工口令）: `3s -> 10s -> 30s`，最多 3 次
+19. autowhip 当前不会伪造用户消息回显，也不会补 `THINKING` / `ThumbsUp` / `ThumbsDown` reaction；额外可见性只来自上面的 `AutoWhip` notice。
+19. remote turn 在 `turn.completed` 时，若当前 item 命中 `terminalCause=autocontinue_eligible_failure`，则 autoContinue 会接管收口：
+   1. direct `turn_failed` notice 被抑制
+   2. surface 进入 autoContinue overlay，而不是 autowhip overlay
+   3. 若当前没有 gate/backoff 阻挡，会立刻开始第 1 次自动继续
+20. `/stop` 对 autoContinue 有两条收口：
+   1. 若 autoContinue 还在 `scheduled`，直接取消等待中的 episode
+   2. 若 autoContinue attempt 已经 running，则 turn 收尾时按 `user_interrupted` 归因，不会继续 schedule 下一轮 autoContinue
+21. autoContinue 当前不会跨目标长期悬挂：
+   1. `/detach`
+   2. `/new`
+   3. `/use` / `/follow`
+   4. thread 丢失 / 被强踢
+   都会清掉当前 episode，只保留 enable 开关
+22. detached-branch 文本入口当前已经直接挂在普通 text ingress：
+   1. 文本里出现 `[什么？]` 时，当前会走 `fork_ephemeral + keep_surface_selection`；它要求 surface 当前已经选中一个可见 thread，服务端会把这个 thread 作为 `source/main thread`
+   2. 文本里出现 `[耸肩摊手]` 时，当前会走 `start_ephemeral + keep_surface_selection`；它不要求 surface 已有选中 thread
+   3. detour 触发文本只作为入口信号：服务端会先把它从实际 prompt 文本里剥掉，再把消息派发给上游
+   4. detour 文本当前会显式绕过 reply auto-steer、implicit `/new` 准备态推进，以及 normal/vscode 的 unbound 输入门禁；运行时只把“当前选中 thread 的 cwd / prepared cwd / workspace root”当作临时会话的 base cwd，不会因此改写 surface 自己的 `SelectedThreadID` 或 `RouteMode`
+   5. detour turn 收尾后，surface 仍保持原先的 route / selected thread；当前只会在同一 reply lane（或原本的顶层 append lane）追加一条 `detour_returned` notice，提示“临时会话已结束，已切回原会话。”
+23. detached review session 当前复用同一套“execution thread 与 surface selected thread 分离”的承接方式，但语义比 detour 更强：
+   1. review thread 必须先带 `source=review`；surface 会优先在 `turn.started(remote_surface)` 时把它识别成 review session。若 Codex 的 `thread/started` 早于 `review/start` result 且暂时没有 `threadSource`，translator 会在 result 返回后按 `reviewThreadId` / `turn.id` 补一条 review metadata `thread.discovered(remote_surface)`，orchestrator 会先 merge source 再激活 pending session；若这轮 `turn.started` 还没拿到 remote-surface 归属，则会退回由 `entered_review_mode` / `exited_review_mode` 生命周期 item 激活同一个 pending session
+   2. 进入 review session 后，instance 级 `ActiveTurnID/ActiveThreadID` 会跟随 review thread，这保证 `/stop`、running 判定和 request gate 仍能命中真正的 review turn
+   3. surface 自己的 `SelectedThreadID` 仍保持 parent thread；因此 review turn 不会污染后续普通 attach/resume 默认目标。`ReviewSession` 的合法性不再依赖 `SelectedThreadID == ParentThreadID`，但这是正常不变量；若旧污染状态里 selected thread 已经变成 review thread，显式追问、退出审阅、按审阅意见继续修改都会先恢复到 parent selection。若此时用户重新发起 `/review uncommitted` 或 `/review commit <sha>`，启动目标也会先从 review thread 回溯到 parent thread。`/new` 进入 `new_thread_ready` 会清掉空闲 review session
+   4. 当 review session 处于 `ActiveTurnID != ""`，或已有目标为 review thread 的 queued / dispatching / running queue item 时，它也属于 live remote work；普通输入不会排队到 review thread，而是提示等待、`/stop` 或通过结果卡做显式决策
+   5. 只有结果卡 `继续追问审阅` 开启的一次性纯文字 capture 会冻结成：
+      1. `PromptExecutionMode=resume_existing`
+      2. `Target.ThreadID=ReviewThreadID`
+      3. `Target.SourceThreadID=ParentThreadID`
+      4. `Target.SurfaceBindingPolicy=keep_surface_selection`
+   6. 若某个 request / item / final turn 输出来自 review thread，但当前没有普通 `pendingRemote/activeRemote` 绑定，surface 归属与 reply anchor 会回退到 `ReviewSession` runtime，而不是丢失到 thread claim 猜测；同一路径也会让 review thread 输出等价于 `keep_surface_selection`，不会触发默认 `follow_execution_thread` 改绑
+   7. inline review 的 `entered_review_mode` / `exited_review_mode` 生命周期 item 当前不会直接投影成前台卡片；它们会把 `TargetLabel` / `LastReviewText` 写回 `ReviewSession` runtime，并在需要时补齐 `ReviewThreadID` / `ParentThreadID` / `ActiveTurnID`。detached review 不等待这组 item，而是在初始 review turn 的 `agent_message item.completed` 时保存 session-owned 候选，并在该 turn 成功完成时固化结果进入 ready
+   8. review detached frontstage 现在与 detour 共用同一条 temporary-session contract：`正在进入审阅` notice、`review_failed`、request / plan / `turn_failed` / shared progress / final card 都统一带 `TemporarySessionLabel="临时会话 · 审阅"`；review 不再依赖 app-layer 标题前缀去补可见语义
+   9. `normal` verbosity 下，review 共享过程现在额外放开 `command_execution`、`dynamic_tool_call` 与 `web_search`，避免 detached review 只显示“开始/结束”而中间看起来像假死
+   10. 对于没有显式 thread/turn carrier 的 review surface owner-card / page 事件，delivery fallback 也会按当前 active / ready review session 继承 `临时会话 · 审阅`；这样 auto-continue / compact 这类 review-only surface 卡不会丢失 review 语义
+
+### 5.3 本地 VS Code 仲裁
+
+```text
+E0/E1
+  -- local.interaction.observed 或 local turn.started --> E4 PausedForLocal
+
+E4 PausedForLocal
+  -- local turn.completed 且 queue 空 --> E0 Idle
+  -- local turn.completed 且 queue 非空 --> E5 HandoffWait
+  -- Tick 超时 --> E0 Idle 并自动恢复 dispatch
+
+E5 HandoffWait
+  -- Tick 到期 --> E0 Idle 并继续 dispatchNext
+```
+
+补充说明：
+
+1. `/new` 本身不会绕过 instance 级本地仲裁。
+2. `R5` 下首条消息如果碰到本地活动，仍可能先在 `PausedForLocal/HandoffWait` 中排队。
+
+### 5.3.1 standalone Codex 升级事务对 dispatch 的影响
+
+```text
+G0 None
+  -- daemon startStandaloneCodexUpgrade(initiator surface) --> 发起 surface 进入 G10 StandaloneCodexUpgradeRunning
+
+E0/E1(other standalone-codex-backed surface)
+  -- daemon startStandaloneCodexUpgrade --> E4 PausedForLocal
+  -- 用户发送文本/图片/文件 --> 保持 E4；输入先按原 route 冻结进 queue，但不 dispatch
+  -- daemon finishStandaloneCodexUpgrade(success/failure) --> E0 Idle 或 E1 Queued，并继续 dispatchNext
+```
+
+补充说明：
+
+1. 这是 daemon 级全局事务，不要求其它 surface 先收到主动广播。
+2. 这里只覆盖真正依赖 standalone Codex 的 surface；attached VS Code surface、以及 detached 的 `vscode` mode surface 当前不会因为这条事务被 pause / busy / restart。
+3. 非发起 surface 当前只有在用户真的尝试输入时，才会看到“当前正在升级 Codex，这条输入会在升级完成后执行”的 notice。
+4. 发起 surface 不会走“排队后恢复”语义；它的普通输入会被直接挡住，避免把 owner-flow 和普通 turn 混在一起。
+5. 这条路径当前只把 `ActionTextMessage`、`ActionImageMessage`、`ActionFileMessage` 当作 queueable input；其它 slash/menu/card 动作仍直接拒绝。
+6. install 完成后的 child restart 当前同样走 shared restart waiter：
+   1. `process.child.restart` 的 bare `ack` 只代表新 child 已接管。
+   2. 只有匹配的 restore outcome `process.child.restart.updated(status=succeeded)` 到达后，upgrade transaction 才会真正结束并恢复 `paused_for_local` surface。
+   3. 若 restore outcome 失败或 daemon 等待超时，upgrade 也会以失败事务收口，不会再出现“child 其实还在恢复，但 surface 先被误判成升级失败/成功”的半死状态。
+
+### 5.3.2 Codex 共享桌面会话订阅
+
+共享桌面模式通过 `wrapper.sharedAppServer` 启用，`CODEX_FEISHU_RELAY_SHARED_APP_SERVER` 的有效布尔值覆盖持久配置。wrapper 上报 `Capabilities.SharedAppServer`；连接程序接入共享桌面 app-server。socket 不可用时，以跨进程启动锁串行执行官方 `codex app-server daemon start`，30 秒内等待就绪；锁内再次检查，以免多个机器人或 IDE 同时恢复时重复启动。已有 daemon 不重启、不停止，不启动独立 thread writer。此模式只接受 `cp_native`，能力集为 `codex-shared-native-v1`；native probe 只执行 `initialize` / `config/read`，不走独立 runtime 的启动参数覆盖、临时 `thread/start` 或 API/OAuth Profile 隔离探测。
+
+选中会话与连接就绪分属两个事实：route 可以保留已选择的 thread，但只有当前 proxy 的订阅结果确认后，普通远程 prompt 才能 dispatch。订阅 ready 是按 instance 保存的内存态，不写入 surface resume 持久状态。
+
+```text
+选择已有 thread / 恢复 pinned thread
+  -> thread.subscribe(commandID, threadID)
+  -> thread/resume(threadId, excludeTurns=true)
+  -> thread/turns/list(threadId, limit=2, sortDirection=desc, itemsView=notLoaded)
+  -> thread.subscribed(ready, commandID, threadID, 当前真实 active turnID 或空)
+
+订阅 pending
+  -> 普通输入保留在原目标队列，等待 ready
+  -> RPC 失败 / command reject / 30 秒 timeout：提示失败，保留输入
+  -> /status 或重新选择会话：重新发起订阅
+
+disconnect
+  -> 清除该连接的订阅 ready
+  -> proxy 连回并恢复选择：重新订阅，再允许 dispatch
+```
+
+当前约束：
+
+1. 订阅用的 `thread/resume` 只携带 `threadId` 与 `excludeTurns=true`，不追加 CWD、model 或 Profile policy 覆盖；它不发送 prompt，也不创建 turn。`thread/turns/list` 读取最新两条轻量记录，只把 `status=inProgress` 的真实 ID 作为活动 turn。查询期间若已经收到更晚的 turn started/completed，结果标记 `turnSnapshotStale`，不能用旧快照覆盖实时生命周期。
+2. adapter 的 live notification 只进入当前选中 thread 的 scope；orchestrator 继续核对当前 proxy、精确 thread、thread claim 或已相关的 remote binding。切换时先向旧 thread 发 `thread/unsubscribe`，再订阅新 thread；旧 commandID 的响应、其它 thread 和错误 proxy 的活动事件不能抢占当前 active turn。目录列表和显式 history read 仍使用各自查询结果通道，不等同于活动会话订阅。
+3. 已有桌面 active turn 归属 `LocalUI`，可以投影到所选飞书 surface。共享 Codex thread 已订阅 ready 且本 surface 拥有该活动 turn 时，普通飞书文本自动并入 `turn/steer`；相同 thread 的排队用户输入按原顺序合并，自动化 queue item 留在队列。上一条 steer 在途时新输入等待其 command ack，再自动继续；active goal/interlock 时走原暂停与队列路径。`/steerall` 仍可显式升级排队输入，`/stop` 使用同一真实 thread/turn target。已接收的进展和最终输出沿用现有 progress/final 投递路径。桌面 turn 完成后，队列继续按原有仲裁与 handoff 规则推进。
+4. ready 且 idle 时，远程 prompt 直接向同一个 thread 发送 `turn/start`。共享模式只以该 RPC 的 `result.turn.id` 确认远程 turn：响应前同 thread 的 turn 事件暂存，成功后按真实 TurnID 标记远程 surface 与原 `CommandID`，再按原顺序释放；只有缺少真实 started 通知时才用 RPC 的真实 turn 证据补齐开始事件。完整 turn 已在响应前结束时不得重新标成 running；没有 TurnID 的 `request.resolved` 也必须跟随 request started 保序。其它 TurnID 保持 `LocalUI`，不能被“该 thread 有 pending remote prompt”误认领。远程 start 被拒绝先释放桌面事件，再只收束对应 CommandID 的 pending remote command，不结束或清掉桌面 active turn 及其已接收输出。
+5. `/new` 的首条输入仍走 `thread/start`。只有关联到原 prompt CommandID 的创建成功响应才能把返回的新 thread ID 采纳为 ready scope，并发送后续 `turn/start`；不需要再 resume，也不依赖该新会话已产生本地 rollout。无关 `thread/started` 通知不能替代创建响应证据。
+6. shared child 的 `PrepareChildRestart` 在停止 child 之前以 `shared_app_server_restart_not_supported` 拒绝重启/重新配置，保留已有可用订阅；restore 入口也拒绝生成恢复请求。连接程序拒绝改变桌面配置的 startup config / MCP overrides，wrapper 不注入 Feishu MCP 启动参数。不能把这类失败当成“桌面设置已经应用”；设置由桌面端管理。
+7. 订阅确认的是本次连接的目标与当前活动 turn。订阅前已存在的审批请求、断线期间未收到的输出，不在当前完整回放保证内；恢复 active turn 不代表补齐了所有历史审批或输出。
+8. 共享模式下 `/compact` 与独立 `/review` 在 adapter 发送任何请求前明确拒绝，并提示在桌面端执行；它们不进入缺少 turn/start RPC ID 关联的 pending 状态。
+9. 实时 `item/completed(userMessage)` 同步为所选 surface 的“电脑端输入” notice。所有桥接 `turn/start` / `turn/steer` 都设置带 `codex-feishu-relay:` 前缀的 `clientUserMessageId`；native 回传的 `clientId` 作为逐条输入来源标识，带标记的飞书输入不重复回显。不能按 turn initiator 判定输入来源：桌面和手机可以在同一 turn 中交替 steer。只投递给当前 instance、精确 thread 的 claim owner；不向其它机器人广播，也不从历史查询补发。当前订阅按 turn/item 保留最近 512 条去重标记；切换或重连重新建立订阅，无跨断线完整重放保证。纯附件显示占位说明，文本按卡片预算分段；用户输入只更新用户消息摘要，不写助手摘要或触发新的 prompt。
+
+本路径的死状态审计：订阅 pending 有 30 秒 watchdog；失败保留队列并提供 `/status` / 重选重试；disconnect 不保留虚假的 ready；晚到响应须匹配本次 CommandID；桌面 turn 与本端被拒绝的 remote start 分别收束。共享模式未增加持久 modal、独立卡片 owner 或绕过 claim 的入口。
+
+桌面启动与窗口恢复（本地 macOS 安装）：
+
+- `CODEX_FEISHU_RELAY_DESKTOP_OPEN=1` 与 shared 模式同时启用后，只有已关联 CommandID 的订阅 ready，或新 thread 的真实 route 绑定完成，才发 `DaemonCommandOpenSharedDesktop`；携带精确 thread 的真实 CWD，不用实例旧工作区推断项目。
+- daemon 异步调用共享 launcher 的 `open-vscode`，不持锁等待 UI，也不阻塞 `dispatchNext`。启动前、完成时与 tick 均核对当前 surface/instance/thread/CWD；切换会话或退出服务取消旧任务。成功后 5 秒内去重，失败或缓存到期后的明确重选可重试。
+- 私有文件请求交给 `extensions/codex-feishu-relay-desktop`。已有匹配项目窗口先 claim；没有窗口 claim 时用 VS Code CLI 新开该项目。伴随扩展按真实目录匹配窗口，只接受用户配置的可信共享 launcher，不经全局 URI 路由；结果必须回传相同 request ID、CWD 和 thread ID。
+- VS Code/Codex 都未打开：启动共享 daemon，打开项目，激活配置为共享 launcher 的 Codex 扩展，再打开原 thread 编辑器。VS Code 已打开但后台已退出：启动共享 daemon，若窗口记录的 socket generation 已改变，则保存一次性恢复票据、重新加载该项目窗口，恢复原 thread。票据防止无限 reload；打开会话不会创建 prompt 或 fork。
+- helper 等 UI 确认最多 90 秒，daemon 任务最多 100 秒。UI 失败明确提示“后台已连接，窗口打开失败”，后台会话仍可使用；重新选择可重试。电脑必须开机且本地桌面会话可用。失效后台导致正在执行的任务结果不确定，沿用原断线仲裁；此启动功能不承诺重放中断中的任务或全部队列，也不补齐离线输出。
+
+### 5.4 daemon 重启恢复与 headless 生命周期
+
+```text
+G0 None
+  -- daemon startup latent normal surface + persisted target --> 先走 normal visible/workspace 恢复判定
+  -- /use(thread，需要 create headless) --> G1 PendingHeadlessStarting
+  -- R0 Detached 且 `surface resume state` 里仍有 `ResumeHeadless=true` 的 concrete thread-restore 目标 --> 后台 exact-thread continuation 判定
+
+G1 PendingHeadlessStarting
+  -- instance connected 且 pending.Purpose=fresh_workspace 且 pending.PrepareNewThread=false --> R1 AttachedUnbound + G0 None
+  -- instance connected 且 pending.Purpose=fresh_workspace 且 pending.PrepareNewThread=true --> R5 NewThreadReady + G0 None
+  -- instance connected 且 pending.Purpose=workspace_route_restart 且 pending.PrepareNewThread=false --> R1 AttachedUnbound + G0 None
+  -- instance connected 且 pending.Purpose=workspace_route_restart 且 pending.PrepareNewThread=true --> R5 NewThreadReady + G0 None
+  -- instance connected 且 pending.ThreadID != "" 且非 auto-restore --> R2 AttachedPinned + G0 None
+  -- instance connected 且 pending.ThreadID != "" 且 auto-restore --> R2 AttachedPinned + G0 None + 单条恢复成功 notice
+  -- instance connected 且 pending.ThreadID != "" 且 auto-restore exact-thread 接管失败 --> kill headless + clear pending + R0 Detached + 单条恢复失败 notice
+  -- instance connected 且 pending.ThreadID == "" 且也不是 fresh_workspace/workspace_route_restart（仅历史兼容兜底） --> kill headless + generic notice + G0 None
+  -- /mode codex|claude|opencode|vscode（目标 backend 或 ProductMode 发生变化） --> kill headless + clear persisted resume target + G0 None + R0 Detached(目标 mode/backend)
+  -- /detach --> kill headless + G0 None + R0 Detached
+  -- Tick timeout --> kill headless + clear pending；thread/fresh workspace 路径按需 detach，`workspace_route_restart` / `prompt_dispatch_restart` 保留当前 workspace route
+```
+
+daemon startup 的 headless resume 额外规则：
+
+1. 触发点：
+   1. daemon startup 后的 tick
+   2. `hello`
+   3. `threads.snapshot`
+   4. `thread.discovered`
+   5. `thread.focused`
+   6. `disconnect`
+2. 前置条件：
+   1. surface 当前处于 headless 主链（当前持久化 token 仍是 `ProductMode=normal`）
+   2. surface 当前没有显式 attach
+   3. surface 当前没有 pending headless
+   4. `surface resume state` 里仍有 `ResumeThreadID` 或 `ResumeWorkspaceKey`
+3. 恢复优先级：
+   1. exact visible thread 恢复
+   2. workspace-owned route 恢复（`ResumeRouteMode=unbound|new_thread_ready`）
+   3. 非 headless pinned thread 的 workspace fallback
+   4. concrete headless thread restore 的 auto-restore
+4. 若 daemon 启动后的首轮 `threads.refresh -> threads.snapshot` 还没走完，且 persisted target 里包含 `ResumeThreadID`：
+   1. 保持 `R0 Detached`
+   2. 静默等待
+   3. 不降级到 workspace，也不给失败提示
+5. exact visible thread 恢复成功时：
+   1. 进入 `R2 AttachedPinned`
+   2. 只发一条 “已恢复到之前会话” notice
+   3. 清掉该 thread 的旧 replay，避免补历史噪音
+6. workspace attach / workspace prepare fallback 成功时：
+   1. 若目标 route 是普通 workspace attach，则进入 `R1 AttachedUnbound` 并发一条 “已先回到工作区” notice
+   2. 若目标 route 是 `new_thread_ready`，则直接进入 `R5 NewThreadReady`
+   3. 若需要先 fresh-start workspace，则会先发 `workspace_create_starting`；成功后再按上面两种 route 落位
+   4. 若当前 workspace 已确定但 runtime contract 需要重启，则会进入 `workspace_route_restart_starting`；成功后直接回到同 workspace 的 `R1 AttachedUnbound` 或 `R5 NewThreadReady`，失败/超时也保留 workspace claim，不把用户主路径引回 `/list`
+7. 若首轮 refresh 已完成，但 visible/workspace 路径仍无法恢复：
+   1. 若目标属于普通 non-headless resume 且连 workspace route 也不存在：保持 `R0 Detached`，发一条恢复失败提示，并进入 daemon 内存态 backoff
+   2. 若目标已经进入 fresh workspace prepare，但 launcher 失败或超时：保持 `R0 Detached`，发 `workspace_create_start_failed` / `workspace_create_start_timeout`
+   3. 若目标是 `ResumeHeadless=true` 的 concrete managed-headless thread restore：headless resume 会在同一条主链里继续 exact-thread continuation，并投影 headless-specific notice；不会再把这件事交给独立的第二 recovery 通道
+
+daemon startup 的 vscode resume 额外规则：
+
+1. 触发点：
+   1. daemon startup 后的 tick
+   2. `hello`
+   3. `threads.snapshot`
+   4. `thread.discovered`
+   5. `thread.focused`
+   6. `disconnect`
+2. 前置条件：
+   1. surface 当前是 `vscode` mode
+   2. surface 当前没有显式 attach
+   3. surface 当前没有 pending headless
+   4. `surface resume state` 里仍有 `ResumeInstanceID`
+3. 恢复规则：
+   1. 只认 exact `ResumeInstanceID`
+   2. unrelated instance 的 `hello` 不会触发 attach
+   3. 不做 workspace fallback，也不走 headless
+   4. 若 surface resume 里还残留 headless 恢复目标，mode 切换与后续 state sync 会把它清掉；旧 hint 文件不参与运行时恢复
+4. exact instance 当前在线且可接管时：
+   1. 复用现有 vscode attach/follow-local 路径
+   2. 若已有可跟随焦点，则进入 `R4 FollowBound`
+   3. 若还没有新的 VS Code 活动，则进入 `R3 FollowWaiting`
+   4. 只发一条“已恢复到 VS Code 实例”的 notice，并明确提示去 VS Code 再说一句话或手动 `/use`
+5. 若 exact instance 还没连回：
+   1. 保持 `R0 Detached`
+   2. 静默等待
+   3. 不给失败提示
+6. 若 exact instance 当前已被其他飞书 surface 接管：
+   1. 保持 `R0 Detached`
+   2. 发一条恢复失败提示
+   3. 进入 daemon 内存态 backoff
+
+后台 auto-restore 额外规则：
+
+1. 触发点：
+   1. daemon startup 后的 tick
+   2. `hello`
+   3. `threads.snapshot`
+   4. `thread.discovered`
+   5. `thread.focused`
+2. daemon startup 时会先根据 `surface resume state` materialize latent detached surface，并恢复 route、`ProductMode`、`Backend`、`ClaudeProfileID` 与 `Verbosity` 执行 hint；合法 Feishu surface 随后由 gateway bot capability store 覆盖能力投影，`PlanMode` 也只从该 bot store 恢复。`surface resume state` 仍是 surface route 与 headless thread 恢复目标的唯一持久化源，但不是 bot capability 的第二写源。startup 不再导入独立的 `headless-restore-hints.json`。
+3. `surface resume state` 只有成功载入后才会 materialize 并进入后台恢复；读取、JSON 或 schema version 失败时，daemon 会把该 store 标为 read-only degraded，不创建替代空 store、不清掉进程内已有 recovery episode，也不允许后续 sync 覆盖原文件。若状态已成功解码但 canonical sanitation 保存失败，规范化后的 entry 仍可用于 materialize/recovery，但 store 保持只读。修复文件并重新 configure（通常是重启 daemon）后才恢复持久化写入。
+   - Profile Catalog migration 只在 admin config 与 context preference、bot capability、surface resume 三个 durable store 均 ready 后运行，因此 `SetHeadlessRuntime -> ConfigureAdmin` 与反向初始化顺序不会制造不可恢复 degraded。若 config 已经标记完成 migration，但 context preference store 缺少当前 config 中的 Codex/Claude profile 条目，startup 会先按 config 幂等补齐缺项再 verify / materialize catalog；只有 store 读取损坏、不可写、legacy provider marker 冲突或 profile record 本身无法解析时才进入 profile catalog degraded。
+4. 后台恢复前置条件：
+   1. surface 当前处于 headless 主链（当前持久化 token 仍是 `ProductMode=normal`）
+   2. surface 当前没有显式 attach
+   3. surface 当前没有 pending headless
+   4. `surface resume state` 里仍存在 `ResumeHeadless=true` 且 `ResumeThreadID` 非空的恢复目标
+   5. surface recovery policy 允许后台恢复；Feishu 群聊 surface 不满足这个条件，只 materialize latent context，不会由 startup/tick 自动拉起 headless
+5. Feishu 群聊按需恢复的 continuation 不是独立 dispatch lane：`PendingHeadless` attach 成功后，daemon 会先清 continuation，再把 clone 的原 action 送回统一 locked ingress episode，并禁用再次 on-demand recovery。这样 replay 会重新经过当前 rejected inbound、room workspace conflict、upgrade owner flow、turn patch transaction/flow 与后续 sync 收尾；若任一 gate 阻断，continuation 仍保持已消费，只返回当前 gate 的单次提示，不会下一次 `hello` 再重放。
+6. 解析顺序：
+   1. 先看当前 merged thread view
+   2. 若 thread 不可见但 hint 仍有 `threadID + threadCWD`，允许构造 synthetic view
+   3. 之后只允许落到 headless 目标，不会自动 attach 到 VS Code
+7. 若 surface 当前是 `vscode` mode，后台恢复会直接跳过，不会 attach 现有 headless，也不会启动新的 headless。
+8. 若 daemon 启动后的首轮 `threads.refresh -> threads.snapshot` 还没走完，且当前又无法从 visible/synthetic view 判定恢复目标：
+   1. 保持 `R0 Detached`
+   2. 静默等待
+   3. 不给用户失败提示
+9. 若首轮 refresh 已完成，目标 thread 仍不可判定：
+   1. 保持 `R0 Detached`
+   2. 在后台自动恢复中记录 `thread_not_found` / `headless_restore_thread_not_found` 与 backoff，但不投递恢复失败提示；thread catalog、实例连回和 synthetic view 仍可能在后续 tick 补齐 evidence
+   3. VS Code 或手动恢复路径仍可对当前交互投递一次 “暂时无法找到之前会话” 提示
+10. 后台恢复成功 attach 时：
+   1. 不补发 thread replay
+   2. 不补 thread selection changed 卡片
+   3. 只发一条恢复成功 notice
+11. headless launch 失败或超时时：
+   1. 清掉 pending
+   2. 保持 `R0 Detached`
+   3. 若失败码是可重试的 `headless_restore_start_failed` / `headless_restore_start_timeout`，只记录 backoff 并静默等待下一轮自动恢复
+   4. 若失败码是确定性的 provider/profile/runtime/workspace/cwd 类错误，发一次恢复失败提示并停止本轮可运行恢复
+12. headless launch 成功且实例连回后，如果 auto-restore exact-thread 接管失败：
+   1. 清掉 pending
+   2. kill 本轮 auto-restore 拉起的 headless
+   3. 保持 `R0 Detached`
+   4. 先进入 daemon recovery notice gate；`thread_not_found`、busy、启动时序类结果只静默记录 backoff，workspace/cwd/provider/profile/runtime 等确定性失败才发一次恢复失败提示
+   5. 不清持久化恢复目标，由 daemon 运行态按 backoff 控制后续 retry；同目标 entry 的展示元数据刷新不会重置这份 backoff / last notice 状态
+
+### 5.5 detach / abandoning 生命周期
+
+```text
+/detach
+  -- 无 live work --> finalizeDetachedSurface --> R0 Detached
+  -- 有 live work --> discard drafts + E6 Abandoning
+
+E6 Abandoning
+  -- 当前 turn 收尾 / disconnect / queue fail --> R0 Detached
+  -- Tick 超时 --> force finalize --> R0 Detached
+```
+
+detach 时额外保证：
+
+1. 未发送 queue item 会被丢弃。
+2. staged image / staged file 会被丢弃。
+3. request prompt / request capture 会被清空。
+
+### 5.6 transport degraded / reconnect / hard disconnect
+
+```text
+R1/R2/R3/R4/R5 + inst.Online=true
+  -- ApplyInstanceTransportDegraded --> 保持当前 route state + inst.Online=false
+
+transport degraded retained attachment
+  -- 当前 active item 若在 dispatching/running 且已有 remote binding --> 保留 active item 与 remote ownership
+  -- 当前 active item 若尚未绑定可恢复 turn --> fail 当前 active item
+  -- queued items --> 保留 queued
+  -- /stop --> 仅提示实例离线，暂时无法发送 interrupt
+  -- /detach --> 立即 finalize 到 R0 Detached
+  -- reconnect(ApplyInstanceConnected) --> 继续当前 route state，但不会抢先 dispatch queued work
+  -- preserved turn.completed --> 再继续 dispatchNext / reevaluateFollow
+  -- hard disconnect(ApplyInstanceDisconnected / RemoveInstance) --> R0 Detached
+```
+
+补充说明：
+
+1. `transport_degraded` 和真正离线不是同一路径。
+2. degraded 会保留：
+   1. `AttachedInstanceID`
+   2. `SelectedThreadID`
+   3. queued work
+   4. 已进入 `dispatching/running` 且有真实 remote binding 的 active queue item
+   5. 该 preserved turn 对应的 remote ownership 与 turn artifacts
+3. degraded 会清掉：
+   1. 当前 active turn 归属
+   2. request prompt / request capture
+   3. surface-level prompt override
+4. degraded 不再把“链路过载/等待恢复”直接翻译成“当前执行已中断”。若 active turn 已经发出且可相关到 remote binding，当前 turn 仍可能继续执行，只是实时输出可能延迟或丢失。
+5. 因为 attachment 仍在，所以 `/status` 必须明确显示“实例离线但接管关系保留”；同时 retained-offline 状态下必须保留显式逃生口：
+   1. `/detach` 立即生效，不进入 `Abandoning`
+   2. `/stop` 只返回 `stop_instance_offline` 提示，不伪造已发送 interrupt
+6. reconnect 只恢复实例在线和 follow 评估，不会因为 queued item 还在就抢先重派；必须等 preserved turn 自己 `completed/failed` 后，后续 queued work 才会继续出队。
+7. 如果该 surface 的 `surface resume state` 仍保留 `ResumeHeadless=true` 的 concrete thread-restore 目标，hard disconnect 回到 `R0 Detached` 后会重新进入同一条 headless recovery 主链里的 exact-thread continuation 判定。
+8. daemon graceful shutdown 也不是 `transport_degraded`。当前实现会在真正停掉 Feishu gateway 前，对内存里允许 daemon lifecycle notice 的 surface best-effort 发送单条 `daemon_shutting_down` notice；Feishu 群聊 surface 会被跳过，Feishu 私聊与非 Feishu surface 保持现有行为。如果某个 surface 或 gateway 发送失败，只记录日志，不阻塞最终退出。
+9. 这几类提示当前统一归类为 `global runtime` 独立车道，而不是 `owner-flow` 或 `turn-owned`：
+   1. 真正脱离当前 owner-card 上下文的 surface resume / VS Code resume failure
+   2. 真正脱离当前 owner-card 上下文的 `open VS Code` prompt
+   3. `attached_instance_transport_degraded`
+   4. `daemon_shutting_down`
+   5. `gateway_apply_failed`
+10. `global runtime` 提示当前统一保持顶层 append-only：
+   1. 不 reply 到 turn 源消息
+   2. 不 patch 当前 owner-card / target picker / request prompt；当前唯一例外是 stamped `/mode vscode` 会在 fallback 到这条车道前，先尝试把首张可投影兼容提示卡承接到当前卡
+   3. 不借用 turn-owned reply-chain 或 final-card anchor
+11. 当前的重复触发策略已经按 family 收口到同一 helper，而不再散在各入口各写一份：
+   1. resume failure / VS Code open prompt 仍以 source 侧恢复 backoff 为主，helper 只额外做短窗去重，避免同批次重复弹出
+   2. `attached_instance_transport_degraded` 当前按 `surface + family + code` 做短窗节流，避免离线抖动时连续刷同一张系统提示
+   3. `daemon_shutting_down` 当前仍是一轮 shutdown 里每 surface 最多一条，并附带较长 dedupe 窗口
+   4. `gateway_apply_failed` 当前会先排入 daemon 的 pending runtime notice 队列，待下一次正常 gateway apply 成功前置冲刷；同 surface 同 family 的重复错误会按 dedupe key 收敛
+12. 因此，后续若新增真正属于 runtime 层的提示，默认应进入这条独立车道，而不是继续直接手写普通 `UIEventNotice`。
+
+## 6. 命令矩阵
+
+### 6.1 基础路由态
+
+除单元格显式写 `vscode` 外，`headless` 路径当前包含 `codex` / `claude` / `opencode` 三个 backend；OpenCode 在 workspace/session 壳上与 headless 主链一致，差异由 4.1.2 的 command profile 与 admission 规则约束。
+
+| 命令 | `R0 Detached` | `R1 AttachedUnbound` | `R2 AttachedPinned` | `R3 FollowWaiting` | `R4 FollowBound` | `R5 NewThreadReady` |
+| --- | --- | --- | --- | --- | --- | --- |
+| `/list` | 允许 | 允许 | 允许 | 允许 | 允许 | 允许 |
+| `/workspace` `/workspace new` | `codex headless`: 允许，分别打开工作会话父页 / 新建方式页；`claude headless`: hidden + allow，继续复用同一工作区与会话壳；`vscode`: 拒绝并提示先切到 headless | `codex headless`: 允许，分别打开工作会话父页 / 新建方式页；`claude headless`: hidden + allow，继续复用同一工作区与会话壳；`vscode`: 拒绝并提示先切到 headless | `codex headless`: 允许，分别打开工作会话父页 / 新建方式页；`claude headless`: hidden + allow，继续复用同一工作区与会话壳；`vscode`: 拒绝并提示先切到 headless | `codex headless`: 允许，分别打开工作会话父页 / 新建方式页；`claude headless`: hidden + allow，继续复用同一工作区与会话壳；`vscode`: 拒绝并提示先切到 headless | `codex headless`: 允许，分别打开工作会话父页 / 新建方式页；`claude headless`: hidden + allow，继续复用同一工作区与会话壳；`vscode`: 拒绝并提示先切到 headless | `codex headless`: 允许，分别打开工作会话父页 / 新建方式页；`claude headless`: hidden + allow，继续复用同一工作区与会话壳；`vscode`: 拒绝并提示先切到 headless |
+| `/workspace list` `/workspace new dir` `/workspace new git` `/workspace new worktree` | `codex headless`: 允许，分别打开切换卡 / 目录新建卡 / Git 新建卡 / Worktree 新建卡；`claude headless`: `/workspace new dir` visible + allow，`/workspace list` / `/workspace new git` / `/workspace new worktree` hidden + allow，继续复用同一 target picker / 新建工作区卡；`vscode`: 拒绝并提示先切到 headless | `codex headless`: 允许，分别打开切换卡 / 目录新建卡 / Git 新建卡 / Worktree 新建卡；`claude headless`: `/workspace new dir` visible + allow，`/workspace list` / `/workspace new git` / `/workspace new worktree` hidden + allow，继续复用同一 target picker / 新建工作区卡；`vscode`: 拒绝并提示先切到 headless | `codex headless`: 允许，分别打开切换卡 / 目录新建卡 / Git 新建卡 / Worktree 新建卡；`claude headless`: `/workspace new dir` visible + allow，`/workspace list` / `/workspace new git` / `/workspace new worktree` hidden + allow，继续复用同一 target picker / 新建工作区卡；`vscode`: 拒绝并提示先切到 headless | `codex headless`: 允许，分别打开切换卡 / 目录新建卡 / Git 新建卡 / Worktree 新建卡；`claude headless`: `/workspace new dir` visible + allow，`/workspace list` / `/workspace new git` / `/workspace new worktree` hidden + allow，继续复用同一 target picker / 新建工作区卡；`vscode`: 拒绝并提示先切到 headless | `codex headless`: 允许，分别打开切换卡 / 目录新建卡 / Git 新建卡 / Worktree 新建卡；`claude headless`: `/workspace new dir` visible + allow，`/workspace list` / `/workspace new git` / `/workspace new worktree` hidden + allow，继续复用同一 target picker / 新建工作区卡；`vscode`: 拒绝并提示先切到 headless | `codex headless`: 允许，分别打开切换卡 / 目录新建卡 / Git 新建卡 / Worktree 新建卡；`claude headless`: `/workspace new dir` visible + allow，`/workspace list` / `/workspace new git` / `/workspace new worktree` hidden + allow，继续复用同一 target picker / 新建工作区卡；`vscode`: 拒绝并提示先切到 headless |
+| `/new` | 拒绝 | `headless`: 允许；`vscode`: 拒绝 | `headless`: 允许；若存在 compact/steer/queued/dispatching/running 或运行中的 review turn 则拒绝；空闲 review session 会被清掉；`vscode`: 拒绝 | 拒绝 | 拒绝 | 允许；若首条消息已 dispatching/running 则拒绝；空闲 review session 会被清掉 |
+| `/compact` | 提示先 `/list` / `/use` 接管并绑定会话 | 提示先 `/use`，或直接发文本开启新会话 | 允许；仅对当前已绑定 thread 生效，若已有 compact/steer/queued/dispatching/running 则拒绝 | 提示先在 VS Code 里进入会话，或手动 `/use` | 允许；仅对当前跟随到的 thread 生效，若已有 compact/steer/queued/dispatching/running 则拒绝 | 提示先发送首条文本真正创建会话 |
+| `/history` | 提示先 `/list` 接管在线实例 | 提示先 `/use`，或直接发文本开启新会话 | 允许；读取当前选中 thread 的历史 | 提示先在 VS Code 里进入会话，或手动 `/use` | 允许；读取当前跟随 thread 的历史 | 提示先发送首条文本真正创建会话 |
+| `/mcpoauth <server>` | 拒绝并提示先 `/list` / `/use` 接管实例 | 允许；省略 `threadId` 发起 app-scoped OAuth login | 允许；传当前 selected thread 作为 `threadId` | 允许；没有 selected thread 时省略 `threadId` | 允许；传当前跟随 thread 作为 `threadId` | 允许；省略 `threadId` 发起 app-scoped OAuth login |
+| `/use` `/useall` | `codex headless`: 二者都只是 `/workspace list` 的 alias；`/use` 偏向当前 workspace，`/useall` 允许跨 workspace；`claude headless`: `/use` 可见、`/useall` hidden + allow，二者复用 workspace-session 切换卡；`vscode`: 拒绝并提示先 `/list` | `codex headless`: 二者都打开 `/workspace list` 切换卡；`/use` 默认当前 workspace，`/useall` 允许跨 workspace；`claude headless`: `/use` 可见、`/useall` hidden + allow，二者复用同一底层切换卡；`vscode`: `/use`=当前 instance 最近 5 个，`/useall`=当前 instance 全量 | `codex headless`: 二者都打开 `/workspace list` 切换卡，允许在 confirm 时切到其他 workspace 的已有会话；但若存在 compact/steer/queued/dispatching/running，confirm 时拒绝 route exit；`claude headless`: `/use` 可见、`/useall` hidden + allow，二者复用同一切换卡；`vscode`: `/use`=当前 instance 最近 5 个，`/useall`=当前 instance 全量 | `/use`=当前 instance 最近 5 个，`/useall`=当前 instance 全量 | `/use`=当前 instance 最近 5 个，`/useall`=当前 instance 全量；若存在 compact/steer/queued/dispatching/running，则拒绝切走当前 thread | `codex headless`: 允许打开 `/workspace list` 切换卡；若仅有 unsent draft，confirm 前会先丢弃；若首条已 dispatching/running，则 confirm 时拒绝 route exit。`claude headless`: `/use` 可见、`/useall` hidden + allow，二者复用同一路径 |
+| `/follow` | `headless`: 拒绝并提示迁移；`vscode`: 拒绝并提示先 `/list` | `headless`: 拒绝并提示迁移；`vscode`: 允许 | `headless`: 拒绝并提示迁移；`vscode`: 允许；若存在 compact/steer/queued/dispatching/running 则拒绝 route change | 允许 | 允许；若存在 compact/steer/queued/dispatching/running，则保持当前 thread 不切换 | 拒绝并提示迁移 |
+| `/mode` | 允许 | 允许；若有 compact/steer/queued/dispatching/running 则拒绝 | 允许；若有 compact/steer/queued/dispatching/running 则拒绝 | 允许；若有 compact/steer/queued/dispatching/running 则拒绝 | 允许；若有 compact/steer/queued/dispatching/running 则拒绝 | 允许；若有 compact/steer/queued/dispatching/running 则拒绝 |
+| `/autowhip` | 允许 | 允许 | 允许 | 允许 | 允许 | 允许 |
+| `/autocontinue` | 允许 | 允许 | 允许 | 允许 | 允许 | 允许 |
+| `/help` `/menu` `/debug` `/upgrade` | 允许 | 允许 | 允许 | 允许 | 允许 | 允许 |
+| `/primary on/off/status/refresh` | 允许；私聊只提示只能在群聊使用，群聊中设置/取消/查看 room primary gateway | 允许；私聊只提示只能在群聊使用，群聊中设置/取消/查看 room primary gateway | 允许；私聊只提示只能在群聊使用，群聊中设置/取消/查看 room primary gateway | 允许；私聊只提示只能在群聊使用，群聊中设置/取消/查看 room primary gateway | 允许；私聊只提示只能在群聊使用，群聊中设置/取消/查看 room primary gateway | 允许；私聊只提示只能在群聊使用，群聊中设置/取消/查看 room primary gateway |
+| `/steerall` | 允许；通常返回 noop 提示；OpenCode hidden + reject | 允许；通常返回 noop 提示；OpenCode hidden + reject | 允许；仅在存在同 thread queued + running turn 时并入，否则 noop；OpenCode hidden + reject | 允许；通常返回 noop 提示；OpenCode hidden + reject | 允许；仅在存在同 thread queued + running turn 时并入，否则 noop；OpenCode hidden + reject | 允许；通常返回 noop 提示；OpenCode hidden + reject |
+| 文本 | 一般拒绝；Feishu 群 headless 若同 room 已绑定 workspace，则先继承 room workspace 并接管/启动当前 bot context，再按 `R1` 文本规则进入新会话首条输入；同 room 无 workspace 时返回 `room_workspace_required` | `headless`: 允许并隐式进入新会话首条输入；`vscode`: 拒绝 | 允许 | 拒绝 | 允许 | 允许首条；首条 queued/dispatching/running 后拒绝第二条 |
+| 图片 | 一般拒绝；Feishu 群 headless 若同 room 已绑定 workspace，则先继承 room workspace 并接管/启动当前 bot context，再 stage 到当前 bot；同 room 无 workspace 时返回 `room_workspace_required` | `headless`: 允许并隐式进入 `R5` 后暂存；`vscode`: 拒绝 | 允许 | 拒绝 | 允许 | 仅在首条文本尚未入队前允许 |
+| 文件 | 一般拒绝；Feishu 群 headless 若同 room 已绑定 workspace，则先继承 room workspace 并接管/启动当前 bot context，再 stage 到当前 bot；同 room 无 workspace 时返回 `room_workspace_required` | `headless`: 允许并隐式进入 `R5` 后暂存；`vscode`: 拒绝 | 允许 | 拒绝 | 允许 | 仅在首条文本尚未入队前允许 |
+| 请求按钮 | 拒绝 | 拒绝 | 允许 | 拒绝 | 允许 | 理论上通常不会出现；若出现仍按 attached surface 处理 |
+| `/stop` | 通常无效果 | 通常无效果 | 允许 | 允许 | 允许 | 允许；可清掉 staged/queued draft |
+| `/status` | 允许 | 允许 | 允许 | 允许 | 允许 | 允许 |
+| `/detach` | 允许但通常只提示已 detached；`codex` 与 `claude` 的菜单主展示命令都已切到 `/workspace detach`，裸 `/detach` 只保留兼容 alias | 允许；`codex` 与 `claude` 的菜单主展示命令都已切到 `/workspace detach`，裸 `/detach` 只保留兼容 alias | 允许；`codex` 与 `claude` 的菜单主展示命令都已切到 `/workspace detach`，裸 `/detach` 只保留兼容 alias | 允许；`codex` 与 `claude` 的菜单主展示命令都已切到 `/workspace detach`，裸 `/detach` 只保留兼容 alias | 允许；`codex` 与 `claude` 的菜单主展示命令都已切到 `/workspace detach`，裸 `/detach` 只保留兼容 alias | 允许；dispatching/running 时走 abandoning；`codex` 与 `claude` 的菜单主展示命令都已切到 `/workspace detach`，裸 `/detach` 只保留兼容 alias |
+| bare `/mode` / bare `/autowhip` / bare `/autocontinue` | 允许，返回快捷按钮 + 表单卡 | 允许，返回快捷按钮 + 表单卡 | 允许，返回快捷按钮 + 表单卡 | 允许，返回快捷按钮 + 表单卡 | 允许，返回快捷按钮 + 表单卡 | 允许，返回快捷按钮 + 表单卡 |
+| bare `/model` `/reasoning` `/permission` | Feishu 私聊 headless 按 backend 开放 bot setting 参数卡：Codex 三者均开放，Claude 开放 reasoning/access，OpenCode 开放 access；OpenCode reasoning 因缺 ACP `effort` 证据返回 attachment-required 卡，Claude/OpenCode model 由 command support hidden + reject。VS Code 与非 Feishu surface 保留 attachment-required 卡 | 允许，返回快捷按钮 + 表单卡 | 允许，返回快捷按钮 + 表单卡 | 允许，返回快捷按钮 + 表单卡 | 允许，返回快捷按钮 + 表单卡 | 允许，返回快捷按钮 + 表单卡 |
+| bare `/debug` `/upgrade` | 允许，返回状态 + 快捷按钮 + 表单卡 | 允许，返回状态 + 快捷按钮 + 表单卡 | 允许，返回状态 + 快捷按钮 + 表单卡 | 允许，返回状态 + 快捷按钮 + 表单卡 | 允许，返回状态 + 快捷按钮 + 表单卡 | 允许，返回状态 + 快捷按钮 + 表单卡 |
+| 带参数 `/model` `/reasoning` `/permission` | Feishu 私聊 headless：Codex 三者均允许，Claude 允许 reasoning/access，OpenCode 允许 access；OpenCode reasoning 因缺 ACP `effort` 证据拒绝，Claude/OpenCode model 由 command support 拒绝。VS Code 与非 Feishu surface 保持拒绝 | 允许 | 允许 | 允许 | 允许 | 允许 |
+
+Feishu 群聊 surface 对 bot 能力设置有额外覆盖规则：`/mode`、provider/profile、`/model`、`/reasoning`、`/permission`、`/plan` 的 bare open、带参数 apply 与同卡 callback 都不修改群 surface 或 bot SSOT，并提示到私聊修改；`/autowhip`、`/autocontinue`、`/verbose` 仍按当前群 surface/context 生效。`/primary` 只改 room primary gateway，不改 workspace/session/thread route；`/primary on` 只强制刷新当前 gateway 的群普通消息权限并写入 `PrimaryGatewayID`，不查询飞书群管理员。机器人进群自动 bootstrap 只在 `chat.get` 证明群内唯一机器人且 room primary 为空时写入，不替换已有 primary。已有 room workspace 时，只有当前 primary bot 能切换；无 primary 或其他 bot 必须先对目标 bot 执行 `/primary on`。
+
+群聊 `/workspace detach` 不是上表裸 `/detach` 的 surface-level alias：私聊仍按 surface detach；群聊中它是 room-level workspace clear，只有当前 primary bot 可执行。成功或 room 本来无 workspace 时会 reset 同 room 全部 surface，并让 daemon 清同 room 全部 surface resume target；非 primary 拒绝时不改变 room、sibling surface 或 durable resume target。裸 `/detach` 保持兼容 surface-level detach，不清 room workspace；当 surface 已 detached 但 room 仍绑定 workspace 时，只返回可执行的 `/workspace detach` 提示。
+
+### 6.2 覆盖门禁
+
+| 覆盖状态 | 当前行为 |
+| --- | --- |
+| `G1 PendingHeadlessStarting` | 只允许 `/status`、`/autowhip`、`/autocontinue`、`/debug`、`/upgrade`、`/mode`、`/detach`、revoke/reaction；其中 `/mode` 若实际切到了新的 backend 或 `ProductMode`，会直接 kill 当前恢复流程并清空持久化 headless / resume target；reaction 即使放行到 action 层，也只会在满足 steering 条件时生效。若当前 pending 只是后台 auto-restore 占位，手动 `/upgrade latest` 与允许 dev feed 的 flavor（源码 `dev` 与 release `alpha`）下的 `/upgrade dev` 允许继续弹候选升级卡 |
+| `G2 PendingRequest` | 普通文本、图片、文件、`/new`、`/compact` 被挡；`/use`、`/follow`、follow 自动重绑定只要会改路由也都会被冻结；`/mode` 允许，并会把 request gate 一并清掉；用户也可以先处理请求卡片。request family 当前仍共用同一 gate / revision / waiting-dispatch substrate，但前台激活语义已进一步收口成“同一 surface 只激活队头 request”：若同一 turn 连续到达多条 renderable request，orchestrator 会按到达顺序排队，只展示第一条；后续 request 要等前一条真正 `request.resolved` 或整轮 turn 结束后才会依次激活，避免多张可点击 request card 并列出现。队头 request 当前还显式区分 `pending_visibility` / `visible` / `delivery_degraded` 三种前台可见性：`pending_visibility` 表示 request 已进入 gate，但系统还在尝试把确认卡显示到 owner surface；`visible` 表示当前 request card 已真正送达，可继续沿同一张 owner card 刷新；`delivery_degraded` 表示最近一次投递失败，普通输入仍被 gate 挡住，但 `/status` 与后续前台交互会优先触发 redelivery。与此同时，队头 request 的 lifecycle 也继续投影到 blocker / `/status`：`submitting` 会明确显示“正在提交，等待本地后端接收”，`awaiting_backend_consume` 会明确显示“已提交，等待后端继续处理”；若同时存在 `pending_visibility` / `delivery_degraded`，`/status` 会把“已提交”与“卡片仍在显示中/送达失败”一起说明，不再把这些状态压成同一句泛化 `pending_request`。卡面语义继续由 orchestrator 单点归一化成 `SemanticKind`：approval family 会区分 `approval_command`、`approval_file_change`、`approval_network`、`approval_can_use_tool`、`plan_confirmation`；其中 `approval_can_use_tool` 当前默认显式暴露 `accept` / `decline` / `captureFeedback`，若 request metadata 里保留了非空 `permissionSuggestions`，还会额外暴露 `acceptForSession`：`acceptForSession` 会直接派发 same-request allow，Claude translator 会把观测到的 `permissionSuggestions` 原样回写成 native `updatedPermissions[]`；若 suggestions 缺失，前台不会暴露这条入口，误收到时 translator 也会 fail-closed。`captureFeedback` 不会再拆成 follow-up prompt，而是进入 `G3 RequestCapture`，把下一条文本回写成同一次 request 的 `{decision=decline, message=<feedback>}`，且不触发 interrupt。`plan_confirmation` 当前显式暴露 accept / acceptForSession / decline / revise：`acceptForSession` 不再直接代表“立刻持续授权”，而是把同一条 pending request inline 切到 request-local structured permission panel；panel submit 仍留在 `G2 PendingRequest`，先把当前卡 seal 成摘要态，再派发 `{decision=accept, permissionSelection={scope=session, grant_level, directories[], rule_classes[]}}`；`decline` 仍是 hard stop，`revise` 会进入 `G3 RequestCapture`，把下一条文本作为 same-request guidance 回写给 Claude，而不是复用 generic `captureFeedback` 的“拒绝 + follow-up 入队”语义。其余 approval 语义继续按 `availableDecisions` 生成 `accept`、`acceptForSession`、`decline`、`cancel` 等决策；`request_user_input` 继续支持“单题自动推进”；`permissions_request_approval` 会投影成权限授予卡，支持“允许本次 / 本会话允许 / 拒绝”；`mcp_server_elicitation` 会分成 url / form / approval 三种语义，其中 form 型同样是单题自动推进，optional 字段需要显式 `skip_optional`，底部 `cancel_request` 只取消当前 request、不打断 turn；approval 型仍回写 MCP elicitation `{action, content, _meta}`，默认“允许本次”会删除 request `_meta.persist` 广告后发送 `action=accept`，若上游 `_meta.persist` 广告 `session` 才显示“本会话允许”并回写 `_meta.persist=session`，若广告 `always` 只提示当前飞书端暂不支持持久授权，不开放 `_meta.persist=always` 提交入口；Claude delegated task 场景下，request card 还会追加 `来自 Task (...)` 这类来源标签，避免把 Task 内的 pending request 误解成“Task 卡死”。这些卡都会在 `request_revision` 上做 same-daemon freshness 校验。`tool_callback` 当前则进入只读 fail-closed 分支：若前面没有别的 pending request，它会 append 一张 sealed `tool_callback` 提示卡并立即自动派发结构化 unsupported 结果；若前面已有队头 request，则会先排队，等轮到自己成为队头时再走同样的 auto-dispatch。无论哪种路径，在上游 `request.resolved` 之前，这个 pending request 仍会保持 gate，避免 route/输入穿透。若这条自动回写被本地 Codex 拒绝，卡片不会错误退回可编辑态，而是继续保持 sealed，并明确提示用户可用 `/stop` 结束当前 turn |
+| `G3 RequestCapture` | 下一条文本优先被当成反馈；图片、文件、`/new`、`/compact`、`/use`、`/follow`、follow 自动重绑定只要会改路由也都会被 request-capture gate 冻住；`/mode` 允许，并会把 capture gate 一并清掉。当前 capture family 继续至少分成三类：generic approval 的 `captureFeedback` 会把当前 request 先拒绝，再把下一条文本排成普通 follow-up queue item；`approval_can_use_tool` 的 `captureFeedback` 不会生成 follow-up queue item，而是把下一条文本直接回写成当前 request 的 same-request deny-with-message；`plan_confirmation` 的 `revise` 则不会生成 follow-up queue item，而是把下一条文本直接回写成当前 request 的 same-request deny-with-guidance |
+| `G4 PathPicker` | 只允许当前 active picker 自己的 enter/up/select/confirm/cancel callback、`/status`、普通文本/图片/文件、revoke/reaction；`/workspace` 命令族、`/list`、`/use`、`/useall`、`/follow`、`/new`、`/detach`，以及 `/menu` / bare config / 其它 competing Feishu card flow 当前都会被挡住并提示先确认或取消 picker。confirm / cancel 会先清 gate，再把结果交给 consumer 或默认 notice；非 owner 或 owner 已知但 actor identity 缺失时只回拒绝 notice，不清当前 gate；若 picker 已过期，则会在下一次 action 入口自动清 gate |
+| `G5 TargetPickerProcessing` | 只允许当前 Git/Worktree owner-card 自己的 `target_picker_cancel`、`/status`、reaction/recall；普通文本/图片/文件、`/workspace` 命令族、`/list`、`/use`、`/useall`、`/new`、`/follow`、`/detach`、bare config 与其它 competing Feishu card flow 当前都会被挡住，并按当前 pending kind 提示“正在导入 Git 工作区”或“正在创建 Worktree 工作区”；非 owner 或 owner 已知但 actor identity 缺失时只回拒绝 notice，不清当前 gate。注意：这里阻断的是 competing user action，不是同一 owner-flow 自己的内部 continuation；只要 continuation 明确保留当前 target picker owner，clone/worktree 成功后的 attach workspace / prepare new thread 仍允许继续推进，并把结果收回同一张卡。Git clone / worktree create / prepare 完成、失败、取消或 flow 失效后会清 gate；cancel 判断 matching pending headless 时同样使用 `ResolveHeadlessResumeWorkspaceKey(pending.WorkspaceKey, pending.ThreadCWD)`，避免 workspaceKey 旧值导致同一 pending 无法被 kill/consume |
+| `G9 UpgradeOwnerFlowRunning` | daemon 侧 active upgrade owner-flow 处于 `running` / `cancelling` / `restarting` 时，只允许 `/status`、`/upgrade`、`/debug`、reaction/recall 与同一张升级卡的 `upgrade_owner_flow(confirm/cancel)`；普通文本/图片/文件、`/list`、`/use`、`/useall`、`/new`、`/follow`、`/detach`、bare config 与其它 competing card flow 当前都会在 `handleAction(...)` 顶层被挡住，并提示“当前正在准备升级”；helper 启动前若用户取消，会先切到 cancelling，再封成 terminal `升级已取消`；helper 即将切换前会把 owner card 封成 `正在重启`，随后等待 daemon 生命周期切换自然结束 |
+| `G10 StandaloneCodexUpgradeRunning` | daemon 侧 active standalone Codex upgrade transaction 运行中时，会先于现有 self-upgrade owner-flow gate 处理输入。发起 surface 只允许 `/status`、`/debug`、`/upgrade`、reaction/recall 与后续 standalone-codex-upgrade owner-flow 动作；其它普通输入直接返回 `codex_upgrade_running`。其它真正依赖 standalone Codex 的 attached surface 的文本/图片/文件会先通过既有 ingress 路径入队，但 dispatch 维持暂停，并追加“升级完成后执行”的同 code notice；VS Code surface / instance 当前完全跳过这条 gate，不进入 pause / queue-after-upgrade 语义；非 queueable 命令/卡片动作当前直接拒绝，不进入缓存 |
+| `G11 TurnPatchTransactionRunning` | daemon 侧 active turn-patch transaction 运行中时，会先于普通 reducer 处理输入。当前 instance 的 attached surface 会统一被 `PauseSurfaceDispatch(...)`；发起 surface 与同 instance 其它 surface 的普通文本/图片/文件、`/bendtomywill`、`/bendtomywill rollback`、`/new`、`/compact`、`/detach`、bare config 与其它 competing card flow 都会被拒绝，并提示“当前正在修补/回滚当前会话”；只保留 `/status`、`/list`、`/help`、`/menu`、`/history`、`/debug`、reaction/recall 这类查看动作，直到 transaction 成功或失败收口 |
+| `G6 AbandoningGate / E6 Abandoning` | `Abandoning` 已在执行 overlay 中持有真实状态；对外门禁与 `G6` 一致：只允许 `/status`、`/autowhip`、`/autocontinue`；再次 `/detach` 只回 `detach_pending`；`/mode` 与其余动作统一拒绝。该 gate 当前只会在“已有真实 started turn 或其它 live work 仍需收尾”时进入；若只是 pre-start dispatching 残留，则 `/detach` 会直接失败 active item 并完成 detach，不再经过 `G6` |
+| `G7 VSCodeCompatibilityBlocked` | 只影响 daemon 的 detached-vscode 恢复路径：exact-instance auto-resume 与普通 open-vscode prompt 会被抑制，改发必要的修复/失败反馈；legacy `editor_settings` 若能安全静默迁到 `managed_shim`，则不会长时间停在这条 gate。surface 侧 `/list`、`/mode`、`/status` 等动作仍按 route matrix 正常处理。若提示由 stamped `/mode vscode` 当前卡同步触发，则优先承接到当前卡；后台恢复路径仍走独立 runtime 提示。异步兼容性检测 goroutine 只允许更新 compatibility cache 和 follow-up 标记；实际 prompt/recovery 必须等下一次 daemon 串行入口通过统一 surface recovery pipeline 消费该标记，避免绕过 orchestrator service 的串行状态边界 |
+| `G12 BotCapabilitySettingsInvalid` | 仅当 canonical map 中已有 record 但 record 无法规范化，或 storage key 与 record gateway 不一致时进入；absent record 不属于该 gate。effective capability read 不回退 surface raw 值，普通 action、plan proposal、Claude snapshot restore、queued prompt 与 AutoContinue dispatch 均停止并返回 `bot_capability_settings_invalid`；已有 queued/AutoContinue 状态保留，不会被错误推进，重复 dispatch notice 按分钟冷却。`/stop`、`/detach` 与 `/workspace detach` 仍允许释放执行与 route 资源。正常 store materialize / private configuration transaction 会拒绝非法 record，修复状态文件并重启后退出该 gate |
+
+Claude `PendingHeadless(Purpose=prompt_dispatch_restart)` 额外规则：
+
+1. 进入 pending 时不再让 surface 保留 `AttachedInstanceID="" + RouteMode=pinned/new_thread_ready + SelectedThreadID/PreparedThreadCWD` 的混合 carrier；route core 会统一切到 detached-unbound，并只保留当前 workspace claim。
+2. pending record 自身持有后续恢复 route intent：`ThreadID` 表示连回后恢复 pinned thread，`PrepareNewThread` + `ThreadCWD` 表示连回后恢复 `R5 NewThreadReady`；成功连接时从 pending intent 重建 route，而不是依赖 surface 上的旧 route 残留。
+3. 启动失败、启动超时或启动中断会消费 pending，并通过同一 recovery cleanup 把 surface 保持为 detached workspace state：无 attached instance、无 selected thread、无 prepared route，但 workspace claim 保留给用户继续 `/use`、`/new` 或重新发送文本恢复。
+4. workspace key 解析使用 `state.ResolveHeadlessResumeWorkspaceKey(...)` 作为 SSOT：`ResumeWorkspaceKey` / surface workspace 是稳定 workspace root，`ThreadCWD` / queued CWD 是工作目录；当 cwd 位于 workspace root 下时不会把 workspace claim 收窄成子目录；当 cwd 已经不属于 workspace root 时，认为旧 workspace carrier 过期并改以 cwd 作为 workspace claim。daemon start command、OpenCode `--cwd` material、surface resume state、workspace-route restart recovery、target picker processing 与 cancel 都遵守同一条 resolver 边界。单值 workspace claim 使用 `state.ResolveWorkspaceClaimKey(...)`，路径身份比较使用 `pathcompare.SameCleanPlatformPath(...)`，不得退回 `filepath.Clean(left) == filepath.Clean(right)`。
+
+retained-offline overlay 额外规则：
+
+1. 条件：`Attachment.InstanceID != ""` 且 `Dispatch.InstanceOnline=false`。
+2. 当前若保留了 active running/dispatching item，`/stop` 只返回恢复中提示，不会发送 interrupt；即使 retained `activeRemote` binding 仍在，也以 offline notice 为准。
+3. `/detach` 直接 finalize，不进入 `E6 Abandoning`。
+4. `/status` 必须把“attachment 仍保留”和“实例当前离线”同时投影出来。
+
+## 7. UI 动作协议
+
+当前 Feishu 卡片动作与服务端 action 对应关系如下：
+
+补充说明：
+
+1. 这张表描述的是 gateway / parser 边界上的 transport action 映射，不等于最终 owner。
+2. `show_*` 与 bare config `Action*Command` 当前在 live path 中会先被归并成 `FeishuUIIntent`，再进入 Feishu UI controller；它们保留对应 `ActionKind` 主要是为了统一文本命令、菜单和卡片 callback 的 transport 兼容面。
+
+| 卡片动作 | 服务端 action | 说明 |
+| --- | --- | --- |
+| `attach_workspace` | `ActionAttachWorkspace` | headless 主链下 `/list` 的 workspace attach/switch 入口 |
+| `show_all_workspaces` | `ActionShowAllWorkspaces` | headless 主链下重新打开 `/workspace list` 切换卡（兼容旧分页导航动作） |
+| `show_recent_workspaces` | `ActionShowRecentWorkspaces` | headless 主链下重新打开 `/workspace list` 切换卡（兼容旧分页返回动作） |
+| `show_workspace_threads` | `ActionShowWorkspaceThreads` | headless 主链下以指定 workspace 为默认项重新打开 `/workspace list` 切换卡（兼容旧 recoverable-workspace 入口） |
+| `attach_instance` | `ActionAttachInstance` | VS Code instance attach；headless 收到旧卡回调时拒绝并要求重新打开 `/list` |
+| `use_thread` | `ActionUseThread` | 直达 thread 切换 |
+| `show_threads` | `ActionShowThreads` | headless 主链下重新打开 `/workspace list` 切换卡；`vscode` 下仍是当前实例最近会话视图；两条路径当前都会默认排除 `source=review` 的 detached review thread |
+| `show_all_threads` | `ActionShowAllThreads` | headless 主链下重新打开 `/workspace list` 切换卡；`vscode` 下仍是当前实例全部会话视图；两条路径当前都会默认排除 `source=review` 的 detached review thread |
+| `show_all_thread_workspaces` | `ActionShowAllThreadWorkspaces` | headless 主链下重新打开 `/workspace list` 切换卡（兼容旧 grouped 总览展开动作） |
+| `show_recent_thread_workspaces` | `ActionShowRecentThreadWorkspaces` | headless 主链下重新打开 `/workspace list` 切换卡（兼容旧 grouped 总览返回动作） |
+| `history_page` | `ActionHistoryPage` | `/history` 列表页翻页；会先同步把当前卡切到 loading，再异步重查当前 thread history |
+| `history_detail` | `ActionHistoryDetail` | `/history` 进入某一轮详情，或在详情页前后切换；同样会先同步 loading，再异步回填结果 |
+| `target_picker_select_workspace` | `ActionTargetPickerSelectWorkspace` | `/workspace list` 切换卡与 `/workspace new worktree` 基准工作区下拉回调；只刷新当前卡，不直接改 route |
+| `target_picker_select_session` | `ActionTargetPickerSelectSession` | `/workspace list` 切换卡的“会话 / 操作”下拉回调；当前可选择旧会话、新建会话或 `worktree_create`，只刷新当前卡，不直接改 route |
+| `target_picker_open_path_picker` | `ActionTargetPickerOpenPathPicker` | `/workspace new dir` / `/workspace new git` 的子步骤导航回调；会打开目录 path picker，并把 Git 主卡草稿一起保存在 active target picker runtime 里；path picker confirm/cancel 回调会先异步 ack，再把最新主卡 patch 回原 target picker owner card |
+| `target_picker_cancel` | `ActionTargetPickerCancel` | 四张工作会话业务卡共用的退出按钮；编辑态会把当前卡 inline replace 成 `已取消`，Git processing 态会 replace 成 `已取消导入`，Worktree processing 态会 replace 成 `已取消创建`，并 best-effort 停止 clone / `git worktree add` / prepare；surface route 只保留取消后的安全状态 |
+| `target_picker_back` | `ActionTargetPickerBack` | `/workspace list` 内部 Worktree 子页返回 target 页；不走 workspace 父页导航，不改 route |
+| `target_picker_confirm` | `ActionTargetPickerConfirm` | 四张工作会话业务卡共用的确认按钮；`/workspace list` 真正执行 attach / switch，或在 `worktree_create` 时进入 Worktree 子页；`/workspace new dir` / `git` / `worktree` 则消费主卡里已保存的目录、Git 或 Worktree 草稿来执行接入、导入或创建 |
+| `request_respond` | `ActionRespondRequest` | 承载 approval、`approval_command`、`approval_file_change`、`approval_network`、`approval_can_use_tool`、`request_user_input`、`permissions_request_approval`、`mcp_server_elicitation` 的按钮回传。approval family 的按钮集合仍沿用归一化后的 `availableDecisions`，包括 `cancel`；但 title/body/hint 与 MCP form/url/approval、permissions grant 等卡面语义，当前都由 orchestrator 先归一化成 `SemanticKind` 并写入 pending request/view。`approval_can_use_tool` 当前也走这条 transport；默认动作是 accept / decline / captureFeedback，若 request metadata 里保留了非空 `permissionSuggestions`，还会额外允许 acceptForSession。`acceptForSession` 会直接回写 same-request allow；Claude translator 会把观测到的 `permissionSuggestions` 原样翻成 native `updatedPermissions[]`，若 suggestions 缺失则 fail-closed。`captureFeedback` 不会再拆成 follow-up prompt：它会进入 request-capture，并在下一条文本到达时回写 `{decision=decline, message=<feedback>}`，不会设置 `interrupt=true`。`plan_confirmation` 当前同样走这条 transport，但 quick-decision 已扩成 accept / acceptForSession / decline / revise：`acceptForSession` 当前不会立刻派发 request response，而是把当前卡 inline 切到 request-local structured permission panel；`decline` 继续触发 interrupt，`revise` 则进入 request-capture，并在下一条文本到达时回写 `{decision=revise, message=<guidance>}`，不会再额外入普通消息队列。`request_user_input` 的纵向 direct-response 按钮会把当前题答案写入 pending request 草稿，并在未完成时刷新到下一题；`permissions_request_approval` 会按按钮回写 `{permissions, scope}`；`mcp_server_elicitation` 会按按钮回写 `{action, content, _meta}`，其中 form 模式的 direct-response 按钮同样先写入局部草稿，只有最后一题答完后才会真正 accept；approval 型的“本会话允许”仍提交 `action=accept`，并把 response top-level `_meta.persist` 改写成 `session`，不会提交 `always`。`tool_callback` 当前不产生任何用户可点击的 `request_respond` 动作；收到 request 后服务端会直接自动派发一条结构化 unsupported 响应 |
+| `request_control` | `ActionControlRequest` | 承载 request 的非回答型动作。当前 live 路径使用 `skip_optional`、`cancel_turn`、`cancel_request`：`skip_optional` 会标记当前 optional 题已跳过，并在必要时直接触发最终 dispatch；`cancel_turn` 会把 `request_user_input` 当前卡 seal 后发送 `turn.interrupt`；`cancel_request` 只用于 form 模式 `mcp_server_elicitation` 的请求级取消 |
+| `submit_request_form` | `ActionRespondRequest` | 顶层/`item` 两种 `request_user_input`、form 模式 `mcp_server_elicitation`，以及 `plan_confirmation` 的 request-local structured permission panel 的表单提交入口；按 `question.id -> answers[]` 或 `field_name -> answers[]` 回传，不再额外携带 live `request_option_id`。`multi_select_static` 当前会保留完整数组值，不再在 request form helper 里压成首项。orchestrator 会根据当前是否还有未完成题，决定是“保存草稿并自动跳到下一题”还是“seal 当前卡并最终提交”；对 `plan_confirmation`，panel 配置完整后会先把卡片 seal 成授权摘要，再派发最终 accept + `permissionSelection` |
+| `kick_thread_confirm` | `ActionConfirmKickThread` | 强踢前再次校验实时状态 |
+| `kick_thread_cancel` | `ActionCancelKickThread` | 仅回 notice |
+| `/vscode-migrate` | `ActionVSCodeMigrateCommand` | 打开 VS Code 迁移 page root；仅在 `vscode` 的 slash help 中展示，headless 主链下不进入 help/menu，直接输入则返回“仅 VS Code 模式可用”页 |
+| `vscode_migrate_owner_flow` | `ActionVSCodeMigrate` | VS Code 迁移 page 的 owner-flow callback；点击后走本机 managed-shim 迁移链路，并把结果继续收口在同一张 guidance card 上 |
+
+文本命令直接映射：
+
+- `/mcpoauth <server>` / `/mcp-oauth <server>` -> `ActionMCPOAuthCommand` -> `DaemonCommandMCPOAuthLogin`
+- 这条链路不会进入 `request_respond` / `submit_request_form`，也不会建立 `G2 PendingRequest`。
+- daemon 只把 OAuth pending flow 记录在命令级 pending map 里；URL-ready、response error、completion success/failure 都只回到发起 surface，无法相关的 completion 会被忽略而不是广播。
+
+菜单与文本命令里新增：
+
+1. `/new`
+2. 菜单 `new`
+3. `/history`
+4. 菜单 `history`
+
+其中 `/new` / 菜单 `new` 都直接映射到 `ActionNewThread`；`/history` / 菜单 `history` 都映射到 `ActionShowHistory`。
+
+同时，文本命令里新增：
+
+1. `/mode`
+2. `/mode normal`
+3. `/mode codex`
+4. `/mode claude`
+5. `/mode opencode`
+6. `/mode vscode`
+
+这些字面值都映射到 `ActionModeCommand`，由服务端在当前 surface 上解释并决定是否执行切换。
+
+同时，文本命令里新增：
+
+1. `/plan`
+2. `/plan on`
+3. `/plan off`
+4. `/plan clear`
+
+四者都映射到 `ActionPlanCommand`，由服务端在当前 surface 上解释；合法 Feishu 私聊会字段级更新 gateway/bot record 的 `PlanMode` / 显式 plan override 并刷新同 gateway 投影，非 canonical surface 才使用本地 owner。真正的提案 handoff 卡按钮单独走 `ActionPlanProposalDecision`，并通过 lifecycle transaction 更新已有 record。
+
+同时，文本命令里新增：
+
+1. `/bendtomywill`
+2. `/bendtomywill rollback`
+3. `/bendtomywill rollback <patch_id>`
+
+三者当前都会先映射到 `ActionTurnPatchCommand`，再由 daemon 按参数二次解析成“打开 patch 卡”或“回滚最近一次修补”；成功页上的回滚按钮则单独走 `ActionTurnPatchRollback`。
+
+补充说明：
+
+1. 当前 Feishu gateway 只为一小组 pure-navigation action 开放同步 `replace_current_card` 回包：
+   1. `ActionShowCommandMenu`
+   2. `ActionShowAllWorkspaces`
+   3. `ActionShowRecentWorkspaces`
+   4. `ActionShowThreads`
+   5. `ActionShowAllThreads`
+   6. `ActionShowScopedThreads`
+   7. `ActionShowWorkspaceThreads`
+   8. `ActionTargetPickerSelectWorkspace`
+   9. `ActionTargetPickerSelectSession`
+   10. `ActionShowHistory`
+   11. `ActionHistoryPage`
+   12. `ActionHistoryDetail`
+   13. bare `ActionModeCommand` / `ActionAutoWhipCommand` / `ActionReasoningCommand` / `ActionAccessCommand` / `ActionModelCommand`
+2. 这些动作只要命中 `ResolveFeishuFrontstageActionContract(action).CurrentCardMode=inline_view`、来源卡片带有当前 daemon 的 lifecycle 标识、且首个 `UIEvent` 显式标记 `InlineReplaceCurrentCard`，就会先走原地替换；若同一动作后面还带异步命令（当前就是 `/history` 的 `thread.history.read`），daemon 仍会继续执行后续事件，不会因为同步 replace 而提前终止。
+3. `/help` 这类静态目录卡、apply 终态、request prompt 终态，以及 bare `/upgrade` / `/debug` 的状态卡与 upgrade 重启后结果 notice 等仍然沿用 append-only 消息语义，不在这轮同步回包范围内；当前例外是 `/upgrade latest` 一旦进入 daemon owner-card 流，会在同一张升级卡上继续 patch 到 confirm/running/restarting。
+
+## 8. 当前死状态审计结论
+
+这轮按当前实现重新审计后，以下几类 bug-grade 半死状态已经收口：
+
+1. **instance 半 attach**：已修复。第二个 surface attach 同一 instance 会直接失败。
+2. **数字文本误切换 thread**：已修复。数字文本现在是普通消息。
+3. **headless 选择期还能旁路 `/use` `/follow` `/new`**：已修复。`PendingHeadless` 仍是顶层 gate。
+4. **staged attachment 跟着 route change 串 thread**：已修复。route change 或 clear 会显式丢弃 staged image / staged file 并告知用户。
+5. **`PausedForLocal` 永久卡住**：已修复。现在有 watchdog。
+6. **`Abandoning` 永久锁死**：已修复。现在有 watchdog。
+7. **`/follow` 切模式但 thread 不变时 UI 不知道 route mode 已变**：已修复。现在会补发 route-mode selection 投影。
+8. **`/new` 的空 thread 归属靠 `ActiveThreadID` 猜**：已修复。现在改成显式 `remote_surface + SurfaceSessionID` 相关性。
+9. **`R5 NewThreadReady` 在 queued draft 时没有出口**：已修复。现在 `/use`、`/follow`、`/detach`、`/stop`、重复 `/new` 都有明确语义。
+10. **detach 期间最后一条 final / thread notice 会被完全吞掉**：已修复。当前会保留单条 thread 级 replay，并在后续 idle 的 `/attach` 或 `/use` 时一次性补发。
+11. **detached 状态下 `/use` 是死入口，只能先 attach instance**：已修复。现在 `/use` 会展示 global merged thread list，并按 resolver 自动 attach。
+12. **cross-instance `/use` 会绕过 detach 语义，保留旧 request/capture/override**：已修复。现在只有 headless detached/global `/use` 还会做这类 resolver attach；切换前会先走 detach 风格清理与门禁。
+13. **旧 `/newinstance` 手工 headless 选择分支仍能把用户带进过时状态**：已修复。当前 parser 已不再接收旧命令，只保留 thread-first `/use` 的 preselected headless；历史兼容残留只会在启动时被自动清掉。
+14. **same-instance `/use` / `/follow` / auto-follow 会在旧 request gate 还活着时静默改路由**：已修复。现在只要 request gate 仍在，所有会改路由的动作都会被冻结，包括 `follow_local` 下手动 force-pick 后再 `/follow` 的回切。
+15. **attached vscode `/use` 会误走全局 merged thread view，甚至跨 instance retarget**：已修复。现在 detached vscode 必须先 `/list`，attached vscode 只允许当前 instance 已知 thread，且 one-shot force-pick 仍保持 `follow_local`。
+16. **cross-instance attach 到复用/新建 headless 时会丢 thread replay**：已修复。当前 replay 会先按 `threadID` 全局迁移，再在目标 attach 上一次性补发。
+17. **transport degraded 后既误报“已中断当前执行”，又缺少 retained-offline 逃生口**：已修复。当前会保留可相关的 in-flight turn，不再伪造“已中断”；同时 `/status`、`/stop`、`/detach` 都已显式区分 retained-offline 与真正 detach。
+18. **queued 点赞升级成 steering 后 item 会脱离普通 queue，若 ack 失败则可能丢失**：已修复。当前已强制恢复原 queue 位置，并补失败 notice。
+19. **headless 自动恢复在首轮 refresh 前过早报失败，或恢复成功后重放旧 replay / 额外补 attached 噪音**：已修复。当前会先静默等待首轮 refresh，恢复成功只发单条成功 notice，且会清空旧 replay 而不是补发。
+20. **`PendingHeadless` 只能靠隐藏的 `/killinstance` 逃生**：已修复。当前 `/detach` 可以直接取消恢复流程并回到 `R0 Detached`；旧 `/killinstance` 也已不再解析。
+21. **显式切 mode 会保留旧 attachment / request gate / draft 残留，导致进入半切换状态**：已修复。当前 idle/detached 时 `/mode` 会先做 detach-like 清理；busy path 则明确拒绝并提示 `/stop` 或 `/detach`。
+22. **headless 主链仍然只按 instance/thread 仲裁，导致同 workspace 多 surface 并存**：已修复。当前 headless 主链的 attach/use/headless 恢复都会先经过 workspace claim；只有显式切到 `vscode` 才绕过这层仲裁。
+23. **headless 主链还能长期停留在 follow 路径，导致 workspace-first 叙事失真**：已收口。当前新 `/follow` 会直接回迁移提示，steady-state 逻辑也不再接受“读 surface 时顺手把旧 headless follow route 自动改写回 pinned/unbound”的 compat 壳；极老 surface 若仍残留这类 route，需要用户重新 `/use`、`/new` 或 `/detach` 回到当前主链。
+24. **旧版本残留的 `vscode + new_thread_ready` 会在升级后继续活着，等价绕回被设计移除的 `/new` 路径**：compat 已删除。当前实现不再在 hot path 里把这类旧 route 自动归一化回 `follow_local`；当前代码也不会再新写出该组合，但若极老 surface 仍残留它，用户需要重新进入当前的 `follow_local` / `/use` 路径，而不是依赖静默修复。
+25. **headless `/list` 仍按 instance root 聚合，broad headless pool 会把多个 thread `cwd` workspace 压成一个选项**：已修复。当前 workspace 列表先看可见 thread `CWD`，只有无可见 thread 时才回退到实例级 workspace metadata。
+26. **headless detached / attach / disconnect 等路径仍向用户暴露“实例”措辞，导致 workspace-first 叙事不一致**：已修复。当前 headless 主链的 detached、attach、offline、degraded、stop-offline 等提示都统一回到工作区语义。
+27. **切到 `vscode` 后仍可能保留 headless restore 入口，最终进入“`vscode` surface 底层实际 attach/pending 的是 headless”半死状态**：已修复。当前 `/mode` 会清掉 pending headless 与 `surface resume state` 里的 headless 恢复目标，且 `vscode` surface 会在 auto-restore 入口被硬拒绝。
+28. **daemon 重启后 latent surface 会丢 mode / verbosity，或根本无法在没有 headless hint 的情况下重新 materialize**：已修复。当前 startup 会先从 `surface resume state` 恢复 surface 路由、`ProductMode` 与 `Verbosity`。
+29. **headless 主链 daemon 重启后会静默掉回 detached、过早报失败，或把 `fresh workspace prepare` 和 headless thread restore 混成一条恢复语义**：已修复。当前恢复已经收口到单一 headless 主链：workspace-owned route 直接恢复 workspace intent；带 `ResumeThreadID` 的 target 先尝试 exact visible attach；若同时带 `ResumeHeadless=true`，visible miss 后继续同 backend 的 managed-headless exact-thread continuation；普通 pinned-thread 才会再按 workspace fallback / `new_thread_ready` 收口。`ResumeHeadless` 只再代表 managed headless thread-restore strategy，`fresh workspace prepare` 会持久化成 workspace+route 语义，首轮 refresh 前仍静默等待，失败路径也按 workspace prepare / generic resume / headless-specific notice 分开收口。
+30. **`vscode` daemon 重启后只保留 mode、不恢复实例，或者恢复链路误走 headless**：已修复。当前会按 exact `ResumeInstanceID` 恢复到原 VS Code 实例，回到 follow-local 语义；若还没有新的 VS Code 活动，会明确提示去 VS Code 再说一句话或手动 `/use`，而且运行时不再读取独立 headless hint 文件。
+31. **`vscode` 进入或 daemon 重启恢复时，会在 legacy `settings.json` / stale managed shim 状态下继续尝试恢复，导致用户看起来进入了 `vscode`，但底层仍沿用旧接入方式或失效入口**：已修复。当前 detached-vscode 恢复会先做本机 VS Code 兼容性检查；命中旧 `settings.json` override 且存在可接管入口时，会先静默自动迁到 `managed_shim` 并清掉旧 `chatgpt.cliExecutable`，成功后再继续后续恢复/open-prompt 链路；只有缺 target、自动迁移失败，或 stale managed shim 需要修复时，才保持 detached 并发可见反馈卡。
+32. **同一张 `/menu` 或 `/use` 导航卡每点一步就继续在消息流里堆新卡，导致用户停留在同一选择上下文却要反复找最新卡**：已修复。当前限定范围内的 same-context 导航已经改成 card callback 同步替换当前卡，不再制造额外历史噪音。
+33. **headless `/list` 只能展示仍有 online instance 的 workspace，导致仅能从 persisted/offline thread 恢复的 workspace（例如 `picdetect`）完全不可见**：已修复。当前 headless `/list` 会把 recoverable-only workspace 也列出来，但不会伪装成 attach；按钮会直接进入该 workspace 的会话列表，再复用现有 `/use` 恢复链路。
+34. **transport degraded / hard disconnect / remove instance 后 compact overlay 可能残留，导致后续 `/compact` 永久 busy**：已修复。当前这三条路径都会清掉 `compactTurns`，不会再把实例卡在伪 `compact_in_progress`；若仍保留当前 surface + compact owner-card，上层还会 best-effort 把显式 `/compact` 卡封成失败态。
+35. **hard disconnect 时 pending steer 没恢复，steering 中的 queued 输入会脱离普通队列后直接消失**：已修复。当前 disconnect 也会按原顺序恢复 `pendingSteers`，再继续 offline/detach 语义。
+36. **VS Code 菜单进入的 `/list`、`/use`、`/useall` 与迁移/恢复提示会在菜单首跳后逃逸成 submission-anchor / notice / runtime prompt**：已修复。当前 stamped 菜单卡会把实例 / 线程结果、attach / use 终态，以及 stamped `/mode vscode` 与 `/vscode-migrate` 命中的兼容提示 / 迁移结果优先收口到原卡；只有真正脱离当前 card 上下文的后台 runtime 提示才继续走独立 `global runtime` 车道。
+37. **headless 主链的 detached backend 仍隐式回退 `codex`，导致 `codex` / `claude` / `opencode` 共用 workspace defaults、surface resume target 或恢复到错误 backend**：已修复。当前 surface 会单独持久化 `Backend`；`WorkspaceDefaults`、surface resume 与 detached catalog context 都按 backend 分区，旧数据缺失 backend 时 lazy 默认 `codex`，而 `codex <-> claude <-> opencode` 切换会显式清掉旧恢复目标。
+38. **Claude 早失败会把 surface 永久卡在 `dispatching`，且 `/detach` 还会被 pre-MVP gate 拒绝或只能进入无意义的 `abandoning`**：已修复。当前 Claude translator 会在首个 `assistant` / `control_request` / `result` 事件上提升 pending turn 并收口终态；若 surface 仍停在没有 `TurnID`、没有 output 的 pre-start dispatching，`/detach` 会直接失败 active item、清掉 pending remote ownership 并完成 detach；只有真实 started turn / compact / steer 才会进入 `E6 Abandoning`。
+39. **route / attach 上下文已经变化，但旧 workspace page / target picker / path picker / history / review picker 还要等“再点一次旧卡”才暴露失效，甚至出现第一次返回无效的假活状态**：已修复。当前 detach-like / route-change cleanup 会统一清掉 context-bound overlay runtime；只要仍有稳定 owner message，就会主动把旧卡封成失效态。若当前可见的是 target-picker-owned path picker 子步骤，则只 patch 这张可见子卡，隐藏父卡 runtime 静默清理；没有 anchor 的旧卡则继续按 callback fail-closed。
+40. **headless auto-resume 先因为 provider/profile/runtime 失败，再在后续 retry 上被 `workspace_busy` / `thread_busy` / `thread_not_found` 覆盖成误导性根因，或每次 retry 都重复刷同一条失败卡**：已修复。当前恢复 runtime 会把“最新 retry 结果”和“本轮恢复的稳定失败根因”拆开记录；仍可能变化的失败只按 backoff 更新状态，不改写更具体根因。确定性的 Codex Profile 定义/secret/OAuth/capability/revision 错误和 restore workspace/cwd/runtime 错误会直接终止当前 episode，发出一次具体提示后不再由 tick 重试；`thread_not_found` / `headless_restore_thread_not_found` 在后台自动恢复里保持可重试，因为 thread catalog 可能晚于 startup recovery 到达。`PendingHeadless.AutoRestore` 的启动超时和连回后接管失败不再依赖 orchestrator 直接投递 notice，而是在 daemon 投递前统一进入 recovery notice gate。
+41. **auto-restore 启动的 managed headless 已经连回，但 exact-thread 接管失败后，surface 仍保留 `PendingHeadless` 到启动超时，并且同一持久化目标的非目标元数据刷新会重置 daemon 侧失败节流，导致恢复失败提示反复刷屏**：已修复。当前连接后接管失败会立刻清掉本轮 pending、kill 这次拉起的 headless，并把缺 workspace/cwd 等接管失败归一到 `headless_restore_*` 恢复失败族；daemon 同步恢复运行态时只用真实恢复目标身份判断是否重置 backoff，标题/时间等非目标元数据刷新不会让同一 episode 重新投影；后台自动恢复中的可重试接管失败与后续 timeout 只保留状态转移、kill 与 backoff，不投递失败卡；只有确定性终态失败或 VS Code 可见 resume failure 才会发用户提示。
+42. **managed headless 连回时用全局 thread view 命中其它实例的同名 thread，导致 workspace/CWD 串用并误报 `workspace_busy`**：已修复。当前连接回调只使用当前实例上的 thread，并用 `PendingHeadless.WorkspaceKey/ThreadCWD` 覆盖缓存元数据；如果可见实例 attach 返回 busy/not-found notice，`TryAutoResumeHeadlessSurface` 会把它作为真正恢复失败返回给 daemon，而不是伪装成 `ThreadAttached`。
+43. **room workspace 恢复冲突进入 blocked state 后没有普通群命令自愈入口**：这是有意保留的 operator-recoverable degraded state，不是 attach/use 成功后的半死态。daemon 在任何 route/owner mutation 前 fail closed，向当前交互明确提示检查 daemon 日志、修复持久化状态并重启；`/list`、`/use` 或菜单 callback 不允许在多份冲突 workspace 中静默任选。修复并重启是当前唯一安全出口，冲突 workspace 明细只进入日志，不进入用户卡片。
+44. **同一 GatewayID 更换 AppID 后，新机器人继承旧 surface/会话或旧 primary**：已修复。bot identity transition 会在新 runtime 启动前排空旧 generation 并撤销旧 bot-owned durable/runtime state；room workspace 作为 room-owned durable fact 保留，因此新机器人首次进入该群仍能看到群工作区，但必须建立自己的 surface 与会话。transition 失败时 identity store 保留 pending 栅栏，新 runtime 不启动；后续即使改回旧 AppID 或同槽位重建同 AppID，也会作为新 generation 启动，不会进入半新半旧的可交互状态。
+45. **Claude `prompt_dispatch_restart` 进入 pending 后留下 `AttachedInstanceID=""` 但仍 pinned/new-thread-ready 的混合 route，启动失败或超时后变成无实例但有 selected/prepared carrier 的半死态**：已修复。prompt restart 现在经 recovery core 进入 detached workspace state，只保留 workspace claim；pending record 自身保存 thread/new-thread intent，成功连回后从 pending 重建 route，启动失败/超时/中断则消费 pending 并保持可继续恢复的 detached workspace。workspace root 与 thread cwd 的解析也统一到 `state.ResolveHeadlessResumeWorkspaceKey(...)`，不会再把 queued CWD 子目录误写成 workspace claim。
+
+46. **Profile migration 将 legacy Codex desired/ref 写入 surface resume 后，又被通用 projector 用浮动 Provider 重建并清掉精确 admission；P2P 旧 identity 合并还会静默覆盖不同 Profile 选择**：已修复。projector 只在同 thread + 同 Profile 时保留 definition/preference 精确 ref；冲突合并写入 `profile_selection_conflict`，对应 surface 启动 fail closed，并以私聊显式重选作为手动出口。
+
+47. **OAuth Profile 启动前 fresh auth probe 释放 daemon 锁后，旧 start 命令可能在 `/detach`、shutdown 或重复 start 后继续启动孤儿 headless 进程**：已修复。带 `SurfaceSessionID + InstanceID` 的 managed headless start 必须在捕获授权时看到原 surface 仍持有 exact pending launch；如果 pending 已被 `/detach` 等操作提前消费，start 命令会静默放弃且不会再执行 probe。对于仍被授权的启动，真正调用 `startHeadless` 前还会重新检查 daemon 未 shutdown、原 pending 仍指向同一 `InstanceID`，且同一 managed instance 尚未登记进程。若授权已失效，启动静默放弃，不再生成无法 kill 的孤儿进程或重复进程。
+
+48. **已迁移 profile catalog 的 context preference state 缺少后续新增/历史遗漏的 Claude profile，导致升级后 Claude session 恢复被误判为“Claude 配置不可用”**：已修复。当前 startup 在 `ProfileCatalogMigrationVersion>=1` 且 durable stores 可读写时，会从 committed config 幂等补齐缺失的 Codex/Claude context preference，再执行 catalog verify 与 materialize；因此 `mimo`、`glm` 这类已存在于 config 的 Claude profile 不会因为 preference state 缺项而阻断 headless restore。真正损坏或不可写的 preference store 仍保持 fail-closed degraded。
+
+49. **群聊 on-demand / detached headless restore 在启动前仍可能被全局 `threads.snapshot` 拷贝到其它实例的同名 thread 误导，把恢复目标 workspace 解析成无关实例的工作区并误报 `workspace_busy` / `thread_busy`**：已修复。`mergedThreadViewForBackend` / `resolveSurfaceResumeVisibleInstance` 现在按线程真实 `CWD` 判断实例归属，忽略被快照合并改写 `WorkspaceKey` 的跨实例副本；旧实例离线后恢复会回落到 resume entry / persisted thread 的真实 workspace，再启动新的 managed headless，而不是在启动前被占用检查拦截。
+
+50. **OpenCode 切换 Profile 后仍 exact-thread 恢复旧 session，导致新实例只声明 Gemini provider/model 时，旧 DeepSeek session 在请求上游前报 `ProviderModelNotFoundError`**：已修复。Profile ID 或 revision 变化的当前 surface 与同 gateway sibling 收敛都保留 workspace、清空 continuation 的 `ThreadID` 并设置 `PrepareNewThread=true`；忙碌 sibling 的延迟收敛会从当前实例与目标 Profile/revision 的差异重新识别该语义。新实例连回后进入 `R5 NewThreadReady`，不会再把旧 session 的 provider/model 强塞进目标 overlay；单纯 `/permission` runtime relaunch 不受影响，仍可恢复原 session。
+
+当前审计范围内，未再发现“attach/use 成功后用户没有任何可恢复下一步”的 bug-grade 状态。
+
+## 9. `/new` 相关补充文档
+
+`/new` 已经是当前实现的一部分。
+
+功能级实现说明见：
+
+1. [new-thread-command-design.md](../implemented/new-thread-command-design.md)
+
+## 10. 提交前复审基线
+
+凡是修改以下任一行为，都应该在提交前回看本文并同步更新：
+
+1. instance/thread attach/detach
+2. `/use`、`/follow`、`/new`
+3. `PendingHeadless`
+4. queue/dispatch/turn ownership
+5. staged image / staged file / draft 命运
+6. request capture / request prompt
+7. Feishu 卡片动作协议
+8. watchdog 与恢复路径
+9. backend profile/admission freeze（Codex / Claude / OpenCode）
+
+最低复审问题：
+
+1. 有没有新增“用户表面上看已 attach 或已选 thread，但文本/图片仍无路可走”的状态。
+2. 有没有新增只靠异步事件才能退出、但没有 watchdog 或手动逃生口的 blocked state。
+3. 有没有让未冻结草稿在 route change 时静默改投目标。
+4. 有没有把 UI helper 状态重新变回服务端持久 modal state。
+5. 有没有让 `R5 NewThreadReady` 在首条消息失败后落回无恢复路径的状态。
+6. `request_user_input` 与 form 模式 `mcp_server_elicitation` 的按钮/表单提交后，是否符合“单题自动推进、optional 只能显式跳过、最后一题才真正 resolve request、旧 revision 不能继续改写当前草稿”的现状语义，并确保 turn 完成、切线程、重连时不会残留旧问题卡。
+7. route / attach 上下文变化后，旧 target picker / path picker / history / review picker / workspace page 是否仍可能留下一张“看起来还能操作、但其实只会第一次点击才报过期”的假活卡。
+8. `/mcpoauth` 这类非 request RPC lifecycle 是否仍保持命令级 pending，而没有错误进入 request gate、菜单 owner-flow 或流式 card patch。
+9. `/model` 打开触发的 `model.list` 是否仍保持后台能力刷新语义，没有错误进入 queue/dispatch/pendingRemote 或改变 route。
+10. `/reasoning` 是否仍按 backend 区分：Codex unknown/catalog-unavailable 保持自动 + 手输降级；OpenCode 必须只允许 ACP `effort` config option 已声明支持的模型/effort，不能在 unsupported runtime 下静默写入 override。
+11. Codex dispatch guard 是否只丢弃“目录已知且明确不兼容”的 reasoning override，并且不误伤 unknown/manual model、Claude launch contract 或 model/access override。
+12. Feishu room workspace 切换是否仍只在真正 destructive workspace change 前触发，且当前 surface blocker、同 room unsafe blocker、primary gate、sibling reset、最终 binding 写入保持同一顺序；普通同 workspace `/use` / session 选择不能调用 Feishu chat info API。
+13. room state v2 是否仍是 workspace/primary durable SSOT；surface resume 只能补录缺失 workspace 或提供冲突证据，不能覆盖已持久化 room workspace；冲突 room 的所有 ingress 入口必须继续 fail closed。
+14. room workspace 切换后，已 reset sibling 的旧 surface resume target 是否在同一次 sync 中被清掉；不得让 previous-target fallback 把旧 workspace 重新写回并在重启时制造伪冲突。
+15. GatewayID 槽位的 committed AppID 变化时，旧 gateway action generation 是否先关闭并排空，identity store 是否先写入 pending transition，旧 bot-owned state 是否在新 runtime upsert 前完成可重放清理；room workspace 必须保留，AppSecret-only 更新不得误清状态。清理失败后改回旧 AppID、删除失败后同槽位重建同 AppID，以及旧 turn patch flow/transaction 都必须覆盖在回归测试中。
+
+16. Codex Profile migration 后，bot/surface desired 是否始终以 `CodexProfileID` 为 canonical owner，精确 `CodexAdmissionRef` 是否只在同 thread + 同 Profile 时保留；P2P selection conflict 是否仍会阻断对应 surface launch，并能由显式私聊重选解除。
+17. OpenCode Profile/access/reasoning 切换后，bot/surface desired 是否以 `OpenCodeProfileID`、`PromptOverride.AccessMode` 与 `PromptOverride.ReasoningEffort` 为 canonical owner；精确 `OpenCodeAdmissionRef` 与 `OpenCodeRuntimeAccessMode` 是否随 queue / pending headless / daemon start command 冻结；自定义/API profile 缺 ref 或 stale revision 是否仍 fail closed，默认 `op_default` 是否仍可 inherit 启动，`/permission clear` 是否不写 permission overlay。
+18. OpenCode `/plan` 是否只通过 `PlanMode + PlanModeOverrideSet` 表达飞书显式 override：`on/off` 冻结到 queue item 并在 ACP prompt 前动态设置 `mode=plan/build`，`clear` 后不冻结也不 dispatch mode；`config_option_update id=mode` 是否能投影最近观察 mode，且自定义 mode 不被折算成 off。
+19. OpenCode ACP preflight 是否在同一 prompt 中按 deterministic 顺序先设置 `mode` 再设置 `effort`，全部成功后才发送 `session/prompt`；`config_option_update id=effort` 是否刷新 observed reasoning，并且 `effort not found` / unsupported model 不会被当作成功 prompt。
+
+2026-08-15 #895 补充：Codex active Goal thread 的 backend-observed turn 与普通队列互锁已并入 dispatch/recovery 主链。`thread/goal/set|get|clear` 与 `thread/read(includeTurns=false)` 成为 typed control carrier；`turn/started` 在目标 thread 的 authoritative Goal status 为 active 且无 remote binding 时记录为 backend-observed active turn（不伪造 continuation provenance），进入 Steer target，并在 completion/error/interrupt/disconnect 时按同一 turn-lifecycle owner 清理。普通队列第一条目标消息入队即创建 durable `pause_pending` lease 并发送 `thread/goal/set(paused)`；pause 确认后以 `thread/read` 的 live `idle` 状态为屏障进入 `draining`，之后才派发普通 prompt；Goal turn 完成即使无 remote binding 也会推进命中同 instance+thread 的等待队列；队列排空且 Goal fingerprint（createdAt/objective/budget）与 lease 快照一致时自动 resume，任何外部 mutation / RPC 失败 / fingerprint 漂移都 fail-closed 放弃自动恢复。lease 持久化到 daemon state，重启后按 phase 重发 pause/probe/get。
+
+2026-08-15 #895 review 修复补充：pause 失败进入退避窗口后，dispatch 门禁在整个退避期内保持阻塞（节流只是抑制重复提示，不会让 `maybeBeginGoalInterlockForQueueItem` 的 nil 落到派发路径）；`thread/goal/set` 响应缺失 `updatedAt`（或整体无 goal 快照）时，有序流中下一条该 thread 的 goal notification 视为本命令确认并消费一次，避免 pause 确认被误判为 external mutation 而永久放弃自动恢复；goal 命令结果只在 commandID 能关联到 pending 命令时才写回本地 thread goal，未知/stale 响应不再覆盖已更新的快照。
+
+2026-08-15 #897 补充：`/permission` 与 `/plan` 改为会话级（surface 级）设置。飞书群聊与私聊各自独立持久化（surface resume state 新增 `AccessMode`，恢复 `PlanMode`/`PlanModeOverrideSet`），群聊可直接执行这两个命令，不再被“机器人设置仅私聊可改”的 gate 拦截；`EffectiveSurfaceCapabilitySettings` 对飞书 surface 的 access/plan 读 surface 字段，bot record 投影不再覆盖会话值。旧版机器人级 access/plan 在 daemon 启动恢复时一次性种子到已存在 surface 后不再作为读路径。`/mode`、profile、`/model`、`/reasoning` 仍为机器人级（仅私聊可改）。
+
+2026-08-15 #896 补充：Codex Goal 用户控制面已接入现有命令卡体系。`/goal` 是 config-flow slash command（复用 `FeishuCatalogConfigView` / `FeishuPageView` / 菜单三态 / owner card 状态机）：bare `/goal` 发 `thread/goal/get`（`user_control` provenance）并回显 Goal 状态页；`/goal new|edit <目标> [--budget N]` 创建/编辑，`/goal pause|resume` 动态生效，`/goal clear` 先出确认卡、`--confirm` 后清除；无精确 selected thread / 非 Codex / Review/helper 会话 fail closed。用户动作携带 `user_control`，会撤销 queue interlock 的自动恢复所有权；状态页通过现有 `pageEvent` inline replace 刷新，不新建第二套卡片 carrier。
+
+2026-08-15 #896 review 修复补充：确认卡/编辑表单打开时在服务端暂存当前 thread 的 Goal fingerprint（createdAt/objective/budget），执行 `clear --confirm` / `new|edit` 前先与最新 thread Goal 比对，漂移则取消操作并出错误卡，避免外部 mutation 窗口内的误清/误改；goal 命令 dispatch 失败会清理 pending `goalUserCommands` 并回错误卡，不再静默丢弃；卡片入口触发的 loading 与结果卡通过 `MessageID + Patchable` 在同一 message 上 patch，不残留无按钮死卡；错误卡复用 config 命令 builder（非 sealed），失败原因不伪装成 no-goal 状态。
+
+## 11. 待讨论取舍
+
+1. 群聊 on-demand 恢复遇到 terminal 失败后，同一恢复目标下的后续普通文本会被静默吞掉（不重复发失败卡），直到恢复目标变化、恢复成功或用户显式重选（`/list`、`/use`、`/new`）。这是为了避免刷屏的有意取舍；风险是用户可能误以为机器人无响应，需要错误卡上的指引文案足够明确。
+2. 群聊/其他 surface 在 bot 级 Profile 切换时若正在执行 turn，切换不会立即生效：surface 标记待收敛，直到下一次交互（实例空闲）才重启实例。这是为避免硬杀进行中任务的有意取舍；若用户希望立即生效，可等待当前任务完成或手动 `/detach` 后重连。
+3. Goal queue interlock 期间，普通队列先暂停 Goal continuation（`thread/goal/set(paused)`），这可能短暂停止 Goal 的 active accounting；这是上游 pause 的真实语义，且用户队列不应计入 Goal budget。pause 失败或上游未确认时保持 fail-closed（不派发普通 prompt 到可能被隐式 Steer 的 Goal turn），并给出诊断 notice；用户可显式 pause/clear Goal 或稍后重试。

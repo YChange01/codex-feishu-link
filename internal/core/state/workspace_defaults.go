@@ -1,0 +1,32 @@
+package state
+
+import "github.com/YChange01/codex-feishu-link/internal/core/agentproto"
+
+const workspaceDefaultsKeySeparator = "\x00"
+
+// WorkspaceDefaultsStorageKey partitions headless workspace defaults by the
+// backend identity that makes a default meaningful for that workspace.
+func WorkspaceDefaultsStorageKey(workspaceKey string, contract InstanceBackendContract) string {
+	workspaceKey = ResolveWorkspaceKey(workspaceKey)
+	if workspaceKey == "" {
+		return ""
+	}
+	contract = NormalizeObservedInstanceBackendContract(contract)
+	identity := WorkspaceDefaultsIdentity(contract)
+	if identity == "" {
+		return ""
+	}
+	return string(contract.Backend) + workspaceDefaultsKeySeparator + identity + workspaceDefaultsKeySeparator + workspaceKey
+}
+
+func WorkspaceDefaultsIdentity(contract InstanceBackendContract) string {
+	contract = NormalizeObservedInstanceBackendContract(contract)
+	switch contract.Backend {
+	case agentproto.BackendClaude:
+		return NormalizeClaudeProfileID(contract.ClaudeProfileID)
+	case agentproto.BackendOpenCode:
+		return NormalizeOpenCodeProfileID(contract.OpenCodeProfileID)
+	default:
+		return NormalizeCodexProfileID(contract.CodexProfileID)
+	}
+}

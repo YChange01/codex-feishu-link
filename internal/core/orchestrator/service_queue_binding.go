@@ -1,0 +1,554 @@
+package orchestrator
+
+import (
+	"strings"
+
+	"github.com/YChange01/codex-feishu-link/internal/core/agentproto"
+	"github.com/YChange01/codex-feishu-link/internal/core/control"
+	"github.com/YChange01/codex-feishu-link/internal/core/eventcontract"
+	"github.com/YChange01/codex-feishu-link/internal/core/state"
+	"github.com/YChange01/codex-feishu-link/internal/xutil"
+)
+
+func normalizeUnspecifiedInitiator(initiator agentproto.Initiator) agentproto.Initiator {
+	if strings.TrimSpace(string(initiator.Kind)) == "" {
+		initiator.Kind = agentproto.InitiatorUnknown
+	}
+	return initiator
+}
+
+func (s *Service) normalizeTurnInitiator(instanceID string, event agentproto.Event) agentproto.Initiator {
+	event.Initiator = normalizeUnspecifiedInitiator(event.Initiator)
+	if event.Initiator.Kind != agentproto.InitiatorLocalUI && event.Initiator.Kind != agentproto.InitiatorUnknown {
+		return event.Initiator
+	}
+	if binding := s.lookupRemoteTurnForEvent(instanceID, event); binding != nil {
+		return agentproto.Initiator{Kind: agentproto.InitiatorRemoteSurface, SurfaceSessionID: binding.SurfaceSessionID}
+	}
+	return event.Initiator
+}
+
+func queuedItemMatchesTurn(item *state.QueueItemRecord, threadID string) bool {
+	if item == nil {
+		return false
+	}
+	if executionThreadID := queuedItemExecutionThreadID(item); executionThreadID != "" {
+		return threadID == "" || threadID == executionThreadID
+	}
+	if item.RouteModeAtEnqueue == state.RouteModeNewThreadReady {
+		return true
+	}
+	return threadID == ""
+}
+
+func queuedItemExecutionThreadID(item *state.QueueItemRecord) string {
+	return queuedItemPromptDispatchPlan(item).ExecutionThreadID
+}
+
+func setQueuedItemPromptDispatchPlan(item *state.QueueItemRecord, plan agentproto.PromptDispatchPlan) {
+	if item == nil {
+		return
+	}
+	item.FrozenDispatchPlan = agentproto.NormalizePromptDispatchPlan(plan)
+}
+
+func setQueuedItemExecutionThreadID(item *state.QueueItemRecord, threadID string) {
+	if item == nil {
+		return
+	}
+	plan := queuedItemPromptDispatchPlan(item)
+	plan.ExecutionThreadID = strings.TrimSpace(threadID)
+	setQueuedItemPromptDispatchPlan(item, plan)
+}
+
+func remoteBindingExecutionThreadID(binding *remoteTurnBinding) string {
+	return remoteBindingPromptDispatchPlan(binding).EffectiveExecutionThreadID()
+}
+
+func remoteBindingSourceThreadID(binding *remoteTurnBinding) string {
+	return remoteBindingPromptDispatchPlan(binding).EffectiveSourceThreadID()
+}
+
+func remoteBindingSurfaceBindingPolicy(binding *remoteTurnBinding) agentproto.SurfaceBindingPolicy {
+	return remoteBindingPromptDispatchPlan(binding).SurfaceBindingPolicy
+}
+
+func remoteBindingKeepsSurfaceSelection(binding *remoteTurnBinding) bool {
+	return remoteBindingSurfaceBindingPolicy(binding) == agentproto.SurfaceBindingPolicyKeepSurfaceSelection
+}
+
+func remoteBindingSurfaceThreadID(binding *remoteTurnBinding) string {
+	return remoteBindingPromptDispatchPlan(binding).EffectiveSurfaceThreadID()
+}
+
+func setRemoteBindingPromptDispatchPlan(binding *remoteTurnBinding, plan agentproto.PromptDispatchPlan) {
+	if binding == nil {
+		return
+	}
+	binding.DispatchPlan = agentproto.NormalizePromptDispatchPlan(plan)
+}
+
+func setRemoteBindingExecutionThreadID(binding *remoteTurnBinding, threadID string) {
+	if binding == nil {
+		return
+	}
+	threadID = strings.TrimSpace(threadID)
+	binding.ThreadID = threadID
+	if threadID == "" {
+		return
+	}
+	plan := remoteBindingPromptDispatchPlan(binding)
+	plan.ExecutionThreadID = threadID
+	if plan.SurfaceBindingPolicy == agentproto.SurfaceBindingPolicyFollowExecutionThread || strings.TrimSpace(plan.SourceThreadID) == "" {
+		plan.SourceThreadID = threadID
+	}
+	setRemoteBindingPromptDispatchPlan(binding, plan)
+}
+
+func autoContinueEpisodePromptDispatchPlan(episode *state.PendingAutoContinueEpisodeRecord) agentproto.PromptDispatchPlan {
+	if episode == nil {
+		return agentproto.DefaultPromptDispatchPlanForExecutionThread("")
+	}
+	return agentproto.NormalizePromptDispatchPlan(episode.FrozenDispatchPlan)
+}
+
+func setAutoContinueEpisodePromptDispatchPlan(episode *state.PendingAutoContinueEpisodeRecord, plan agentproto.PromptDispatchPlan) {
+	if episode == nil {
+		return
+	}
+	episode.FrozenDispatchPlan = agentproto.NormalizePromptDispatchPlan(plan)
+}
+
+func setAutoContinueEpisodeExecutionThreadID(episode *state.PendingAutoContinueEpisodeRecord, threadID string) {
+	if episode == nil {
+		return
+	}
+	plan := autoContinueEpisodePromptDispatchPlan(episode)
+	plan.ExecutionThreadID = strings.TrimSpace(threadID)
+	setAutoContinueEpisodePromptDispatchPlan(episode, plan)
+}
+
+func queuedItemPromptDispatchPlan(item *state.QueueItemRecord) agentproto.PromptDispatchPlan {
+	if item == nil {
+		return agentproto.DefaultPromptDispatchPlanForExecutionThread("")
+	}
+	return agentproto.NormalizePromptDispatchPlan(item.FrozenDispatchPlan)
+}
+
+func remoteBindingPromptDispatchPlan(binding *remoteTurnBinding) agentproto.PromptDispatchPlan {
+	if binding == nil {
+		return agentproto.DefaultPromptDispatchPlanForExecutionThread("")
+	}
+	plan := agentproto.NormalizePromptDispatchPlan(binding.DispatchPlan)
+	if strings.TrimSpace(binding.ThreadID) != "" {
+		plan.ExecutionThreadID = strings.TrimSpace(binding.ThreadID)
+	}
+	return agentproto.NormalizePromptDispatchPlan(plan)
+}
+
+func shouldRestorePreparedNewThread(surface *state.SurfaceConsoleRecord, item *state.QueueItemRecord, binding *remoteTurnBinding) bool {
+	if surface == nil || item == nil {
+		return false
+	}
+	if item.RouteModeAtEnqueue != state.RouteModeNewThreadReady {
+		return false
+	}
+	if binding == nil {
+		return true
+	}
+	return binding.BootstrapNewThread && !binding.ThreadCommitted
+}
+
+func matchesRemoteBindingThread(binding *remoteTurnBinding, threadID string) bool {
+	if binding == nil {
+		return false
+	}
+	threadID = strings.TrimSpace(threadID)
+	if threadID == "" {
+		return true
+	}
+	executionThreadID := remoteBindingExecutionThreadID(binding)
+	if executionThreadID == "" || executionThreadID == threadID {
+		return true
+	}
+	sourceThreadID := remoteBindingSourceThreadID(binding)
+	return sourceThreadID != "" && sourceThreadID == threadID
+}
+
+func (s *Service) pendingRemoteBindingRecord(instanceID string) (*remoteTurnBinding, *state.SurfaceConsoleRecord, *state.QueueItemRecord) {
+	if s == nil || s.turns == nil {
+		return nil, nil, nil
+	}
+	binding := s.turns.pendingRemoteBinding(instanceID)
+	if binding == nil {
+		return nil, nil, nil
+	}
+	surface := s.root.Surfaces[binding.SurfaceSessionID]
+	if surface == nil {
+		s.clearPendingRemoteTurn(instanceID)
+		return nil, nil, nil
+	}
+	item := surface.QueueItems[binding.QueueItemID]
+	if item == nil || (item.Status != state.QueueItemDispatching && item.Status != state.QueueItemRunning) {
+		s.clearPendingRemoteTurn(instanceID)
+		return nil, nil, nil
+	}
+	return binding, surface, item
+}
+
+func (s *Service) hasPendingRemoteTurn(instanceID string) bool {
+	if s == nil || s.turns == nil {
+		return false
+	}
+	return s.turns.pendingRemoteBinding(instanceID) != nil
+}
+
+func (s *Service) bindPendingRemoteCommand(surface *state.SurfaceConsoleRecord, commandID string) bool {
+	if s == nil || s.turns == nil || surface == nil {
+		return false
+	}
+	commandID = strings.TrimSpace(commandID)
+	if commandID == "" || strings.TrimSpace(surface.AttachedInstanceID) == "" {
+		return false
+	}
+	binding := s.turns.pendingRemoteBinding(surface.AttachedInstanceID)
+	if binding == nil || binding.SurfaceSessionID != surface.SurfaceSessionID {
+		return false
+	}
+	if surface.ActiveQueueItemID != "" && binding.QueueItemID != surface.ActiveQueueItemID {
+		return true
+	}
+	binding.CommandID = commandID
+	return true
+}
+
+func (s *Service) bindPendingReviewStartCommand(surface *state.SurfaceConsoleRecord, commandID string) bool {
+	if s == nil || s.turns == nil || surface == nil || surface.ReviewSession == nil {
+		return false
+	}
+	if surface.ReviewSession.Phase != state.ReviewSessionPhasePending {
+		return false
+	}
+	s.turns.bindPendingReview(commandID, surface.SurfaceSessionID)
+	return true
+}
+
+func (s *Service) pendingReviewStartSurface(commandID string) *state.SurfaceConsoleRecord {
+	if s == nil || s.turns == nil {
+		return nil
+	}
+	surfaceID := s.turns.pendingReviewSurface(commandID)
+	if surfaceID == "" {
+		return nil
+	}
+	surface := s.root.Surfaces[surfaceID]
+	if surface == nil || surface.ReviewSession == nil || surface.ReviewSession.Phase != state.ReviewSessionPhasePending {
+		s.turns.clearPendingReview(commandID)
+		return nil
+	}
+	return surface
+}
+
+func (s *Service) clearPendingReviewStart(surface *state.SurfaceConsoleRecord) {
+	if s == nil || s.turns == nil || surface == nil {
+		return
+	}
+	s.turns.clearPendingReviewsForSurface(surface.SurfaceSessionID)
+}
+
+func (s *Service) acknowledgePendingReviewStart(commandID string) bool {
+	surface := s.pendingReviewStartSurface(commandID)
+	if surface == nil {
+		return false
+	}
+	s.turns.clearPendingReview(commandID)
+	return true
+}
+
+func (s *Service) failPendingReviewStart(commandID string, reviewNotice *control.Notice) []eventcontract.Event {
+	surface := s.pendingReviewStartSurface(commandID)
+	if surface == nil {
+		return nil
+	}
+	s.turns.clearPendingReview(commandID)
+	s.releaseFeishuRoomReviewReservations(surface)
+	surface.ReviewSession = nil
+	if reviewNotice == nil {
+		return nil
+	}
+	return []eventcontract.Event{{
+		Kind:             eventcontract.KindNotice,
+		SurfaceSessionID: surface.SurfaceSessionID,
+		Notice:           reviewNotice,
+	}}
+}
+
+func (s *Service) pendingRemoteBindingByCommandForInstance(instanceID, commandID string) *remoteTurnBinding {
+	if s == nil || s.turns == nil {
+		return nil
+	}
+	binding := s.turns.pendingRemoteBinding(instanceID)
+	if binding == nil || strings.TrimSpace(binding.CommandID) != strings.TrimSpace(commandID) {
+		return nil
+	}
+	return binding
+}
+
+func (s *Service) pendingRemoteBinding(instanceID, threadID string) *remoteTurnBinding {
+	binding, _, item := s.pendingRemoteBindingRecord(instanceID)
+	if binding == nil {
+		return nil
+	}
+	if !queuedItemMatchesTurn(item, threadID) {
+		return nil
+	}
+	return binding
+}
+
+func (s *Service) pendingRemoteBindingByCommand(instanceID, commandID string) *remoteTurnBinding {
+	commandID = strings.TrimSpace(commandID)
+	if commandID == "" {
+		return nil
+	}
+	binding, _, _ := s.pendingRemoteBindingRecord(instanceID)
+	if binding == nil || strings.TrimSpace(binding.CommandID) != commandID {
+		return nil
+	}
+	return binding
+}
+
+func (s *Service) pendingRemoteBindingBySurface(instanceID, surfaceSessionID string) *remoteTurnBinding {
+	surfaceSessionID = strings.TrimSpace(surfaceSessionID)
+	if surfaceSessionID == "" {
+		return nil
+	}
+	binding, _, _ := s.pendingRemoteBindingRecord(instanceID)
+	if binding == nil || strings.TrimSpace(binding.SurfaceSessionID) != surfaceSessionID {
+		return nil
+	}
+	return binding
+}
+
+func (s *Service) pendingRemoteBindingForEvent(instanceID string, event agentproto.Event) *remoteTurnBinding {
+	if binding := s.pendingRemoteBindingByCommand(instanceID, event.CommandID); binding != nil {
+		return binding
+	}
+	initiator := normalizeUnspecifiedInitiator(event.Initiator)
+	if initiator.Kind == agentproto.InitiatorRemoteSurface && strings.TrimSpace(initiator.SurfaceSessionID) != "" {
+		if binding := s.pendingRemoteBindingBySurface(instanceID, initiator.SurfaceSessionID); binding != nil {
+			return binding
+		}
+	}
+	if inst := s.root.Instances[instanceID]; inst != nil && inst.Capabilities.SharedAppServer {
+		return nil
+	}
+	return s.pendingRemoteBinding(instanceID, event.ThreadID)
+}
+
+func (s *Service) promotePendingRemote(instanceID string, event agentproto.Event) *remoteTurnBinding {
+	binding := s.pendingRemoteBindingForEvent(instanceID, event)
+	if binding == nil {
+		return s.activeRemoteBinding(instanceID, event.TurnID)
+	}
+	s.clearPendingRemoteTurn(instanceID)
+	threadID := strings.TrimSpace(event.ThreadID)
+	if threadID != "" {
+		setRemoteBindingExecutionThreadID(binding, threadID)
+	}
+	binding.TurnID = strings.TrimSpace(event.TurnID)
+	binding.Status = string(state.QueueItemRunning)
+	s.bindActiveRemoteTurn(instanceID, binding)
+	return binding
+}
+
+func (s *Service) activeRemoteBinding(instanceID, turnID string) *remoteTurnBinding {
+	if s == nil || s.turns == nil {
+		return nil
+	}
+	binding := s.turns.activeRemoteBinding(instanceID)
+	if binding == nil {
+		return nil
+	}
+	if turnID != "" && binding.TurnID != "" && binding.TurnID != turnID {
+		return nil
+	}
+	return binding
+}
+
+func (s *Service) lookupRemoteTurnForEvent(instanceID string, event agentproto.Event) *remoteTurnBinding {
+	if binding := s.activeRemoteBinding(instanceID, event.TurnID); binding != nil {
+		if matchesRemoteBindingThread(binding, event.ThreadID) {
+			return binding
+		}
+	}
+	return s.pendingRemoteBindingForEvent(instanceID, event)
+}
+
+func (s *Service) lookupRemoteTurn(instanceID, threadID, turnID string) *remoteTurnBinding {
+	if binding := s.activeRemoteBinding(instanceID, turnID); binding != nil {
+		if matchesRemoteBindingThread(binding, threadID) {
+			return binding
+		}
+	}
+	if inst := s.root.Instances[instanceID]; inst != nil && inst.Capabilities.SharedAppServer {
+		return nil
+	}
+	return s.pendingRemoteBinding(instanceID, threadID)
+}
+
+func (s *Service) shouldTrackInstanceActiveTurn(instanceID string, event agentproto.Event) bool {
+	if isInternalHelperEvent(event) {
+		return false
+	}
+	if event.Initiator.Kind == agentproto.InitiatorLocalUI {
+		return true
+	}
+	if inst := s.root.Instances[instanceID]; inst != nil && threadIsReview(inst.Threads[event.ThreadID]) {
+		return true
+	}
+	if s.threadHasActiveGoal(instanceID, event.ThreadID) {
+		return true
+	}
+	binding := s.lookupRemoteTurnForEvent(instanceID, event)
+	if binding == nil {
+		return false
+	}
+	return !remoteBindingKeepsSurfaceSelection(binding)
+}
+
+func (s *Service) threadHasActiveGoal(instanceID, threadID string) bool {
+	inst := s.root.Instances[instanceID]
+	threadID = strings.TrimSpace(threadID)
+	if inst == nil || threadID == "" {
+		return false
+	}
+	thread := inst.Threads[threadID]
+	if thread == nil || thread.ThreadGoal == nil {
+		return false
+	}
+	return strings.EqualFold(strings.TrimSpace(thread.ThreadGoal.Status), "active")
+}
+
+func shouldClearTrackedInstanceActiveTurn(inst *state.InstanceRecord, threadID, turnID string) bool {
+	if inst == nil {
+		return false
+	}
+	activeTurnID := strings.TrimSpace(inst.ActiveTurnID)
+	if activeTurnID == "" || activeTurnID != strings.TrimSpace(turnID) {
+		return false
+	}
+	activeThreadID := strings.TrimSpace(inst.ActiveThreadID)
+	targetThreadID := strings.TrimSpace(threadID)
+	return activeThreadID == "" || targetThreadID == "" || activeThreadID == targetThreadID
+}
+
+func (s *Service) clearRemoteTurn(instanceID, turnID string) {
+	if binding := s.activeRemoteBinding(instanceID, turnID); binding != nil {
+		s.clearActiveRemoteTurn(instanceID)
+	}
+	if binding := s.turns.pendingRemoteBinding(instanceID); binding != nil && (turnID == "" || binding.TurnID == turnID) {
+		s.clearPendingRemoteTurn(instanceID)
+	}
+}
+
+func (s *Service) markRemoteTurnInterruptRequested(instanceID, threadID, turnID string) {
+	binding := s.lookupRemoteTurn(instanceID, threadID, turnID)
+	if binding == nil {
+		return
+	}
+	binding.InterruptRequested = true
+	if binding.InterruptRequestedAt.IsZero() {
+		binding.InterruptRequestedAt = s.now().UTC()
+	}
+}
+
+func (s *Service) clearRemoteOwnership(surface *state.SurfaceConsoleRecord) {
+	if surface == nil || surface.AttachedInstanceID == "" {
+		return
+	}
+	if binding := s.turns.pendingRemoteBinding(surface.AttachedInstanceID); binding != nil && binding.SurfaceSessionID == surface.SurfaceSessionID {
+		s.clearPendingRemoteTurn(surface.AttachedInstanceID)
+	}
+	if binding := s.turns.activeRemoteBinding(surface.AttachedInstanceID); binding != nil && binding.SurfaceSessionID == surface.SurfaceSessionID {
+		s.clearActiveRemoteTurn(surface.AttachedInstanceID)
+	}
+}
+
+func (s *Service) remoteBindingForSurface(surface *state.SurfaceConsoleRecord) *remoteTurnBinding {
+	if surface == nil || surface.AttachedInstanceID == "" {
+		return nil
+	}
+	if binding := s.activeRemoteBindingForSurface(surface); binding != nil {
+		return binding
+	}
+	if binding := s.turns.pendingRemoteBinding(surface.AttachedInstanceID); binding != nil && binding.SurfaceSessionID == surface.SurfaceSessionID {
+		return binding
+	}
+	return nil
+}
+
+func (s *Service) activeRemoteBindingForSurface(surface *state.SurfaceConsoleRecord) *remoteTurnBinding {
+	if s == nil || s.turns == nil || surface == nil || surface.AttachedInstanceID == "" {
+		return nil
+	}
+	binding := s.turns.activeRemoteBinding(surface.AttachedInstanceID)
+	if binding == nil || binding.SurfaceSessionID != surface.SurfaceSessionID {
+		return nil
+	}
+	return binding
+}
+
+func (s *Service) interruptibleSurfaceTurn(surface *state.SurfaceConsoleRecord) (threadID, turnID string, ok bool) {
+	if surface == nil || surface.AttachedInstanceID == "" {
+		return "", "", false
+	}
+	inst := s.root.Instances[surface.AttachedInstanceID]
+	if binding := s.activeRemoteBindingForSurface(surface); binding != nil {
+		turnID = strings.TrimSpace(binding.TurnID)
+		if turnID != "" {
+			activeThreadID := ""
+			if inst != nil {
+				activeThreadID = inst.ActiveThreadID
+			}
+			return strings.TrimSpace(xutil.FirstNonEmpty(remoteBindingExecutionThreadID(binding), activeThreadID)), turnID, true
+		}
+	}
+	if inst == nil {
+		return "", "", false
+	}
+	if inst.Capabilities.SharedAppServer && (surface.SelectedThreadID != inst.ActiveThreadID || !s.sharedThreadSubscriptionReady(inst.InstanceID, surface.SelectedThreadID)) {
+		return "", "", false
+	}
+	turnID = strings.TrimSpace(inst.ActiveTurnID)
+	if turnID == "" {
+		return "", "", false
+	}
+	return strings.TrimSpace(inst.ActiveThreadID), turnID, true
+}
+
+func (s *Service) remoteBindingSurfaceByCommand(commandID string) *state.SurfaceConsoleRecord {
+	if s == nil || s.turns == nil {
+		return nil
+	}
+	commandID = strings.TrimSpace(commandID)
+	if commandID == "" {
+		return nil
+	}
+	var surface *state.SurfaceConsoleRecord
+	s.turns.forEachPendingRemote(func(binding *remoteTurnBinding) {
+		if surface != nil || strings.TrimSpace(binding.CommandID) != commandID {
+			return
+		}
+		surface = s.root.Surfaces[binding.SurfaceSessionID]
+	})
+	if surface != nil {
+		return surface
+	}
+	s.turns.forEachActiveRemote(func(binding *remoteTurnBinding) {
+		if surface != nil || strings.TrimSpace(binding.CommandID) != commandID {
+			return
+		}
+		surface = s.root.Surfaces[binding.SurfaceSessionID]
+	})
+	return surface
+}

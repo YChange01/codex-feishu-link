@@ -1,0 +1,6 @@
+#!/bin/sh
+set -eu
+# Use the same native daemon as Feishu; never create an independent writer.
+export CODEX_FEISHU_RELAY_SHARED_APP_SERVER=1
+launcher_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+exec "$launcher_dir/codex-desktop-link" "$@"

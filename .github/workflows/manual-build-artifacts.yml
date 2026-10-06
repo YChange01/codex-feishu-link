@@ -1,0 +1,279 @@
+name: Manual Build Artifacts
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: Git ref to build. Defaults to main.
+        required: false
+        default: main
+        type: string
+      version:
+        description: Binary version string. Defaults to a valid placeholder for the selected track.
+        required: false
+        default: ""
+        type: string
+      track:
+        description: Build track metadata.
+        required: true
+        default: alpha
+        type: choice
+        options:
+          - production
+          - beta
+          - alpha
+      package_label:
+        description: Artifact filename version label. Defaults to manual-<short-sha>.
+        required: false
+        default: ""
+        type: string
+      retention_days:
+        description: How long GitHub keeps downloadable artifacts.
+        required: true
+        default: "14"
+        type: choice
+        options:
+          - "3"
+          - "7"
+          - "14"
+          - "30"
+
+permissions:
+  actions: write
+  contents: read
+
+concurrency:
+  group: manual-build-artifacts-${{ github.run_id }}
+  cancel-in-progress: false
+
+jobs:
+  build-base-assets:
+    runs-on: ubuntu-latest
+    outputs:
+      source_ref: ${{ steps.source.outputs.ref }}
+      version: ${{ steps.meta.outputs.version }}
+      package_label: ${{ steps.meta.outputs.package_label }}
+      track: ${{ inputs.track }}
+      artifact_name: ${{ steps.meta.outputs.artifact_name }}
+      commit: ${{ steps.meta.outputs.commit }}
+
+    steps:
+      - name: Resolve source ref
+        id: source
+        shell: bash
+        run: |
+          ref='${{ inputs.ref }}'
+          if [[ -z "${ref}" ]]; then
+            ref='main'
+          fi
+          echo "ref=${ref}" >> "${GITHUB_OUTPUT}"
+
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+          ref: ${{ steps.source.outputs.ref }}
+
+      - name: Resolve Go version spec
+        id: go_version
+        shell: bash
+        run: echo "version=$(bash scripts/ci/go-version-spec.sh)" >> "${GITHUB_OUTPUT}"
+
+      - name: Setup Go
+        uses: actions/setup-go@v6
+        with:
+          go-version: ${{ steps.go_version.outputs.version }}
+
+      - name: Resolve build metadata
+        id: meta
+        shell: bash
+        run: |
+          commit="$(git rev-parse HEAD)"
+          short_commit="$(git rev-parse --short=12 "${commit}")"
+          version='${{ inputs.version }}'
+          package_label='${{ inputs.package_label }}'
+          if [[ -z "${version}" ]]; then
+            case '${{ inputs.track }}' in
+              production)
+                version="v0.0.0"
+                ;;
+              beta)
+                version="v0.0.0-beta.0"
+                ;;
+              alpha)
+                version="v0.0.0-alpha.0"
+                ;;
+              *)
+                echo "unsupported track: ${{ inputs.track }}" >&2
+                exit 1
+                ;;
+            esac
+          fi
+          if [[ -z "${package_label}" ]]; then
+            package_label="manual-${short_commit}"
+          fi
+          if ! [[ "${package_label}" =~ ^[A-Za-z0-9._-]+$ ]]; then
+            echo "package_label must contain only letters, numbers, dot, underscore, or dash: ${package_label}" >&2
+            exit 1
+          fi
+          artifact_name="manual-build-release-assets-${package_label}"
+          echo "commit=${commit}" >> "${GITHUB_OUTPUT}"
+          echo "version=${version}" >> "${GITHUB_OUTPUT}"
+          echo "package_label=${package_label}" >> "${GITHUB_OUTPUT}"
+          echo "artifact_name=${artifact_name}" >> "${GITHUB_OUTPUT}"
+
+      - name: Install NSIS
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y nsis
+
+      - name: Check public docs for machine-local paths
+        run: bash scripts/check/no-local-paths.sh
+
+      - name: Check legacy names are gone
+        run: bash scripts/check/no-legacy-names.sh
+
+      - name: Check formatting
+        run: |
+          files="$(find cmd internal testkit -name '*.go' | sort)"
+          output="$(gofmt -l ${files})"
+          if [[ -n "${output}" ]]; then
+            echo "${output}"
+            exit 1
+          fi
+
+      - name: Run tests
+        run: go test ./...
+
+      - name: Build base artifacts
+        env:
+          CODEX_FEISHU_RELAY_BUILD_FLAVOR: ${{ inputs.track == 'alpha' && 'alpha' || 'shipping' }}
+          CODEX_FEISHU_RELAY_PACKAGE_VERSION_LABEL: ${{ steps.meta.outputs.package_label }}
+        run: bash scripts/release/build-artifacts.sh "${{ steps.meta.outputs.version }}" dist --jobs 5
+
+      - name: Build Windows NSIS installer
+        run: |
+          bash scripts/release/build-windows-nsis.sh \
+            --version "${{ steps.meta.outputs.version }}" \
+            --track "${{ inputs.track }}" \
+            --package-version-label "${{ steps.meta.outputs.package_label }}" \
+            --dist-dir dist
+
+      - name: Upload internal base dist
+        uses: actions/upload-artifact@v4
+        with:
+          name: internal-manual-build-base-dist
+          path: dist
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 1
+
+  build-macos-packaged-installer:
+    needs: build-base-assets
+    runs-on: macos-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ needs.build-base-assets.outputs.source_ref }}
+
+      - name: Download internal base dist
+        uses: actions/download-artifact@v4
+        with:
+          name: internal-manual-build-base-dist
+          path: dist
+
+      - name: Build macOS packaged installer
+        run: |
+          bash scripts/release/build-macos-packaged-installer.sh \
+            --version "${{ needs.build-base-assets.outputs.version }}" \
+            --track "${{ needs.build-base-assets.outputs.track }}" \
+            --package-version-label "${{ needs.build-base-assets.outputs.package_label }}" \
+            --dist-dir dist
+
+      - name: Upload internal macOS packaged installer
+        uses: actions/upload-artifact@v4
+        with:
+          name: internal-manual-build-macos-packaged-installer
+          path: dist/codex-feishu-relay_*_darwin_universal_installer.dmg
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 1
+
+  package-download:
+    needs:
+      - build-base-assets
+      - build-macos-packaged-installer
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+          ref: ${{ needs.build-base-assets.outputs.source_ref }}
+
+      - name: Download internal base dist
+        uses: actions/download-artifact@v4
+        with:
+          name: internal-manual-build-base-dist
+          path: dist
+
+      - name: Download internal macOS packaged installer
+        uses: actions/download-artifact@v4
+        with:
+          name: internal-manual-build-macos-packaged-installer
+          path: dist
+
+      - name: Refresh checksums
+        run: bash scripts/release/write-checksums.sh dist
+
+      - name: Write build manifest
+        shell: bash
+        run: |
+          cat > dist/manual-build.json <<EOF
+          {
+            "ref": "${{ needs.build-base-assets.outputs.source_ref }}",
+            "commit": "${{ needs.build-base-assets.outputs.commit }}",
+            "version": "${{ needs.build-base-assets.outputs.version }}",
+            "track": "${{ needs.build-base-assets.outputs.track }}",
+            "packageLabel": "${{ needs.build-base-assets.outputs.package_label }}",
+            "runId": "${{ github.run_id }}",
+            "runAttempt": "${{ github.run_attempt }}",
+            "runUrl": "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          }
+          EOF
+          bash scripts/release/write-checksums.sh dist
+
+      - name: Upload complete downloadable dist
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ needs.build-base-assets.outputs.artifact_name }}
+          path: dist/*
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: ${{ fromJSON(inputs.retention_days) }}
+
+  cleanup-internal-artifacts:
+    needs:
+      - build-base-assets
+      - build-macos-packaged-installer
+      - package-download
+    if: always()
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Delete internal transfer artifacts
+        if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          mapfile -t artifact_ids < <(
+            gh api "repos/${GH_REPO}/actions/runs/${{ github.run_id }}/artifacts" --paginate \
+              --jq '.artifacts[] | select(.name == "internal-manual-build-base-dist" or .name == "internal-manual-build-macos-packaged-installer") | .id'
+          )
+          for artifact_id in "${artifact_ids[@]}"; do
+            gh api --method DELETE "repos/${GH_REPO}/actions/artifacts/${artifact_id}" || true
+          done

@@ -1,0 +1,390 @@
+package orchestrator
+
+import (
+	"strings"
+
+	"github.com/YChange01/codex-feishu-link/internal/core/agentproto"
+	"github.com/YChange01/codex-feishu-link/internal/core/control"
+	"github.com/YChange01/codex-feishu-link/internal/core/state"
+)
+
+func (s *Service) buildCommandMenuView(surface *state.SurfaceConsoleRecord, raw string) control.FeishuCatalogView {
+	ctx := s.buildCatalogContext(surface)
+	return control.FeishuCatalogView{
+		Menu: &control.FeishuCatalogMenuView{
+			Stage:   ctx.MenuStage,
+			GroupID: parseCommandMenuView(raw),
+		},
+	}
+}
+
+func (s *Service) buildConfigCommandView(surface *state.SurfaceConsoleRecord, commandID string) control.FeishuCatalogView {
+	flow, ok := control.FeishuConfigFlowDefinitionByCommandID(commandID)
+	if !ok {
+		return control.FeishuCatalogView{}
+	}
+	return s.buildConfigCommandViewState(surface, flow, control.FeishuCatalogConfigView{})
+}
+
+func (s *Service) buildConfigCommandViewState(
+	surface *state.SurfaceConsoleRecord,
+	flow control.FeishuConfigFlowDefinition,
+	cardState control.FeishuCatalogConfigView,
+) control.FeishuCatalogView {
+	base := flow.BaseCatalogView()
+	view := control.FeishuCatalogView{
+		Config: s.applyCommandConfigCardState(&base, cardState),
+	}
+
+	ctx := s.buildCatalogContext(surface)
+	if view.Config.CatalogBackend == "" {
+		view.Config.CatalogBackend = ctx.Backend
+	}
+	if strings.TrimSpace(view.Config.CatalogFamilyID) != "" && (strings.TrimSpace(view.Config.CatalogVariantID) == "" || view.Config.CatalogVariantID == flow.DefaultVariantID()) {
+		view.Config.CatalogVariantID = control.FeishuCommandVariantIDForContext(view.Config.CatalogFamilyID, ctx)
+	}
+	inst := s.root.Instances[ctx.InstanceID]
+	if inst == nil && s.promptSettingRequiresAttachment(surface, flow.ActionKind) {
+		view.Config.RequiresAttachment = true
+		return view
+	}
+
+	var summary control.PromptRouteSummary
+	if flow.UsesPromptSummary() {
+		summary = s.resolveNextPromptSummary(inst, surface, "", "", state.ModelConfigRecord{})
+	}
+
+	view.Config.CurrentValue = s.resolveConfigFlowValue(ctx, surface, summary, flow.CurrentValueKey)
+	view.Config.EffectiveValue = s.resolveConfigFlowValue(ctx, surface, summary, flow.EffectiveValueKey)
+	view.Config.EffectiveValueSource = resolveConfigFlowValueSource(summary, flow.EffectiveValueKey)
+	view.Config.OverrideValue = s.resolveConfigFlowValue(ctx, surface, summary, flow.OverrideValueKey)
+	view.Config.OverrideExtraValue = s.resolveConfigFlowValue(ctx, surface, summary, flow.OverrideExtraValueKey)
+	view.Config.UsesLocalRequestedOverrides = summary.UsesLocalRequestedOverrides
+	view.Config.PlanModeOverrideSet = summary.PlanModeOverrideSet
+	view.Config.PlanModeUsesLocalRequested = summary.PlanModeUsesLocalRequested
+	switch flow.CommandID {
+	case control.FeishuCommandCodexProfile:
+		view.Config.FormOptions = s.codexProfileCommandOptions(true)
+		view.Config.FormPagination = true
+		if strings.TrimSpace(view.Config.StatusText) == "" {
+			if lines := s.unavailableCodexProfileLines(); len(lines) != 0 {
+				view.Config.StatusKind = "info"
+				view.Config.StatusText = strings.Join(lines, "\n")
+			}
+		}
+		if strings.TrimSpace(view.Config.FormDefaultValue) == "" {
+			view.Config.FormDefaultValue = s.surfaceCodexProfileID(surface)
+		}
+	case control.FeishuCommandClaudeProfile:
+		view.Config.FormOptions = s.claudeProfileCommandOptions()
+		if strings.TrimSpace(view.Config.FormDefaultValue) == "" {
+			view.Config.FormDefaultValue = s.surfaceClaudeProfileID(surface)
+		}
+	case control.FeishuCommandOpenCodeProfile:
+		view.Config.FormOptions = s.openCodeProfileCommandOptions()
+		if strings.TrimSpace(view.Config.FormDefaultValue) == "" {
+			view.Config.FormDefaultValue = s.surfaceOpenCodeProfileID(surface)
+		}
+	case control.FeishuCommandModel:
+		options, truncated := s.modelCatalogCommandOptions(surface, inst)
+		if len(options) != 0 {
+			view.Config.FormOptions = options
+		}
+		view.Config.SecondaryFormOptions = modelCombinedReasoningOptions(inst, options)
+		if kind, text := s.maybeModelCatalogStatusText(surface, inst, view.Config.CatalogBackend, truncated); text != "" && strings.TrimSpace(view.Config.StatusText) == "" {
+			view.Config.StatusKind = kind
+			view.Config.StatusText = text
+		}
+	case control.FeishuCommandReasoning:
+		if view.Config.CatalogBackend != agentproto.BackendClaude {
+			options, kind, text := s.modelReasoningCommandOptions(surface, inst, view.Config.CatalogBackend, summary.EffectiveModel)
+			view.Config.FormOptions = options
+			if text != "" && strings.TrimSpace(view.Config.StatusText) == "" {
+				view.Config.StatusKind = kind
+				view.Config.StatusText = text
+			}
+		}
+	}
+	return view
+}
+
+func resolveConfigFlowValueSource(summary control.PromptRouteSummary, key control.FeishuConfigFlowValueKey) string {
+	switch key {
+	case control.FeishuConfigFlowValuePromptEffectiveReasoning:
+		return strings.TrimSpace(summary.EffectiveReasoningEffortSource)
+	case control.FeishuConfigFlowValuePromptObservedThreadAccess:
+		if control.HasObservedThreadAccess(summary) {
+			return "thread"
+		}
+		return ""
+	case control.FeishuConfigFlowValuePromptEffectiveAccess:
+		return strings.TrimSpace(summary.EffectiveAccessModeSource)
+	case control.FeishuConfigFlowValuePromptEffectiveModel:
+		return strings.TrimSpace(summary.EffectiveModelSource)
+	case control.FeishuConfigFlowValuePromptObservedThreadPlan:
+		if strings.TrimSpace(summary.ObservedThreadPlanMode) != "" {
+			return "thread"
+		}
+		return ""
+	default:
+		return ""
+	}
+}
+
+func mergeConfigCardStateFromAction(
+	flow control.FeishuConfigFlowDefinition,
+	action control.Action,
+	cardState control.FeishuCatalogConfigView,
+) control.FeishuCatalogConfigView {
+	if strings.TrimSpace(cardState.CommandID) == "" {
+		cardState.CommandID = strings.TrimSpace(flow.CommandID)
+	}
+	if strings.TrimSpace(cardState.CatalogFamilyID) == "" {
+		cardState.CatalogFamilyID = strings.TrimSpace(action.CatalogFamilyID)
+		if cardState.CatalogFamilyID == "" {
+			cardState.CatalogFamilyID = flow.CatalogFamilyID()
+		}
+	}
+	if strings.TrimSpace(cardState.CatalogVariantID) == "" {
+		cardState.CatalogVariantID = strings.TrimSpace(action.CatalogVariantID)
+		if cardState.CatalogVariantID == "" {
+			cardState.CatalogVariantID = flow.DefaultVariantID()
+		}
+	}
+	if cardState.CatalogBackend == "" {
+		cardState.CatalogBackend = action.CatalogBackend
+	}
+	return cardState
+}
+
+func (s *Service) resolveConfigFlowValue(
+	ctx control.CatalogContext,
+	surface *state.SurfaceConsoleRecord,
+	summary control.PromptRouteSummary,
+	key control.FeishuConfigFlowValueKey,
+) string {
+	switch key {
+	case control.FeishuConfigFlowValueSurfaceProductMode:
+		normalized := control.NormalizeCatalogContext(ctx)
+		return state.SurfaceModeAlias(state.ProductMode(normalized.ProductMode), normalized.Backend)
+	case control.FeishuConfigFlowValueSurfaceCodexProfile:
+		if surface != nil {
+			return s.surfaceCodexProfileID(surface)
+		}
+		return state.NativeCodexProfileID
+	case control.FeishuConfigFlowValueSurfaceClaudeProfile:
+		if surface != nil {
+			return s.surfaceClaudeProfileID(surface)
+		}
+		return state.DefaultClaudeProfileID
+	case control.FeishuConfigFlowValueSurfaceOpenCodeProfile:
+		if surface != nil {
+			return s.surfaceOpenCodeProfileID(surface)
+		}
+		return state.DefaultOpenCodeProfileID
+	case control.FeishuConfigFlowValueSurfaceAutoWhip:
+		if surface != nil && surface.AutoWhip.Enabled {
+			return "on"
+		}
+		return "off"
+	case control.FeishuConfigFlowValueSurfaceAutoContinue:
+		if surface != nil && surface.AutoContinue.Enabled {
+			return "on"
+		}
+		return "off"
+	case control.FeishuConfigFlowValueSurfacePlanMode:
+		current := state.PlanModeSettingOff
+		if surface != nil {
+			current = state.NormalizePlanModeSetting(surface.PlanMode)
+		}
+		return string(current)
+	case control.FeishuConfigFlowValueSurfaceVerbosity:
+		current := state.SurfaceVerbosityNormal
+		if surface != nil {
+			current = state.NormalizeSurfaceVerbosity(surface.Verbosity)
+		}
+		return string(current)
+	case control.FeishuConfigFlowValuePromptEffectiveReasoning:
+		return strings.TrimSpace(summary.EffectiveReasoningEffort)
+	case control.FeishuConfigFlowValuePromptOverrideReasoning:
+		return strings.TrimSpace(summary.OverrideReasoningEffort)
+	case control.FeishuConfigFlowValuePromptObservedThreadAccess:
+		return control.ObservedThreadAccessDisplay(summary)
+	case control.FeishuConfigFlowValuePromptEffectiveAccess:
+		return strings.TrimSpace(summary.EffectiveAccessMode)
+	case control.FeishuConfigFlowValuePromptOverrideAccess:
+		return strings.TrimSpace(summary.OverrideAccessMode)
+	case control.FeishuConfigFlowValuePromptObservedThreadPlan:
+		return strings.TrimSpace(summary.ObservedThreadPlanMode)
+	case control.FeishuConfigFlowValuePromptEffectiveModel:
+		return strings.TrimSpace(summary.EffectiveModel)
+	case control.FeishuConfigFlowValuePromptOverrideModel:
+		return strings.TrimSpace(summary.OverrideModel)
+	default:
+		return ""
+	}
+}
+
+func (s *Service) applyCommandConfigCardState(base *control.FeishuCatalogConfigView, cardState control.FeishuCatalogConfigView) *control.FeishuCatalogConfigView {
+	if base == nil {
+		base = &control.FeishuCatalogConfigView{}
+	}
+	if strings.TrimSpace(cardState.FormDefaultValue) != "" {
+		base.FormDefaultValue = strings.TrimSpace(cardState.FormDefaultValue)
+	}
+	if len(cardState.FormOptions) != 0 {
+		base.FormOptions = append([]control.CommandCatalogFormFieldOption(nil), cardState.FormOptions...)
+	}
+	if len(cardState.SecondaryFormOptions) != 0 {
+		base.SecondaryFormOptions = append([]control.CommandCatalogFormFieldOption(nil), cardState.SecondaryFormOptions...)
+	}
+	if strings.TrimSpace(cardState.CatalogFamilyID) != "" {
+		base.CatalogFamilyID = strings.TrimSpace(cardState.CatalogFamilyID)
+	}
+	if strings.TrimSpace(cardState.CatalogVariantID) != "" {
+		base.CatalogVariantID = strings.TrimSpace(cardState.CatalogVariantID)
+	}
+	if cardState.CatalogBackend != "" {
+		base.CatalogBackend = cardState.CatalogBackend
+	}
+	if strings.TrimSpace(cardState.StatusKind) != "" {
+		base.StatusKind = strings.TrimSpace(cardState.StatusKind)
+	}
+	if strings.TrimSpace(cardState.StatusText) != "" {
+		base.StatusText = strings.TrimSpace(cardState.StatusText)
+	}
+	if cardState.FormCursor != 0 {
+		base.FormCursor = cardState.FormCursor
+	}
+	if cardState.FormPagination {
+		base.FormPagination = true
+	}
+	if cardState.Sealed {
+		base.Sealed = true
+	}
+	return base
+}
+
+func (s *Service) codexProfileCommandOptions(includeUnavailable bool) []control.CommandCatalogFormFieldOption {
+	profiles := s.CodexProfiles()
+	options := make([]control.CommandCatalogFormFieldOption, 0, len(profiles))
+	labelCounts := map[string]int{}
+	for _, profile := range profiles {
+		if !profile.Available && !includeUnavailable {
+			continue
+		}
+		label := strings.TrimSpace(profile.Name)
+		if label == "" {
+			label = profile.ID
+		}
+		labelCounts[label]++
+	}
+	for _, profile := range profiles {
+		if !profile.Available && !includeUnavailable {
+			continue
+		}
+		label := strings.TrimSpace(profile.Name)
+		if label == "" {
+			label = profile.ID
+		}
+		if labelCounts[label] > 1 && !strings.EqualFold(label, strings.TrimSpace(profile.ID)) {
+			label += "（" + strings.TrimSpace(profile.ID) + "）"
+		}
+		if !profile.Available {
+			label += "（不可用）"
+		}
+		options = append(options, control.CommandCatalogFormFieldOption{
+			Label: label,
+			Value: strings.TrimSpace(profile.ID),
+		})
+	}
+	if len(options) == 0 {
+		return []control.CommandCatalogFormFieldOption{{
+			Label: "本机默认",
+			Value: state.NativeCodexProfileID,
+		}}
+	}
+	return options
+}
+
+func (s *Service) unavailableCodexProfileLines() []string {
+	lines := make([]string, 0)
+	for _, profile := range s.CodexProfiles() {
+		if profile.Available {
+			continue
+		}
+		name := strings.TrimSpace(profile.Name)
+		if name == "" {
+			name = strings.TrimSpace(profile.ID)
+		}
+		reason := codexProfileUnavailableReasonText(profile)
+		lines = append(lines, name+"："+reason)
+	}
+	return lines
+}
+
+func codexProfileUnavailableReasonText(profile state.CodexProfileSummary) string {
+	switch strings.TrimSpace(profile.StatusCode) {
+	case "oauth_missing", "missing":
+		return "未检测到 ChatGPT 登录，请在本机完成 Codex 登录后再使用。"
+	case "oauth_probe_unknown", "unknown":
+		return "暂时无法确认 ChatGPT 登录状态，请稍后刷新或到 Web 管理界面检查。"
+	case "oauth_deployment_unsupported":
+		return "当前 ChatGPT 登录部署暂不支持这个 Profile。"
+	case "codex_capability_unsupported":
+		return "当前 Codex 版本暂不支持 Profile 隔离能力。"
+	case "managed_model_catalog_missing":
+		return "当前运行目录无法准备 Codex 模型目录，请检查服务安装状态后再试。"
+	case "profile_definition_incomplete":
+		return "配置不完整，请到 Web 管理界面补齐端点、模型和推理配置。"
+	case "profile_secret_missing":
+		return "缺少 API Key，请到 Web 管理界面补齐后再使用。"
+	case "profile_revision_unavailable":
+		return "当前保存的 Profile 版本已经不可用，请到 Web 管理界面刷新或重新保存。"
+	case "profile_catalog_degraded":
+		return "Profile 目录暂不可用，请稍后刷新。"
+	default:
+		return "当前不可用，请到 Web 管理界面检查配置。"
+	}
+}
+
+func (s *Service) claudeProfileCommandOptions() []control.CommandCatalogFormFieldOption {
+	profiles := s.ClaudeProfiles()
+	if len(profiles) == 0 {
+		return []control.CommandCatalogFormFieldOption{{
+			Label: state.DefaultClaudeProfileName,
+			Value: state.DefaultClaudeProfileID,
+		}}
+	}
+	labelCounts := map[string]int{}
+	for _, profile := range profiles {
+		label := strings.TrimSpace(profile.Name)
+		if label == "" {
+			label = profile.ID
+		}
+		labelCounts[label]++
+	}
+	options := make([]control.CommandCatalogFormFieldOption, 0, len(profiles))
+	for _, profile := range profiles {
+		label := strings.TrimSpace(profile.Name)
+		if label == "" {
+			label = profile.ID
+		}
+		if labelCounts[label] > 1 && !strings.EqualFold(label, strings.TrimSpace(profile.ID)) {
+			label += "（" + strings.TrimSpace(profile.ID) + "）"
+		}
+		options = append(options, control.CommandCatalogFormFieldOption{
+			Label: label,
+			Value: strings.TrimSpace(profile.ID),
+		})
+	}
+	return options
+}
+
+func (s *Service) commandPageFromView(surface *state.SurfaceConsoleRecord, view control.FeishuCatalogView) control.FeishuPageView {
+	page, ok := control.FeishuPageViewFromViewContext(view, s.buildCatalogContext(surface))
+	if !ok {
+		return control.FeishuPageView{}
+	}
+	return page
+}

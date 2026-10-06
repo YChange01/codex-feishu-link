@@ -1,0 +1,256 @@
+package feishuapp
+
+import "github.com/YChange01/codex-feishu-link/internal/core/control"
+
+type Manifest struct {
+	Scopes            ScopesImport          `json:"scopesImport"`
+	ScopeRequirements []ScopeRequirement    `json:"scopeRequirements,omitempty"`
+	Events            []EventRequirement    `json:"events"`
+	Callbacks         []CallbackRequirement `json:"callbacks"`
+	Menus             []MenuRequirement     `json:"menus"`
+	Checklist         []ChecklistSection    `json:"checklist"`
+}
+
+type ScopesImport struct {
+	Scopes PermissionScopes `json:"scopes"`
+}
+
+type PermissionScopes struct {
+	Tenant []string `json:"tenant"`
+	User   []string `json:"user"`
+}
+
+type ScopeRequirement struct {
+	Scope          string `json:"scope"`
+	ScopeType      string `json:"scopeType,omitempty"`
+	Feature        string `json:"feature,omitempty"`
+	Required       bool   `json:"required"`
+	DegradeMessage string `json:"degradeMessage,omitempty"`
+}
+
+type EventRequirement struct {
+	Event          string `json:"event"`
+	Purpose        string `json:"purpose,omitempty"`
+	Feature        string `json:"feature,omitempty"`
+	Required       bool   `json:"required"`
+	DegradeMessage string `json:"degradeMessage,omitempty"`
+}
+
+type CallbackRequirement struct {
+	Callback       string `json:"callback"`
+	Purpose        string `json:"purpose,omitempty"`
+	Feature        string `json:"feature,omitempty"`
+	Required       bool   `json:"required"`
+	DegradeMessage string `json:"degradeMessage,omitempty"`
+}
+
+type MenuRequirement struct {
+	Key         string `json:"key"`
+	Name        string `json:"name"`
+	Description string `json:"description,omitempty"`
+}
+
+type ChecklistSection struct {
+	Area  string   `json:"area"`
+	Items []string `json:"items"`
+}
+
+func DefaultManifest() Manifest {
+	menus := control.FeishuRecommendedMenus()
+	manifestMenus := make([]MenuRequirement, 0, len(menus))
+	for _, menu := range menus {
+		manifestMenus = append(manifestMenus, MenuRequirement{
+			Key:         menu.Key,
+			Name:        menu.Name,
+			Description: menu.Description,
+		})
+	}
+	return Manifest{
+		Scopes: ScopesImport{
+			Scopes: PermissionScopes{
+				Tenant: []string{
+					"application:application:self_manage",
+					"drive:drive",
+					"bitable:app",
+					"im:message:readonly",
+					"im:message.group_at_msg:readonly",
+					"im:message.group_at_msg.include_bot:readonly",
+					"im:message.group_msg",
+					"im:chat:readonly",
+					"im:message.p2p_msg:readonly",
+					"im:message.reactions:read",
+					"im:message.reactions:write_only",
+					"im:message:send_as_bot",
+					"im:resource:upload",
+				},
+				User: []string{},
+			},
+		},
+		ScopeRequirements: []ScopeRequirement{
+			{
+				Scope:     "application:application:self_manage",
+				ScopeType: "tenant",
+				Feature:   "setup_app_management",
+				Required:  true,
+			},
+			{
+				Scope:     "drive:drive",
+				ScopeType: "tenant",
+				Feature:   "markdown_preview",
+				Required:  true,
+			},
+			{
+				Scope:     "bitable:app",
+				ScopeType: "tenant",
+				Feature:   "cron_bitable",
+				Required:  true,
+			},
+			{
+				Scope:     "im:message:readonly",
+				ScopeType: "tenant",
+				Feature:   "core_message_flow",
+				Required:  true,
+			},
+			{
+				Scope:     "im:message.group_at_msg:readonly",
+				ScopeType: "tenant",
+				Feature:   "group_mentions",
+				Required:  true,
+			},
+			{
+				Scope:     "im:message.group_at_msg.include_bot:readonly",
+				ScopeType: "tenant",
+				Feature:   "group_mentions",
+				Required:  true,
+			},
+			{
+				Scope:     "im:message.group_msg",
+				ScopeType: "tenant",
+				Feature:   "primary_room_bot",
+				Required:  true,
+			},
+			{
+				Scope:     "im:chat:readonly",
+				ScopeType: "tenant",
+				Feature:   "primary_room_auto_bootstrap",
+				Required:  true,
+			},
+			{
+				Scope:     "im:message.p2p_msg:readonly",
+				ScopeType: "tenant",
+				Feature:   "p2p_chat",
+				Required:  true,
+			},
+			{
+				Scope:     "im:message.reactions:read",
+				ScopeType: "tenant",
+				Feature:   "reaction_feedback",
+				Required:  true,
+			},
+			{
+				Scope:     "im:message.reactions:write_only",
+				ScopeType: "tenant",
+				Feature:   "reaction_feedback",
+				Required:  true,
+			},
+			{
+				Scope:     "im:message:send_as_bot",
+				ScopeType: "tenant",
+				Feature:   "core_message_flow",
+				Required:  true,
+			},
+			{
+				Scope:     "im:resource:upload",
+				ScopeType: "tenant",
+				Feature:   "core_message_flow",
+				Required:  true,
+			},
+		},
+		Events: []EventRequirement{
+			{
+				Event:    "im.message.receive_v1",
+				Purpose:  "接收用户发给机器人的文本和图片消息",
+				Feature:  "core_message_flow",
+				Required: true,
+			},
+			{
+				Event:    "im.message.recalled_v1",
+				Purpose:  "处理用户撤回消息",
+				Feature:  "message_recall_sync",
+				Required: true,
+			},
+			{
+				Event:    "im.message.reaction.created_v1",
+				Purpose:  "处理用户对消息的反馈动作",
+				Feature:  "reaction_feedback",
+				Required: true,
+			},
+			{
+				Event:    "im.message.reaction.deleted_v1",
+				Purpose:  "处理用户对消息的反馈动作",
+				Feature:  "reaction_feedback",
+				Required: true,
+			},
+			{
+				Event:    "im.chat.member.bot.added_v1",
+				Purpose:  "机器人被加入群时自动引导唯一机器人成为本群主机器人",
+				Feature:  "primary_room_auto_bootstrap",
+				Required: true,
+			},
+			{
+				Event:    "application.bot.menu_v6",
+				Purpose:  "处理机器人菜单点击",
+				Feature:  "bot_menu",
+				Required: true,
+			},
+		},
+		Callbacks: []CallbackRequirement{
+			{
+				Callback: "card.action.trigger",
+				Purpose:  "处理卡片按钮和卡片交互回调",
+				Feature:  "interactive_cards",
+				Required: true,
+			},
+		},
+		Menus: manifestMenus,
+		Checklist: []ChecklistSection{
+			{
+				Area: "凭证与基础信息",
+				Items: []string{
+					"在飞书开放平台记录 App ID 和 App Secret。",
+					"在当前页面保存凭证后再做长连接验证。",
+				},
+			},
+			{
+				Area: "权限导入",
+				Items: []string{
+					"打开“权限管理”里的“批量导入/导出权限”，粘贴 scopes import JSON。",
+					"点击“保存并申请开通”，再回到当前页面继续。",
+					"保持 manifest 里的所有权限启用。",
+				},
+			},
+			{
+				Area: "事件订阅",
+				Items: []string{
+					"打开“事件与回调”页，在“订阅方式”里确认长连接并保存。",
+					"手工订阅 manifest 里的消息事件和菜单事件。",
+				},
+			},
+			{
+				Area: "回调配置",
+				Items: []string{
+					"在“事件与回调”页的“回调配置”里，将“回调订阅方式”设为长连接。",
+					"确认 manifest 里的卡片回调项已经配置完成。",
+					"当前版本不需要填写 HTTP 回调 URL。",
+				},
+			},
+			{
+				Area: "机器人菜单与发布",
+				Items: []string{
+					"创建 manifest 里的全部机器人菜单 key。",
+					"完成配置后发布机器人版本，再回到管理页观察连接状态。",
+				},
+			},
+		},
+	}
+}

@@ -1,0 +1,12 @@
+Source provenance
+
+This repository starts from the v2.1.2 source snapshot of the project maintained
+by kxn at https://github.com/kxn/codex-remote-feishu, revision ab73118.
+
+The imported implementation, documentation, tests, and release notes retain
+their upstream authorship. This repository adds local desktop-sharing support,
+Feishu integration changes, and publication configuration for
+https://github.com/YChange01/codex-feishu-link.
+
+The executable name remains codex-feishu-relay for compatibility with its
+configuration, service, and packaging interfaces.

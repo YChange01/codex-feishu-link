@@ -1,0 +1,882 @@
+package orchestrator
+
+import (
+	"sort"
+	"strconv"
+	"strings"
+
+	"github.com/YChange01/codex-feishu-link/internal/core/agentproto"
+	"github.com/YChange01/codex-feishu-link/internal/core/control"
+	"github.com/YChange01/codex-feishu-link/internal/core/eventcontract"
+	"github.com/YChange01/codex-feishu-link/internal/core/frontstagecontract"
+	"github.com/YChange01/codex-feishu-link/internal/core/state"
+	"github.com/YChange01/codex-feishu-link/internal/xutil"
+)
+
+func (s *Service) findAttachedSurface(instanceID string) *state.SurfaceConsoleRecord {
+	for _, surface := range s.root.Surfaces {
+		if surface.AttachedInstanceID == instanceID {
+			return surface
+		}
+	}
+	return nil
+}
+
+func (s *Service) findAttachedSurfaces(instanceID string) []*state.SurfaceConsoleRecord {
+	var surfaces []*state.SurfaceConsoleRecord
+	for _, surface := range s.root.Surfaces {
+		if surface.AttachedInstanceID == instanceID {
+			surfaces = append(surfaces, surface)
+		}
+	}
+	return surfaces
+}
+
+func (s *Service) SurfaceSnapshot(surfaceID string) *control.Snapshot {
+	surface := s.root.Surfaces[surfaceID]
+	if surface == nil {
+		return nil
+	}
+	return s.buildSnapshot(surface)
+}
+
+func (s *Service) AttachedInstanceID(surfaceID string) string {
+	surface := s.root.Surfaces[surfaceID]
+	if surface == nil {
+		return ""
+	}
+	return surface.AttachedInstanceID
+}
+
+func (s *Service) SurfaceChatID(surfaceID string) string {
+	surface := s.root.Surfaces[surfaceID]
+	if surface == nil {
+		return ""
+	}
+	return surface.ChatID
+}
+
+func (s *Service) SurfaceGatewayID(surfaceID string) string {
+	surface := s.root.Surfaces[surfaceID]
+	if surface == nil {
+		return ""
+	}
+	return surface.GatewayID
+}
+
+func (s *Service) SurfaceActorUserID(surfaceID string) string {
+	surface := s.root.Surfaces[surfaceID]
+	if surface == nil {
+		return ""
+	}
+	return surface.ActorUserID
+}
+
+func (s *Service) PendingRequest(surfaceID, requestID string) *state.RequestPromptRecord {
+	surface := s.root.Surfaces[strings.TrimSpace(surfaceID)]
+	if surface == nil {
+		return nil
+	}
+	return pendingRequestRecord(surface, requestID)
+}
+
+func (s *Service) MaterializeSurface(surfaceID, gatewayID, chatID, actorUserID string) {
+	if strings.TrimSpace(surfaceID) == "" {
+		return
+	}
+	s.ensureSurface(control.Action{
+		Kind:             control.ActionStatus,
+		GatewayID:        gatewayID,
+		SurfaceSessionID: surfaceID,
+		ChatID:           chatID,
+		ActorUserID:      actorUserID,
+	})
+}
+
+func (s *Service) MaterializeSurfaceResume(surfaceID, gatewayID, chatID, actorUserID string, mode state.ProductMode, backend agentproto.Backend, claudeProfileID string, verbosity state.SurfaceVerbosity, planMode state.PlanModeSetting) {
+	var contract state.SurfaceBackendContract
+	if state.IsVSCodeProductMode(mode) {
+		contract = state.VSCodeSurfaceBackendContract()
+	} else if agentproto.NormalizeBackend(backend) == agentproto.BackendClaude {
+		contract = state.HeadlessClaudeSurfaceBackendContract(claudeProfileID)
+	} else if agentproto.NormalizeBackend(backend) == agentproto.BackendOpenCode {
+		contract = state.HeadlessOpenCodeSurfaceBackendContract("")
+	} else {
+		contract = state.HeadlessCodexSurfaceBackendContract("")
+	}
+	s.MaterializeSurfaceResumeContract(surfaceID, gatewayID, chatID, actorUserID, contract, verbosity, planMode)
+}
+
+func (s *Service) MaterializeSurfaceResumeWithCodexProfile(surfaceID, gatewayID, chatID, actorUserID string, mode state.ProductMode, backend agentproto.Backend, codexProfileID, claudeProfileID string, verbosity state.SurfaceVerbosity, planMode state.PlanModeSetting) {
+	contract := state.NormalizeSurfaceBackendContract(state.SurfaceBackendContract{
+		ProductMode:     mode,
+		Backend:         backend,
+		CodexProfileID:  codexProfileID,
+		ClaudeProfileID: claudeProfileID,
+	})
+	s.MaterializeSurfaceResumeContract(surfaceID, gatewayID, chatID, actorUserID, contract, verbosity, planMode)
+}
+
+func (s *Service) MaterializeSurfaceResumeWithOpenCodeProfile(surfaceID, gatewayID, chatID, actorUserID string, mode state.ProductMode, backend agentproto.Backend, openCodeProfileID string, verbosity state.SurfaceVerbosity, planMode state.PlanModeSetting) {
+	contract := state.NormalizeSurfaceBackendContract(state.SurfaceBackendContract{
+		ProductMode:       mode,
+		Backend:           backend,
+		OpenCodeProfileID: openCodeProfileID,
+	})
+	s.MaterializeSurfaceResumeContract(surfaceID, gatewayID, chatID, actorUserID, contract, verbosity, planMode)
+}
+
+func (s *Service) MaterializeSurfaceResumeContract(surfaceID, gatewayID, chatID, actorUserID string, contract state.SurfaceBackendContract, verbosity state.SurfaceVerbosity, planMode state.PlanModeSetting) {
+	if strings.TrimSpace(surfaceID) == "" {
+		return
+	}
+	surface := s.ensureSurface(control.Action{
+		Kind:             control.ActionStatus,
+		GatewayID:        gatewayID,
+		SurfaceSessionID: surfaceID,
+		ChatID:           chatID,
+		ActorUserID:      actorUserID,
+	})
+	if surface == nil {
+		return
+	}
+	s.setSurfaceDesiredContract(surface, contract)
+	surface.Verbosity = state.NormalizeSurfaceVerbosity(verbosity)
+	surface.PlanMode = state.NormalizePlanModeSetting(planMode)
+	s.projectLatestBotCapabilitySettingsToSurface(surface)
+}
+
+func (s *Service) MaterializeSurfaceResumeContractWithOpenCodeRef(surfaceID, gatewayID, chatID, actorUserID string, contract state.SurfaceBackendContract, openCodeAdmissionRef *state.OpenCodeAdmissionRef, verbosity state.SurfaceVerbosity, planMode state.PlanModeSetting) {
+	s.MaterializeSurfaceResumeContract(surfaceID, gatewayID, chatID, actorUserID, contract, verbosity, planMode)
+	if strings.TrimSpace(surfaceID) == "" {
+		return
+	}
+	surface := s.root.Surfaces[surfaceID]
+	if surface == nil {
+		return
+	}
+	if ref := state.NormalizeOpenCodeAdmissionRef(openCodeAdmissionRef); ref != nil &&
+		state.NormalizeOpenCodeProfileID(ref.ProfileRef.ID) == state.EffectiveSurfaceOpenCodeProfileID(contract) {
+		surface.OpenCodeAdmissionRef = ref
+	}
+}
+
+// RestoreSurfaceSessionSettings 恢复 access/plan 这两个会话级设置。
+// 必须在 MaterializeSurfaceResumeContract（含 bot settings 投影）之后调用，
+// 避免投影覆盖会话值。
+func (s *Service) RestoreSurfaceSessionSettings(surfaceID, accessMode string, planMode state.PlanModeSetting, planModeOverrideSet bool) {
+	if strings.TrimSpace(surfaceID) == "" {
+		return
+	}
+	surface := s.root.Surfaces[surfaceID]
+	if surface == nil {
+		return
+	}
+	surface.PromptOverride.AccessMode = strings.TrimSpace(accessMode)
+	surface.PlanMode = state.NormalizePlanModeSetting(planMode)
+	surface.PlanModeOverrideSet = planModeOverrideSet
+}
+
+func (s *Service) BindPendingRemoteCommand(surfaceID, commandID string) {
+	if commandID == "" {
+		return
+	}
+	surface := s.root.Surfaces[surfaceID]
+	if surface == nil {
+		return
+	}
+	if surface.AttachedInstanceID != "" {
+		if s.bindPendingCompactCommand(surface, commandID) {
+			return
+		}
+		if s.bindPendingRemoteCommand(surface, commandID) {
+			return
+		}
+	}
+	if s.bindPendingSteerCommand(surfaceID, commandID) {
+		return
+	}
+}
+
+func (s *Service) BindPendingReviewStartCommand(surfaceID, commandID string) {
+	if strings.TrimSpace(commandID) == "" {
+		return
+	}
+	surface := s.root.Surfaces[surfaceID]
+	s.bindPendingReviewStartCommand(surface, commandID)
+}
+
+func (s *Service) HandleCommandDispatchFailure(surfaceID, commandID string, err error) []eventcontract.Event {
+	if events := s.failGoalUserCommand(surfaceID, commandID, err); len(events) != 0 {
+		return events
+	}
+	surface := s.root.Surfaces[surfaceID]
+	if events := s.restorePendingCompactDispatch(surfaceID, commandID, "dispatch_failed", err); len(events) != 0 {
+		return events
+	}
+	if events := s.restorePendingRequestDispatch(surface, commandID, "dispatch_failed"); len(events) != 0 {
+		return events
+	}
+	problem := agentproto.ErrorInfoFromError(err, agentproto.ErrorInfo{
+		Code:             "dispatch_failed",
+		Layer:            "daemon",
+		Stage:            "dispatch_command",
+		Message:          "消息未成功发送到本地 Codex。",
+		SurfaceSessionID: surfaceID,
+	})
+	notice := NoticeForProblem(problem)
+	notice.Code = "dispatch_failed"
+	if s.pendingReviewStartSurface(commandID) != nil {
+		return s.failPendingReviewStart(commandID, &notice)
+	}
+	if key, binding := s.pendingSteerForCommand("", commandID); binding != nil {
+		_ = binding
+		notice.Code = "steer_failed"
+		notice.Text = appendSteerRestoreHint(notice.Text)
+		return s.restorePendingSteer(key, &notice)
+	}
+	if surface == nil || surface.ActiveQueueItemID == "" {
+		return nil
+	}
+	item := surface.QueueItems[surface.ActiveQueueItemID]
+	if item == nil || item.Status != state.QueueItemDispatching {
+		return nil
+	}
+	return s.failSurfaceActiveQueueItem(surface, item, &notice, true)
+}
+
+func (s *Service) HandleCommandAccepted(instanceID string, ack agentproto.CommandAck) []eventcontract.Event {
+	if ack.CommandID == "" {
+		return nil
+	}
+	if s.acknowledgePendingReviewStart(ack.CommandID) {
+		return nil
+	}
+	if surface, request := s.findPendingRequestByCommandID(ack.CommandID); surface != nil && request != nil {
+		markRequestAwaitingBackendConsume(request)
+		if requestPromptRenderable(request.RequestType) && strings.TrimSpace(request.VisibleMessageID) != "" {
+			return []eventcontract.Event{s.requestPromptDeliveryEvent(surface, request, "")}
+		}
+		return nil
+	}
+	key, binding := s.pendingSteerForCommand(instanceID, ack.CommandID)
+	if binding == nil {
+		return nil
+	}
+	surface := s.root.Surfaces[binding.SurfaceSessionID]
+	if surface == nil {
+		s.clearPendingSteer(key)
+		return nil
+	}
+	s.clearPendingSteer(key)
+	events := []eventcontract.Event{}
+	if strings.TrimSpace(binding.OwnerCardMessageID) != "" {
+		events = append(events, steerAllCompletedOwnerCardEvent(surface.SurfaceSessionID, binding.OwnerCardMessageID, len(pendingSteerQueueItemIDs(binding))))
+	}
+	if supplement := s.steerUserSupplementEvent(surface, binding); supplement != nil {
+		events = append(events, *supplement)
+	}
+	for _, queueItemID := range pendingSteerQueueItemIDs(binding) {
+		item := surface.QueueItems[queueItemID]
+		if item == nil || item.Status != state.QueueItemSteering {
+			continue
+		}
+		item.Status = state.QueueItemSteered
+		events = append(events, s.pendingInputEvents(surface, control.PendingInputState{
+			QueueItemID: item.ID,
+			Status:      string(item.Status),
+			QueueOff:    true,
+			ThumbsUp:    true,
+		}, queueItemSourceMessageIDs(item))...)
+	}
+	events = s.insertExecCommandProgressBoundary(binding.InstanceID, binding.ThreadID, binding.TurnID, events)
+	return append(events, s.maybeAutoSteerSharedQueuedInputs(surface, "")...)
+}
+
+func (s *Service) HandleCommandRejected(instanceID string, ack agentproto.CommandAck) []eventcontract.Event {
+	if subscription := s.sharedSubscriptions[instanceID]; subscription != nil && subscription.CommandID == ack.CommandID {
+		return s.failSharedThreadSubscription(instanceID, ack.Error)
+	}
+	if ack.CommandID == "" {
+		return nil
+	}
+	if surface := s.pendingReviewStartSurface(ack.CommandID); surface != nil {
+		notice := NoticeForProblem(commandAckProblem(surface.SurfaceSessionID, ack))
+		notice.Code = "command_rejected"
+		return s.failPendingReviewStart(ack.CommandID, &notice)
+	}
+	if events := s.restorePendingCompactCommand(instanceID, ack.CommandID, commandAckProblem("", ack)); len(events) != 0 {
+		return events
+	}
+	if key, binding := s.pendingSteerForCommand(instanceID, ack.CommandID); binding != nil {
+		notice := NoticeForProblem(commandAckProblem(binding.SurfaceSessionID, ack))
+		notice.Code = "steer_failed"
+		notice.Text = appendSteerRestoreHint(notice.Text)
+		return s.restorePendingSteer(key, &notice)
+	}
+	binding := s.pendingRemoteBindingByCommandForInstance(instanceID, ack.CommandID)
+	if binding == nil {
+		if surface := s.findAttachedSurface(instanceID); surface != nil {
+			return s.restorePendingRequestDispatch(surface, ack.CommandID, "command_rejected")
+		}
+		return nil
+	}
+	surface := s.root.Surfaces[binding.SurfaceSessionID]
+	if surface == nil {
+		s.clearPendingRemoteTurn(instanceID)
+		return nil
+	}
+	item := surface.QueueItems[binding.QueueItemID]
+	if item == nil || item.Status != state.QueueItemDispatching {
+		s.clearPendingRemoteTurn(instanceID)
+		return nil
+	}
+	notice := NoticeForProblem(commandAckProblem(surface.SurfaceSessionID, ack))
+	notice.Code = "command_rejected"
+	return s.failSurfaceActiveQueueItem(surface, item, &notice, true)
+}
+
+func (s *Service) restorePendingRequestDispatch(surface *state.SurfaceConsoleRecord, commandID, noticeCode string) []eventcontract.Event {
+	if surface == nil || strings.TrimSpace(commandID) == "" {
+		return nil
+	}
+	surface, request := s.findPendingRequestByCommandID(commandID)
+	if request == nil || surface == nil {
+		return nil
+	}
+	if normalizeRequestType(request.RequestType) == "tool_callback" {
+		markRequestAwaitingBackendConsume(request)
+		bumpRequestCardRevision(request)
+		noticeText := "自动上报 unsupported 结果失败，当前 turn 可能仍在等待 callback。可使用 `/stop` 结束本轮，或等待本地 Codex 恢复后重试。"
+		return []eventcontract.Event{
+			s.requestPromptInlinePhaseEvent(surface, request, "", frontstagecontract.PhaseWaitingDispatch, noticeText),
+			{
+				Kind:             eventcontract.KindNotice,
+				SurfaceSessionID: surface.SurfaceSessionID,
+				SourceMessageID:  strings.TrimSpace(request.SourceMessageID),
+				Notice: &control.Notice{
+					Code: noticeCode,
+					Text: noticeText,
+				},
+			},
+		}
+	}
+	markRequestVisibleEditing(request)
+	bumpRequestCardRevision(request)
+	noticeText := "请求提交失败，请在最新卡片上重试。"
+	if noticeCode == "command_rejected" {
+		noticeText = "本地 Codex 拒绝了这次请求提交，请在最新卡片上重试。"
+	}
+	if !requestPromptRenderable(request.RequestType) {
+		return notice(surface, noticeCode, noticeText)
+	}
+	return s.requestPromptRefreshWithNotice(surface, request, noticeCode, noticeText)
+}
+
+func (s *Service) restorePendingSteer(key string, notice *control.Notice) []eventcontract.Event {
+	binding := s.pendingSteerBinding(key)
+	if binding == nil {
+		return nil
+	}
+	s.clearPendingSteer(key)
+	surface := s.root.Surfaces[binding.SurfaceSessionID]
+	if surface == nil {
+		return nil
+	}
+	restoreOrder := []struct {
+		queueItemID string
+		queueIndex  int
+	}{}
+	for _, queueItemID := range pendingSteerQueueItemIDs(binding) {
+		item := surface.QueueItems[queueItemID]
+		if item == nil || item.Status == state.QueueItemSteered {
+			continue
+		}
+		if s.restorePendingSteerAsStagedImage(surface, item) {
+			continue
+		}
+		item.Status = state.QueueItemQueued
+		surface.QueuedQueueItemIDs = removeString(surface.QueuedQueueItemIDs, item.ID)
+		queueIndex, ok := pendingSteerQueueIndex(binding, queueItemID)
+		if !ok {
+			queueIndex = len(surface.QueuedQueueItemIDs)
+		}
+		restoreOrder = append(restoreOrder, struct {
+			queueItemID string
+			queueIndex  int
+		}{
+			queueItemID: queueItemID,
+			queueIndex:  queueIndex,
+		})
+	}
+	sort.SliceStable(restoreOrder, func(i, j int) bool {
+		if restoreOrder[i].queueIndex == restoreOrder[j].queueIndex {
+			return restoreOrder[i].queueItemID < restoreOrder[j].queueItemID
+		}
+		return restoreOrder[i].queueIndex < restoreOrder[j].queueIndex
+	})
+	for _, restore := range restoreOrder {
+		surface.QueuedQueueItemIDs = insertString(surface.QueuedQueueItemIDs, restore.queueIndex, restore.queueItemID)
+	}
+	var events []eventcontract.Event
+	if strings.TrimSpace(binding.OwnerCardMessageID) != "" {
+		text := ""
+		if notice != nil {
+			text = notice.Text
+		}
+		if strings.TrimSpace(text) == "" {
+			text = "本地连接已断开，排队输入已恢复原位置。"
+		}
+		events = append(events, steerAllFailedOwnerCardEvent(surface.SurfaceSessionID, binding.OwnerCardMessageID, appendSteerRestoreHint(text)))
+	}
+	if notice != nil && (strings.TrimSpace(notice.Code) != "" || strings.TrimSpace(notice.Title) != "" || strings.TrimSpace(notice.Text) != "") {
+		events = append(events, eventcontract.Event{
+			Kind:             eventcontract.KindNotice,
+			SurfaceSessionID: surface.SurfaceSessionID,
+			Notice:           notice,
+		})
+	}
+	events = append(events, s.dispatchNext(surface)...)
+	events = append(events, s.finishSurfaceAfterWork(surface)...)
+	return s.insertExecCommandProgressBoundary(binding.InstanceID, binding.ThreadID, binding.TurnID, events)
+}
+
+func (s *Service) restorePendingSteersForInstance(instanceID string) []eventcontract.Event {
+	var events []eventcontract.Event
+	for _, key := range s.pendingSteerKeysForInstance(instanceID) {
+		events = append(events, s.restorePendingSteer(key, nil)...)
+	}
+	return events
+}
+
+func appendSteerRestoreHint(text string) string {
+	text = strings.TrimSpace(text)
+	if text == "" {
+		return "追加输入失败，已恢复原排队位置。"
+	}
+	if strings.Contains(text, "恢复") {
+		return text
+	}
+	return text + " 已恢复原排队位置。"
+}
+
+func pendingSteerQueueItemIDs(binding *pendingSteerBinding) []string {
+	if binding == nil {
+		return nil
+	}
+	ids := uniqueStrings(binding.QueueItemIDs)
+	if len(ids) > 0 {
+		return ids
+	}
+	if strings.TrimSpace(binding.QueueItemID) == "" {
+		return nil
+	}
+	return []string{binding.QueueItemID}
+}
+
+func pendingSteerQueueIndex(binding *pendingSteerBinding, queueItemID string) (int, bool) {
+	if binding == nil || strings.TrimSpace(queueItemID) == "" {
+		return 0, false
+	}
+	if binding.QueueIndices != nil {
+		if index, ok := binding.QueueIndices[queueItemID]; ok {
+			return index, true
+		}
+	}
+	if binding.QueueItemID == queueItemID {
+		return binding.QueueIndex, true
+	}
+	return 0, false
+}
+
+func (s *Service) restorePendingSteerAsStagedImage(surface *state.SurfaceConsoleRecord, item *state.QueueItemRecord) bool {
+	if surface == nil || item == nil || !item.RestoreAsStagedImage {
+		return false
+	}
+	if len(item.Inputs) != 1 || item.Inputs[0].Type != agentproto.InputLocalImage {
+		return false
+	}
+	s.nextImageID++
+	image := &state.StagedImageRecord{
+		ImageID:          "img-" + strconv.Itoa(s.nextImageID),
+		SurfaceSessionID: surface.SurfaceSessionID,
+		SourceMessageID:  item.SourceMessageID,
+		ActorUserID:      strings.TrimSpace(xutil.FirstNonEmpty(item.ActorUserID, surface.ActorUserID)),
+		LocalPath:        item.Inputs[0].Path,
+		MIMEType:         item.Inputs[0].MIMEType,
+		State:            state.ImageStaged,
+	}
+	surface.StagedImages[image.ImageID] = image
+	delete(surface.QueueItems, item.ID)
+	return true
+}
+
+func (s *Service) HandleHeadlessLaunchStarted(surfaceID, instanceID string, pid int) []eventcontract.Event {
+	surface := s.root.Surfaces[surfaceID]
+	pending := s.pendingSurfaceHeadlessLaunch(surface, instanceID)
+	if pending == nil {
+		return nil
+	}
+	pending.PID = pid
+	return nil
+}
+
+func (s *Service) HandleHeadlessLaunchFailed(surfaceID, instanceID string, err error) []eventcontract.Event {
+	surface := s.root.Surfaces[surfaceID]
+	pending := s.consumeSurfacePendingHeadlessLaunch(surface, instanceID)
+	if pending == nil {
+		return nil
+	}
+	s.releaseFeishuRoomActiveReservationByReason(surface, feishuRoomGroupOnDemandReservationReason)
+	if pending.Purpose == state.HeadlessLaunchPurposePromptDispatchRestart {
+		s.releaseFeishuRoomActiveReservation(surface, "")
+		s.finishPromptDispatchRestartPendingRoute(surface, pending)
+	}
+	if pending.Purpose == state.HeadlessLaunchPurposeWorkspaceRouteRestart {
+		s.finishWorkspaceRouteRestartPendingRoute(surface, pending)
+		notice := control.Notice{
+			Code:  "workspace_route_restart_failed",
+			Title: "当前工作区重启失败",
+			Text:  "当前工作区的运行环境暂时无法重新准备，请稍后重试。",
+		}
+		if problem := agentproto.ErrorInfoFromError(err, agentproto.ErrorInfo{}); problem.Code != "" && isCodexProfileLaunchFailureCode(problem.Code) {
+			notice.Code = problem.Code
+			notice.Text = NoticeForProblem(problem).Text
+		}
+		events := []eventcontract.Event{{
+			Kind:             eventcontract.KindNotice,
+			SurfaceSessionID: surface.SurfaceSessionID,
+			Notice:           &notice,
+		}}
+		return s.maybeFinalizePendingTargetPicker(surface, events, notice.Text)
+	}
+	if pending.AutoRestore {
+		notice := NoticeForHeadlessRestoreFailure(HeadlessRestoreLaunchFailureCode(err))
+		if notice == nil {
+			notice = &control.Notice{
+				Code:  "headless_restore_start_failed",
+				Title: "恢复失败",
+				Text:  "之前的会话暂时无法恢复，请稍后重试或尝试其他会话。",
+			}
+		}
+		events := []eventcontract.Event{{
+			Kind:             eventcontract.KindNotice,
+			SurfaceSessionID: surface.SurfaceSessionID,
+			Notice:           notice,
+		}}
+		return s.maybeFinalizePendingTargetPicker(surface, events, notice.Text)
+	}
+	if pending.Purpose == state.HeadlessLaunchPurposeFreshWorkspace {
+		problem := agentproto.ErrorInfoFromError(err, agentproto.ErrorInfo{
+			Code:             "workspace_create_start_failed",
+			Layer:            "daemon",
+			Stage:            "headless_start",
+			Operation:        "create_workspace",
+			Message:          "无法准备这个工作区。",
+			SurfaceSessionID: surface.SurfaceSessionID,
+			Retryable:        true,
+		})
+		notice := NoticeForProblem(problem)
+		notice.Code = "workspace_create_start_failed"
+		if isCodexProfileLaunchFailureCode(problem.Code) {
+			notice.Code = problem.Code
+		}
+		notice.Title = "工作区准备失败"
+		events := []eventcontract.Event{{
+			Kind:             eventcontract.KindNotice,
+			SurfaceSessionID: surface.SurfaceSessionID,
+			Notice:           &notice,
+		}}
+		return s.maybeFinalizePendingTargetPicker(surface, events, notice.Text)
+	}
+	problem := agentproto.ErrorInfoFromError(err, agentproto.ErrorInfo{
+		Code:             "headless_start_failed",
+		Layer:            "daemon",
+		Stage:            "headless_start",
+		Operation:        "start_headless",
+		Message:          "无法准备恢复会话。",
+		SurfaceSessionID: surface.SurfaceSessionID,
+		ThreadID:         pending.ThreadID,
+		Retryable:        true,
+	})
+	notice := NoticeForProblem(problem)
+	notice.Code = "headless_start_failed"
+	if isCodexProfileLaunchFailureCode(problem.Code) {
+		notice.Code = problem.Code
+	}
+	notice.Title = "恢复准备失败"
+	events := []eventcontract.Event{{
+		Kind:             eventcontract.KindNotice,
+		SurfaceSessionID: surface.SurfaceSessionID,
+		Notice:           &notice,
+	}}
+	return s.maybeFinalizePendingTargetPicker(surface, events, notice.Text)
+}
+
+func isCodexProfileLaunchFailureCode(code string) bool {
+	switch strings.TrimSpace(code) {
+	case "profile_definition_incomplete",
+		"profile_secret_missing",
+		"oauth_missing",
+		"oauth_probe_unknown",
+		"oauth_deployment_unsupported",
+		"codex_capability_unsupported",
+		"codex_binary_unavailable",
+		"codex_probe_timeout",
+		"codex_probe_unavailable",
+		"codex_probe_contract_mismatch",
+		"managed_model_catalog_missing",
+		"profile_revision_unavailable":
+		return true
+	default:
+		return false
+	}
+}
+
+func (s *Service) ApplyInstanceConnected(instanceID string) []eventcontract.Event {
+	inst := s.root.Instances[instanceID]
+	if inst == nil {
+		return nil
+	}
+	inst.Online = true
+
+	var events []eventcontract.Event
+	events = append(events, s.restorePendingSteersForInstance(instanceID)...)
+	for _, surface := range s.root.Surfaces {
+		pending := s.pendingSurfaceHeadlessLaunch(surface, instanceID)
+		if pending == nil || pending.InstanceID != instanceID {
+			continue
+		}
+		attachEvents := s.attachHeadlessInstance(surface, inst, pending)
+		events = append(events, s.maybeFinalizePendingTargetPicker(surface, attachEvents, "")...)
+	}
+	for _, surface := range s.findAttachedSurfaces(instanceID) {
+		events = append(events, s.ensureSharedThreadSubscription(surface)...)
+		events = append(events, s.dispatchNext(surface)...)
+	}
+	// Replay any pending text input saved when the user sent a message
+	// before the instance was available (e.g., group on-demand resume,
+	// workspace binding with headless start).
+	for _, surface := range s.findAttachedSurfaces(instanceID) {
+		if pending := s.takePendingTextInput(surface); pending != nil {
+			replayAction := control.Action{
+				Kind:             control.ActionTextMessage,
+				SurfaceSessionID: surface.SurfaceSessionID,
+				GatewayID:        surface.GatewayID,
+				MessageID:        pending.SourceMessageID,
+				ActorUserID:      pending.ActorUserID,
+				Text:             pending.Text,
+				Inputs:           pending.Inputs,
+			}
+			events = append(events, s.handleText(surface, replayAction)...)
+		}
+	}
+	events = append(events, s.reevaluateFollowSurfaces(instanceID)...)
+	return events
+}
+
+func (s *Service) ApplyInstanceDisconnected(instanceID string) []eventcontract.Event {
+	inst := s.root.Instances[instanceID]
+	if inst == nil {
+		return nil
+	}
+	inst.Online = false
+	delete(s.sharedSubscriptions, instanceID)
+	inst.ActiveTurnID = ""
+	inst.ModelCatalog = nil
+	events := s.failCompactTurn(instanceID, "当前实例已离线，上下文压缩已中断。", nil, false)
+
+	for _, surface := range s.root.Surfaces {
+		pending := s.consumeSurfacePendingHeadlessLaunch(surface, instanceID)
+		if pending == nil {
+			continue
+		}
+		s.releaseFeishuRoomActiveReservationByReason(surface, feishuRoomGroupOnDemandReservationReason)
+		if pending.Purpose == state.HeadlessLaunchPurposePromptDispatchRestart {
+			s.releaseFeishuRoomActiveReservation(surface, "")
+			s.finishPromptDispatchRestartPendingRoute(surface, pending)
+		}
+		if pending.Purpose == state.HeadlessLaunchPurposeWorkspaceRouteRestart {
+			s.finishWorkspaceRouteRestartPendingRoute(surface, pending)
+			events = append(events, eventcontract.Event{
+				Kind:             eventcontract.KindNotice,
+				SurfaceSessionID: surface.SurfaceSessionID,
+				Notice: &control.Notice{
+					Code:  "workspace_route_restart_interrupted",
+					Title: "当前工作区重启中断",
+					Text:  "当前工作区的运行环境准备已中断，请稍后重试。",
+				},
+			})
+			continue
+		}
+		events = append(events, s.maybeFinalizePendingTargetPicker(surface, nil, "当前工作目标准备已中断，请重新发送 /list、/use 或 /useall 再试一次。")...)
+	}
+
+	surfaces := s.findAttachedSurfaces(instanceID)
+	events = append(events, s.restorePendingSteersForInstance(instanceID)...)
+	if len(surfaces) == 0 {
+		s.clearInstanceClaim(instanceID)
+		s.clearInstanceRemoteTurnOwnership(instanceID)
+		return events
+	}
+
+	for _, surface := range surfaces {
+		s.persistCurrentClaudeWorkspaceProfileSnapshot(surface)
+		clearSurfacePromptRuntimeOverride(surface)
+		s.resetSurfaceExecutionGates(surface)
+		clearSurfaceRequests(surface)
+
+		if surface.ActiveQueueItemID != "" {
+			if item := surface.QueueItems[surface.ActiveQueueItemID]; item != nil && (item.Status == state.QueueItemDispatching || item.Status == state.QueueItemRunning) {
+				events = append(events, s.failSurfaceActiveQueueItem(surface, item, &control.Notice{
+					Code: "attached_instance_offline",
+					Text: s.attachmentOfflineText(surface, inst),
+				}, false)...)
+			} else {
+				s.clearSurfaceActiveQueueItem(surface, "")
+			}
+		}
+
+		events = append(events, s.finalizeDetachedSurface(surface)...)
+		events = append(events, eventcontract.Event{
+			Kind:             eventcontract.KindNotice,
+			SurfaceSessionID: surface.SurfaceSessionID,
+			Notice: &control.Notice{
+				Code: "attached_instance_offline",
+				Text: s.attachmentOfflineText(surface, inst),
+			},
+		})
+	}
+	s.clearInstanceClaim(instanceID)
+	s.clearInstanceRemoteTurnOwnership(instanceID)
+	return events
+}
+
+func (s *Service) ApplyInstanceTransportDegraded(instanceID string, emitNotice bool) []eventcontract.Event {
+	inst := s.root.Instances[instanceID]
+	if inst == nil {
+		return nil
+	}
+	inst.Online = false
+	delete(s.sharedSubscriptions, instanceID)
+	inst.ActiveTurnID = ""
+	inst.ModelCatalog = nil
+
+	delete(s.threadRefreshes, instanceID)
+
+	surfaces := s.findAttachedSurfaces(instanceID)
+	events := s.failCompactTurn(instanceID, "当前实例连接已中断，上下文压缩已中断。", nil, false)
+	events = append(events, s.restorePendingSteersForInstance(instanceID)...)
+	if len(surfaces) == 0 {
+		s.clearInstanceRemoteTurnOwnership(instanceID)
+		return events
+	}
+
+	noticeText := s.attachmentTransportDegradedText(nil, inst)
+	preserveRemoteOwnership := false
+	for _, surface := range surfaces {
+		noticeText = s.attachmentTransportDegradedText(surface, inst)
+		s.persistCurrentClaudeWorkspaceProfileSnapshot(surface)
+		clearSurfacePromptRuntimeOverride(surface)
+		s.resetSurfaceExecutionGates(surface)
+		s.releaseFeishuRoomReviewReservations(surface)
+
+		binding := s.remoteBindingForSurface(surface)
+		if binding != nil && surface.ActiveQueueItemID != "" {
+			item := surface.QueueItems[surface.ActiveQueueItemID]
+			if item != nil && (item.Status == state.QueueItemDispatching || item.Status == state.QueueItemRunning) {
+				preserveRemoteOwnership = true
+				events = append(events, appendPendingInputTyping(s.pendingInputEvents(surface, control.PendingInputState{
+					QueueItemID: item.ID,
+					Status:      string(item.Status),
+				}, queueItemSourceMessageIDs(item)), item.SourceMessageID, false)...)
+				if emitNotice {
+					notice := globalRuntimeNotice(control.NoticeDeliveryFamilyTransportDegraded, "attached_instance_transport_degraded", "", noticeText)
+					events = append(events, eventcontract.Event{
+						Kind:             eventcontract.KindNotice,
+						SurfaceSessionID: surface.SurfaceSessionID,
+						Notice:           &notice,
+					})
+				}
+				continue
+			}
+		}
+		clearSurfaceRequests(surface)
+		if binding != nil {
+			s.clearTurnArtifacts(binding.InstanceID, binding.ThreadID, binding.TurnID)
+		}
+
+		if surface.ActiveQueueItemID != "" {
+			item := surface.QueueItems[surface.ActiveQueueItemID]
+			if item != nil && (item.Status == state.QueueItemDispatching || item.Status == state.QueueItemRunning) {
+				var noticePtr *control.Notice
+				if emitNotice {
+					notice := globalRuntimeNotice(control.NoticeDeliveryFamilyTransportDegraded, "attached_instance_transport_degraded", "", noticeText)
+					noticePtr = &notice
+				}
+				events = append(events, s.failSurfaceActiveQueueItem(surface, item, noticePtr, true)...)
+				continue
+			}
+			s.clearSurfaceActiveQueueItem(surface, "")
+		}
+
+		s.clearRemoteOwnership(surface)
+		events = append(events, s.finishSurfaceAfterWork(surface)...)
+		if emitNotice {
+			notice := globalRuntimeNotice(control.NoticeDeliveryFamilyTransportDegraded, "attached_instance_transport_degraded", "", noticeText)
+			events = append(events, eventcontract.Event{
+				Kind:             eventcontract.KindNotice,
+				SurfaceSessionID: surface.SurfaceSessionID,
+				Notice:           &notice,
+			})
+		}
+	}
+	if !preserveRemoteOwnership {
+		s.clearInstanceRemoteTurnOwnership(instanceID)
+	}
+	return events
+}
+
+func (s *Service) RemoveInstance(instanceID string) {
+	if strings.TrimSpace(instanceID) == "" {
+		return
+	}
+	s.revokeGoalInterlockForInstance(instanceID)
+	if inst := s.root.Instances[instanceID]; inst != nil {
+		inst.Online = false
+		inst.ActiveTurnID = ""
+	}
+	_ = s.failCompactTurn(instanceID, "当前实例已移除，上下文压缩已中断。", nil, false)
+	s.restorePendingSteersForInstance(instanceID)
+	for _, surface := range s.root.Surfaces {
+		if surface == nil {
+			continue
+		}
+		if pending := s.consumeSurfacePendingHeadlessLaunch(surface, instanceID); pending != nil {
+			s.releaseFeishuRoomActiveReservationByReason(surface, feishuRoomGroupOnDemandReservationReason)
+		}
+		if surface.AttachedInstanceID != instanceID {
+			continue
+		}
+		s.discardDrafts(surface)
+		s.resetSurfaceExecutionGates(surface)
+		if surface.ActiveQueueItemID != "" {
+			if item := surface.QueueItems[surface.ActiveQueueItemID]; item != nil && (item.Status == state.QueueItemDispatching || item.Status == state.QueueItemRunning) {
+				s.failSurfaceActiveQueueItem(surface, item, nil, false)
+			} else {
+				s.clearRemoteOwnership(surface)
+				s.clearSurfaceActiveQueueItem(surface, "")
+			}
+		} else {
+			s.clearRemoteOwnership(surface)
+		}
+		_ = s.finalizeDetachedSurface(surface)
+	}
+	delete(s.root.Instances, instanceID)
+	s.clearInstanceClaim(instanceID)
+	s.clearInstanceRemoteTurnOwnership(instanceID)
+	delete(s.threadRefreshes, instanceID)
+	s.clearItemBuffers(instanceID, "", "")
+	s.clearMCPToolCallProgress(instanceID, "", "")
+	s.clearPendingProgressTextForInstance(instanceID)
+}

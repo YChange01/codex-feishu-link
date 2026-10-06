@@ -1,0 +1,194 @@
+package state
+
+import (
+	"testing"
+
+	"github.com/YChange01/codex-feishu-link/internal/core/agentproto"
+)
+
+func TestIsHeadlessProductMode(t *testing.T) {
+	if !IsHeadlessProductMode(ProductModeNormal) {
+		t.Fatal("expected ProductModeNormal to be treated as headless")
+	}
+	if IsHeadlessProductMode(ProductModeVSCode) {
+		t.Fatal("expected ProductModeVSCode to be non-headless")
+	}
+}
+
+func TestSurfaceModeAlias(t *testing.T) {
+	tests := []struct {
+		name    string
+		mode    ProductMode
+		backend agentproto.Backend
+		want    string
+	}{
+		{name: "codex headless", mode: ProductModeNormal, backend: agentproto.BackendCodex, want: "codex"},
+		{name: "claude headless", mode: ProductModeNormal, backend: agentproto.BackendClaude, want: "claude"},
+		{name: "opencode headless", mode: ProductModeNormal, backend: agentproto.BackendOpenCode, want: "opencode"},
+		{name: "vscode forces codex alias", mode: ProductModeVSCode, backend: agentproto.BackendClaude, want: "vscode"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := SurfaceModeAlias(tc.mode, tc.backend); got != tc.want {
+				t.Fatalf("SurfaceModeAlias(%q, %q) = %q, want %q", tc.mode, tc.backend, got, tc.want)
+			}
+		})
+	}
+}
+
+func TestSurfaceDesiredBackendContractProjectsOpenCodeBinding(t *testing.T) {
+	surface := &SurfaceConsoleRecord{
+		ProductMode:       ProductModeNormal,
+		Backend:           agentproto.BackendOpenCode,
+		CodexProfileID:    "team-proxy",
+		ClaudeProfileID:   "devseek",
+		OpenCodeProfileID: "op_team",
+	}
+	contract := SurfaceDesiredBackendContract(surface)
+	if contract.Backend != agentproto.BackendOpenCode {
+		t.Fatalf("unexpected backend: %#v", contract)
+	}
+	if contract.CodexProfileID != "" || contract.ClaudeProfileID != "" {
+		t.Fatalf("expected inactive backend bindings to stay hidden, got %#v", contract)
+	}
+	if contract.OpenCodeProfileID != "op_team" {
+		t.Fatalf("expected opencode profile to survive projection, got %#v", contract)
+	}
+	if got := EffectiveSurfaceOpenCodeProfileID(contract); got != "op_team" {
+		t.Fatalf("expected active opencode profile projection, got %q", got)
+	}
+}
+
+func TestHeadlessLaunchContractCarriesOpenCodeAdmissionRef(t *testing.T) {
+	ref := &OpenCodeAdmissionRef{ProfileRef: OpenCodeProfileRef{ID: "op_team", Revision: 7}}
+	surface := &SurfaceConsoleRecord{
+		ProductMode:            ProductModeNormal,
+		Backend:                agentproto.BackendOpenCode,
+		OpenCodeProfileID:      "op_team",
+		OpenCodeAdmissionRef:   ref,
+		PromptOverride:         ModelConfigRecord{AccessMode: " CONFIRM "},
+		CodexAdmissionRef:      &CodexAdmissionRef{ProfileRef: CodexProfileRef{ID: "cp_team", Revision: 1}, ContextPreferenceRef: CodexContextPreferenceRef{ProfileID: "cp_team", Revision: 1}},
+		CodexProfileID:         "team-proxy",
+		ClaudeProfileID:        "devseek",
+		ContractRefreshPending: true,
+	}
+	contract := HeadlessLaunchContractFromSurface(surface)
+	if contract.Backend != agentproto.BackendOpenCode {
+		t.Fatalf("unexpected backend: %#v", contract)
+	}
+	if contract.OpenCodeProfileID != "op_team" {
+		t.Fatalf("unexpected opencode profile: %#v", contract)
+	}
+	if contract.OpenCodeAdmissionRef == nil || contract.OpenCodeAdmissionRef.ProfileRef.Revision != 7 {
+		t.Fatalf("expected opencode admission ref to be cloned into launch contract, got %#v", contract)
+	}
+	if contract.OpenCodeRuntimeAccessMode != agentproto.AccessModeConfirm {
+		t.Fatalf("expected opencode runtime access in launch contract, got %#v", contract)
+	}
+	if contract.CodexAdmissionRef != nil || contract.CodexProfileID != "" || contract.ClaudeProfileID != "" {
+		t.Fatalf("expected inactive backend launch fields to be hidden, got %#v", contract)
+	}
+
+	inst := &InstanceRecord{
+		Backend:                   agentproto.BackendOpenCode,
+		OpenCodeProfileID:         "op_team",
+		OpenCodeAdmissionRef:      ref,
+		OpenCodeRuntimeAccessMode: " CONFIRM ",
+		ClaudeReasoningEffort:     "high",
+		CodexProfileID:            "team-proxy",
+		CodexAdmissionRef:         &CodexAdmissionRef{ProfileRef: CodexProfileRef{ID: "cp_team", Revision: 1}, ContextPreferenceRef: CodexContextPreferenceRef{ProfileID: "cp_team", Revision: 1}},
+		CodexConnectionContract:   &CodexConnectionContract{ConnectionContractID: "codex"},
+		CodexThreadPolicy:         &CodexThreadPolicy{ThreadPolicyID: "policy-1"},
+	}
+	observed := HeadlessLaunchContractFromInstance(inst)
+	if observed.OpenCodeRuntimeAccessMode != agentproto.AccessModeConfirm {
+		t.Fatalf("expected opencode runtime access from instance, got %#v", observed)
+	}
+	if observed.CodexAdmissionRef != nil || observed.CodexConnectionContract != nil || observed.CodexThreadPolicy != nil || observed.ClaudeReasoningEffort != "" {
+		t.Fatalf("expected inactive backend launch fields to stay hidden in observed OpenCode contract, got %#v", observed)
+	}
+}
+
+func TestWorkspaceDefaultsStorageKeyPartitionsOpenCodeProfiles(t *testing.T) {
+	left := WorkspaceDefaultsStorageKey("/repo", OpenCodeInstanceBackendContract("op_left"))
+	right := WorkspaceDefaultsStorageKey("/repo", OpenCodeInstanceBackendContract("op_right"))
+	if left == "" || right == "" {
+		t.Fatalf("expected opencode workspace default keys, got %q %q", left, right)
+	}
+	if left == right {
+		t.Fatalf("expected opencode workspace defaults to partition by profile, got %q", left)
+	}
+	if got := WorkspaceDefaultsIdentity(OpenCodeInstanceBackendContract("")); got != DefaultOpenCodeProfileID {
+		t.Fatalf("default opencode workspace identity = %q, want %q", got, DefaultOpenCodeProfileID)
+	}
+}
+
+func TestSurfaceDesiredBackendContractProjectsOnlyActiveBackendBinding(t *testing.T) {
+	surface := &SurfaceConsoleRecord{
+		ProductMode:     ProductModeNormal,
+		Backend:         agentproto.BackendClaude,
+		CodexProfileID:  "team-proxy",
+		ClaudeProfileID: "devseek",
+	}
+	contract := SurfaceDesiredBackendContract(surface)
+	if contract.Backend != agentproto.BackendClaude {
+		t.Fatalf("unexpected backend: %#v", contract)
+	}
+	if contract.CodexProfileID != "" {
+		t.Fatalf("expected inactive codex profile to stay hidden in active contract, got %#v", contract)
+	}
+	if contract.ClaudeProfileID != "devseek" {
+		t.Fatalf("expected claude profile storage to stay intact, got %#v", contract)
+	}
+	if got := EffectiveSurfaceCodexProfileID(contract); got != "" {
+		t.Fatalf("expected inactive codex profile projection to stay hidden, got %q", got)
+	}
+	if got := EffectiveSurfaceClaudeProfileID(contract); got != "devseek" {
+		t.Fatalf("expected active claude profile projection, got %q", got)
+	}
+	if surface.CodexProfileID != "team-proxy" || surface.ClaudeProfileID != "devseek" {
+		t.Fatalf("expected source surface storage to remain intact, got %#v", surface)
+	}
+}
+
+func TestPersistedSurfaceBackendContractCanonicalizesLegacyClaudeProfileProjection(t *testing.T) {
+	contract := PersistedSurfaceBackendContract(ProductModeNormal, agentproto.BackendCodex, "", "devseek", "")
+	if contract.Backend != agentproto.BackendClaude {
+		t.Fatalf("expected legacy persisted claude profile to canonicalize back to claude, got %#v", contract)
+	}
+	if contract.ClaudeProfileID != "devseek" {
+		t.Fatalf("expected claude profile to survive canonicalization, got %#v", contract)
+	}
+	if contract.CodexProfileID != "" {
+		t.Fatalf("expected inactive codex profile projection to stay hidden, got %#v", contract)
+	}
+}
+
+func TestHeadlessLaunchContractCarriesClaudeReasoningEffort(t *testing.T) {
+	surface := &SurfaceConsoleRecord{
+		ProductMode:     ProductModeNormal,
+		Backend:         agentproto.BackendClaude,
+		ClaudeProfileID: "devseek",
+		PromptOverride:  ModelConfigRecord{ReasoningEffort: " HIGH "},
+	}
+	contract := HeadlessLaunchContractFromSurface(surface)
+	if contract.Backend != agentproto.BackendClaude {
+		t.Fatalf("unexpected backend: %#v", contract)
+	}
+	if contract.ClaudeProfileID != "devseek" {
+		t.Fatalf("unexpected claude profile: %#v", contract)
+	}
+	if contract.ClaudeReasoningEffort != "high" {
+		t.Fatalf("unexpected reasoning effort: %#v", contract)
+	}
+
+	inst := &InstanceRecord{
+		Backend:               agentproto.BackendClaude,
+		ClaudeProfileID:       "devseek",
+		ClaudeReasoningEffort: " HIGH ",
+	}
+	observed := HeadlessLaunchContractFromInstance(inst)
+	if observed.ClaudeReasoningEffort != "high" {
+		t.Fatalf("unexpected observed reasoning effort: %#v", observed)
+	}
+}

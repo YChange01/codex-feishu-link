@@ -1,0 +1,569 @@
+package install
+
+import (
+	"context"
+	"os"
+	"path/filepath"
+	"reflect"
+	"strconv"
+	"strings"
+	"testing"
+)
+
+func TestDetectAutostartReportsSupportedDisabledOnWindows(t *testing.T) {
+	baseDir := t.TempDir()
+	originalGOOS := serviceRuntimeGOOS
+	originalHome := serviceUserHomeDir
+	originalRunner := taskSchedulerRunner
+	serviceRuntimeGOOS = "windows"
+	serviceUserHomeDir = func() (string, error) { return baseDir, nil }
+	defer func() {
+		serviceRuntimeGOOS = originalGOOS
+		serviceUserHomeDir = originalHome
+		taskSchedulerRunner = originalRunner
+	}()
+	taskSchedulerRunner = func(_ context.Context, args ...string) (string, error) {
+		if len(args) > 0 && args[0] == "/Query" {
+			return "", os.ErrNotExist
+		}
+		return "", nil
+	}
+
+	status, err := DetectAutostart("")
+	if err != nil {
+		t.Fatalf("DetectAutostart: %v", err)
+	}
+	if status.Platform != "windows" {
+		t.Fatalf("Platform = %q, want windows", status.Platform)
+	}
+	if !status.Supported {
+		t.Fatalf("expected supported status, got %#v", status)
+	}
+	if status.Manager != ServiceManagerTaskSchedulerLogon {
+		t.Fatalf("Manager = %q, want %q", status.Manager, ServiceManagerTaskSchedulerLogon)
+	}
+	if status.Status != "disabled" || status.Enabled || status.Configured {
+		t.Fatalf("unexpected status: %#v", status)
+	}
+}
+
+func TestApplyAutostartInstallsAndEnablesSystemdUserService(t *testing.T) {
+	baseDir := t.TempDir()
+	statePath := defaultInstallStatePath(baseDir)
+	binaryPath := seedBinary(t, filepath.Join(baseDir, "bin", "codex-feishu-relay"), "binary")
+
+	originalGOOS := serviceRuntimeGOOS
+	originalHome := serviceUserHomeDir
+	originalRunner := systemctlUserRunner
+	serviceRuntimeGOOS = "linux"
+	serviceUserHomeDir = func() (string, error) { return baseDir, nil }
+	defer func() {
+		serviceRuntimeGOOS = originalGOOS
+		serviceUserHomeDir = originalHome
+		systemctlUserRunner = originalRunner
+	}()
+
+	var calls []string
+	systemctlUserRunner = func(_ context.Context, args ...string) (string, error) {
+		calls = append(calls, strings.Join(args, " "))
+		if len(args) > 0 && args[0] == "is-enabled" {
+			return "enabled", nil
+		}
+		return "", nil
+	}
+
+	status, err := ApplyAutostart(AutostartApplyOptions{
+		StatePath:       statePath,
+		BaseDir:         baseDir,
+		InstalledBinary: binaryPath,
+		CurrentVersion:  "dev",
+	})
+	if err != nil {
+		t.Fatalf("ApplyAutostart: %v", err)
+	}
+	if status.Status != "enabled" || !status.Enabled {
+		t.Fatalf("unexpected autostart status: %#v", status)
+	}
+	if len(calls) != 3 || calls[0] != "daemon-reload" || calls[1] != "enable codex-feishu-relay.service" || calls[2] != "is-enabled codex-feishu-relay.service" {
+		t.Fatalf("systemctl calls = %#v", calls)
+	}
+
+	loaded, err := LoadState(statePath)
+	if err != nil {
+		t.Fatalf("LoadState: %v", err)
+	}
+	if loaded.ServiceManager != ServiceManagerSystemdUser {
+		t.Fatalf("ServiceManager = %q, want %q", loaded.ServiceManager, ServiceManagerSystemdUser)
+	}
+	if strings.TrimSpace(loaded.ServiceUnitPath) == "" {
+		t.Fatalf("expected service unit path to be written, got %#v", loaded)
+	}
+	if _, err := os.Stat(loaded.ServiceUnitPath); err != nil {
+		t.Fatalf("expected service unit file to exist: %v", err)
+	}
+}
+
+func TestApplyAutostartInstallsAndEnablesLaunchdUserService(t *testing.T) {
+	baseDir := t.TempDir()
+	statePath := defaultInstallStatePath(baseDir)
+	binaryPath := seedBinary(t, filepath.Join(baseDir, "bin", "codex-feishu-relay"), "binary")
+
+	originalGOOS := serviceRuntimeGOOS
+	originalHome := serviceUserHomeDir
+	originalRunner := launchctlUserRunner
+	serviceRuntimeGOOS = "darwin"
+	serviceUserHomeDir = func() (string, error) { return baseDir, nil }
+	defer func() {
+		serviceRuntimeGOOS = originalGOOS
+		serviceUserHomeDir = originalHome
+		launchctlUserRunner = originalRunner
+	}()
+
+	var calls []string
+	launchctlUserRunner = func(_ context.Context, args ...string) (string, error) {
+		calls = append(calls, strings.Join(args, " "))
+		switch {
+		case len(args) > 0 && args[0] == "print-disabled":
+			return `disabled services = {
+	"com.codex-feishu-relay.service" => false
+}`, nil
+		default:
+			return "", nil
+		}
+	}
+
+	status, err := ApplyAutostart(AutostartApplyOptions{
+		StatePath:       statePath,
+		BaseDir:         baseDir,
+		InstalledBinary: binaryPath,
+		CurrentVersion:  "dev",
+	})
+	if err != nil {
+		t.Fatalf("ApplyAutostart: %v", err)
+	}
+	if status.Status != "enabled" || !status.Enabled {
+		t.Fatalf("unexpected autostart status: %#v", status)
+	}
+	wantTarget := "gui/" + strconv.Itoa(os.Getuid()) + "/com.codex-feishu-relay.service"
+	wantPlist := filepath.Join(baseDir, "Library", "LaunchAgents", "com.codex-feishu-relay.service.plist")
+	if len(calls) != 3 ||
+		calls[0] != "enable "+wantTarget ||
+		calls[1] != "bootstrap gui/"+strconv.Itoa(os.Getuid())+" "+wantPlist ||
+		calls[2] != "print-disabled gui/"+strconv.Itoa(os.Getuid()) {
+		t.Fatalf("launchctl calls = %#v", calls)
+	}
+
+	loaded, err := LoadState(statePath)
+	if err != nil {
+		t.Fatalf("LoadState: %v", err)
+	}
+	if loaded.ServiceManager != ServiceManagerLaunchdUser {
+		t.Fatalf("ServiceManager = %q, want %q", loaded.ServiceManager, ServiceManagerLaunchdUser)
+	}
+	if strings.TrimSpace(loaded.ServiceUnitPath) == "" {
+		t.Fatalf("expected service unit path to be written, got %#v", loaded)
+	}
+	if _, err := os.Stat(loaded.ServiceUnitPath); err != nil {
+		t.Fatalf("expected launchd plist to exist: %v", err)
+	}
+}
+
+func TestApplyAutostartInstallsAndEnablesTaskSchedulerLogonService(t *testing.T) {
+	baseDir := t.TempDir()
+	statePath := defaultInstallStatePath(baseDir)
+	binaryPath := seedBinary(t, filepath.Join(baseDir, "bin", "codex-feishu-relay.exe"), "binary")
+
+	originalGOOS := serviceRuntimeGOOS
+	originalHome := serviceUserHomeDir
+	originalRunner := taskSchedulerRunner
+	originalPSRunner := taskSchedulerPowerShellRunner
+	serviceRuntimeGOOS = "windows"
+	serviceUserHomeDir = func() (string, error) { return baseDir, nil }
+	defer func() {
+		serviceRuntimeGOOS = originalGOOS
+		serviceUserHomeDir = originalHome
+		taskSchedulerRunner = originalRunner
+		taskSchedulerPowerShellRunner = originalPSRunner
+	}()
+
+	var calls []string
+	taskSchedulerRunner = func(_ context.Context, args ...string) (string, error) {
+		calls = append(calls, strings.Join(args, " "))
+		if len(args) > 0 && args[0] == "/Query" {
+			return `<Task><Triggers><LogonTrigger><Enabled>true</Enabled></LogonTrigger></Triggers></Task>`, nil
+		}
+		return "", nil
+	}
+
+	var psScript string
+	taskSchedulerPowerShellRunner = func(_ context.Context, script string) (string, error) {
+		psScript = script
+		return "", nil
+	}
+
+	status, err := ApplyAutostart(AutostartApplyOptions{
+		StatePath:       statePath,
+		BaseDir:         baseDir,
+		InstalledBinary: binaryPath,
+		CurrentVersion:  "dev",
+	})
+	if err != nil {
+		t.Fatalf("ApplyAutostart: %v", err)
+	}
+	if status.Status != "enabled" || !status.Enabled {
+		t.Fatalf("unexpected autostart status: %#v", status)
+	}
+	taskName := taskSchedulerTaskNameForInstance("stable")
+	if len(calls) != 2 ||
+		calls[0] != "/Change /TN "+taskName+" /ENABLE" ||
+		calls[1] != "/Query /TN "+taskName+" /XML" {
+		t.Fatalf("task scheduler calls = %#v", calls)
+	}
+	if !strings.Contains(psScript, "Register-ScheduledTask") || !strings.Contains(psScript, "-AtLogOn") {
+		t.Fatalf("PowerShell script missing Register-ScheduledTask or -AtLogOn: %s", psScript)
+	}
+
+	loaded, err := LoadState(statePath)
+	if err != nil {
+		t.Fatalf("LoadState: %v", err)
+	}
+	if loaded.ServiceManager != ServiceManagerTaskSchedulerLogon {
+		t.Fatalf("ServiceManager = %q, want %q", loaded.ServiceManager, ServiceManagerTaskSchedulerLogon)
+	}
+	if _, err := os.Stat(loaded.ServiceUnitPath); err != nil {
+		t.Fatalf("expected task XML file to exist: %v", err)
+	}
+}
+
+func TestDisableAutostartDisablesSystemdUserService(t *testing.T) {
+	baseDir := t.TempDir()
+	statePath := defaultInstallStatePath(baseDir)
+	stubServiceUserHome(t, baseDir)
+	state := InstallState{
+		BaseDir:           baseDir,
+		StatePath:         statePath,
+		CurrentBinaryPath: seedBinary(t, filepath.Join(baseDir, "bin", "codex-feishu-relay"), "binary"),
+		ServiceManager:    ServiceManagerSystemdUser,
+	}
+	ApplyStateMetadata(&state, StateMetadataOptions{
+		StatePath:      statePath,
+		BaseDir:        baseDir,
+		ServiceManager: state.ServiceManager,
+	})
+	if err := os.MkdirAll(filepath.Dir(state.ServiceUnitPath), 0o755); err != nil {
+		t.Fatalf("MkdirAll(unit dir): %v", err)
+	}
+	if err := os.WriteFile(state.ServiceUnitPath, []byte("[Unit]\nDescription=test\n"), 0o644); err != nil {
+		t.Fatalf("WriteFile(unit): %v", err)
+	}
+	if err := WriteState(statePath, state); err != nil {
+		t.Fatalf("WriteState: %v", err)
+	}
+
+	originalGOOS := serviceRuntimeGOOS
+	originalHome := serviceUserHomeDir
+	originalRunner := systemctlUserRunner
+	serviceRuntimeGOOS = "linux"
+	serviceUserHomeDir = func() (string, error) { return baseDir, nil }
+	defer func() {
+		serviceRuntimeGOOS = originalGOOS
+		serviceUserHomeDir = originalHome
+		systemctlUserRunner = originalRunner
+	}()
+
+	enabled := true
+	var calls []string
+	systemctlUserRunner = func(_ context.Context, args ...string) (string, error) {
+		calls = append(calls, strings.Join(args, " "))
+		if len(args) == 0 {
+			return "", nil
+		}
+		switch args[0] {
+		case "is-enabled":
+			if enabled {
+				return "enabled", nil
+			}
+			return "disabled", nil
+		case "disable":
+			enabled = false
+			return "", nil
+		default:
+			return "", nil
+		}
+	}
+
+	status, err := DisableAutostart(statePath)
+	if err != nil {
+		t.Fatalf("DisableAutostart: %v", err)
+	}
+	if status.Enabled {
+		t.Fatalf("expected autostart to be disabled, got %#v", status)
+	}
+	if status.Status != "disabled" {
+		t.Fatalf("status = %q, want disabled", status.Status)
+	}
+	wantCalls := []string{
+		"is-enabled codex-feishu-relay.service",
+		"disable codex-feishu-relay.service",
+		"is-enabled codex-feishu-relay.service",
+	}
+	if !reflect.DeepEqual(calls, wantCalls) {
+		t.Fatalf("systemctl calls = %#v, want %#v", calls, wantCalls)
+	}
+}
+
+func TestDetectAutostartReportsConfiguredDisabledState(t *testing.T) {
+	baseDir := t.TempDir()
+	statePath := defaultInstallStatePath(baseDir)
+	stubServiceUserHome(t, baseDir)
+	state := InstallState{
+		BaseDir:           baseDir,
+		ConfigPath:        filepath.Join(baseDir, ".config", "codex-feishu-relay", "config.json"),
+		StatePath:         statePath,
+		CurrentBinaryPath: seedBinary(t, filepath.Join(baseDir, "bin", "codex-feishu-relay"), "binary"),
+		ServiceManager:    ServiceManagerSystemdUser,
+	}
+	ApplyStateMetadata(&state, StateMetadataOptions{
+		StatePath:      statePath,
+		BaseDir:        baseDir,
+		ServiceManager: state.ServiceManager,
+	})
+	if !strings.HasPrefix(state.ServiceUnitPath, baseDir+string(filepath.Separator)) {
+		t.Fatalf("ServiceUnitPath = %q, want temp-dir-scoped path under %q", state.ServiceUnitPath, baseDir)
+	}
+	if err := os.MkdirAll(filepath.Dir(state.ServiceUnitPath), 0o755); err != nil {
+		t.Fatalf("MkdirAll(unit dir): %v", err)
+	}
+	if err := os.WriteFile(state.ServiceUnitPath, []byte("[Unit]\nDescription=test\n"), 0o644); err != nil {
+		t.Fatalf("WriteFile(unit): %v", err)
+	}
+	if err := WriteState(statePath, state); err != nil {
+		t.Fatalf("WriteState: %v", err)
+	}
+
+	originalGOOS := serviceRuntimeGOOS
+	originalHome := serviceUserHomeDir
+	originalRunner := systemctlUserRunner
+	serviceRuntimeGOOS = "linux"
+	serviceUserHomeDir = func() (string, error) { return baseDir, nil }
+	defer func() {
+		serviceRuntimeGOOS = originalGOOS
+		serviceUserHomeDir = originalHome
+		systemctlUserRunner = originalRunner
+	}()
+
+	systemctlUserRunner = func(_ context.Context, args ...string) (string, error) {
+		if len(args) > 0 && args[0] == "is-enabled" {
+			return "disabled", nil
+		}
+		return "", nil
+	}
+
+	status, err := DetectAutostart(statePath)
+	if err != nil {
+		t.Fatalf("DetectAutostart: %v", err)
+	}
+	if !status.Configured {
+		t.Fatalf("expected configured status, got %#v", status)
+	}
+	if status.Enabled {
+		t.Fatalf("expected disabled autostart, got %#v", status)
+	}
+	if status.Status != "disabled" {
+		t.Fatalf("Status = %q, want disabled", status.Status)
+	}
+}
+
+func TestApplyAutostartDebugInstanceUsesDebugUnit(t *testing.T) {
+	baseDir := t.TempDir()
+	statePath := defaultInstallStatePathForInstance(baseDir, debugInstanceID)
+	binaryPath := seedBinary(t, filepath.Join(baseDir, "bin", "codex-feishu-relay"), "binary")
+
+	originalGOOS := serviceRuntimeGOOS
+	originalHome := serviceUserHomeDir
+	originalRunner := systemctlUserRunner
+	serviceRuntimeGOOS = "linux"
+	serviceUserHomeDir = func() (string, error) { return baseDir, nil }
+	defer func() {
+		serviceRuntimeGOOS = originalGOOS
+		serviceUserHomeDir = originalHome
+		systemctlUserRunner = originalRunner
+	}()
+
+	var calls []string
+	systemctlUserRunner = func(_ context.Context, args ...string) (string, error) {
+		calls = append(calls, strings.Join(args, " "))
+		if len(args) > 0 && args[0] == "is-enabled" {
+			return "enabled", nil
+		}
+		return "", nil
+	}
+
+	status, err := ApplyAutostart(AutostartApplyOptions{
+		InstanceID:      debugInstanceID,
+		StatePath:       statePath,
+		BaseDir:         baseDir,
+		InstalledBinary: binaryPath,
+		CurrentVersion:  "dev",
+	})
+	if err != nil {
+		t.Fatalf("ApplyAutostart: %v", err)
+	}
+	if status.ServiceUnitPath != filepath.Join(baseDir, ".config", "systemd", "user", "codex-feishu-relay-debug.service") {
+		t.Fatalf("ServiceUnitPath = %q", status.ServiceUnitPath)
+	}
+	if len(calls) != 3 || calls[0] != "daemon-reload" || calls[1] != "enable codex-feishu-relay-debug.service" || calls[2] != "is-enabled codex-feishu-relay-debug.service" {
+		t.Fatalf("systemctl calls = %#v", calls)
+	}
+
+	loaded, err := LoadState(statePath)
+	if err != nil {
+		t.Fatalf("LoadState: %v", err)
+	}
+	if loaded.InstanceID != debugInstanceID {
+		t.Fatalf("InstanceID = %q, want %q", loaded.InstanceID, debugInstanceID)
+	}
+}
+
+// TestDetectAutostartIgnoresStaleSystemdState is the #808-D probe-first guard
+// for systemd: a state file that still claims systemd_user must not make
+// detect report a configured service when no unit exists on disk.
+func TestDetectAutostartIgnoresStaleSystemdState(t *testing.T) {
+	baseDir := t.TempDir()
+	statePath := defaultInstallStatePath(baseDir)
+
+	originalGOOS := serviceRuntimeGOOS
+	originalHome := serviceUserHomeDir
+	originalRunner := systemctlUserRunner
+	serviceRuntimeGOOS = "linux"
+	serviceUserHomeDir = func() (string, error) { return baseDir, nil }
+	defer func() {
+		serviceRuntimeGOOS = originalGOOS
+		serviceUserHomeDir = originalHome
+		systemctlUserRunner = originalRunner
+	}()
+	systemctlUserRunner = func(_ context.Context, args ...string) (string, error) {
+		return "", nil
+	}
+
+	// State claims systemd_user with a unit path, but no unit file exists.
+	state := InstallState{
+		BaseDir:           baseDir,
+		ConfigPath:        filepath.Join(baseDir, ".config", "codex-feishu-relay", "config.json"),
+		StatePath:         statePath,
+		CurrentBinaryPath: seedBinary(t, filepath.Join(baseDir, "bin", "codex-feishu-relay"), "binary"),
+		ServiceManager:    ServiceManagerSystemdUser,
+	}
+	ApplyStateMetadata(&state, StateMetadataOptions{
+		StatePath:      statePath,
+		BaseDir:        baseDir,
+		ServiceManager: state.ServiceManager,
+	})
+	if err := WriteState(statePath, state); err != nil {
+		t.Fatalf("WriteState: %v", err)
+	}
+
+	status, err := DetectAutostart(statePath)
+	if err != nil {
+		t.Fatalf("DetectAutostart: %v", err)
+	}
+	if status.Configured {
+		t.Fatalf("expected not configured, got %#v", status)
+	}
+	if status.Enabled {
+		t.Fatalf("expected disabled, got %#v", status)
+	}
+	if status.CurrentManager != ServiceManagerDetached {
+		t.Fatalf("CurrentManager = %q, want %q (state must not revive a removed service)", status.CurrentManager, ServiceManagerDetached)
+	}
+	if status.ServiceUnitPath != filepath.Join(baseDir, ".config", "systemd", "user", "codex-feishu-relay.service") {
+		t.Fatalf("ServiceUnitPath = %q, want derived path", status.ServiceUnitPath)
+	}
+}
+
+// TestDetectAutostartLaunchdStateMissing covers the launchd probe-first path
+// with no state file at all: detect must still report a clean disabled status.
+func TestDetectAutostartLaunchdStateMissing(t *testing.T) {
+	baseDir := t.TempDir()
+	statePath := defaultInstallStatePath(baseDir)
+
+	originalGOOS := serviceRuntimeGOOS
+	originalHome := serviceUserHomeDir
+	originalRunner := launchctlUserRunner
+	serviceRuntimeGOOS = "darwin"
+	serviceUserHomeDir = func() (string, error) { return baseDir, nil }
+	defer func() {
+		serviceRuntimeGOOS = originalGOOS
+		serviceUserHomeDir = originalHome
+		launchctlUserRunner = originalRunner
+	}()
+	launchctlUserRunner = func(_ context.Context, args ...string) (string, error) {
+		return "", nil
+	}
+
+	status, err := DetectAutostart(statePath)
+	if err != nil {
+		t.Fatalf("DetectAutostart: %v", err)
+	}
+	if !status.Supported {
+		t.Fatalf("expected supported, got %#v", status)
+	}
+	if status.Manager != ServiceManagerLaunchdUser {
+		t.Fatalf("Manager = %q, want %q", status.Manager, ServiceManagerLaunchdUser)
+	}
+	if status.Configured || status.Enabled {
+		t.Fatalf("expected not configured/disabled without state, got %#v", status)
+	}
+	if status.CurrentManager != ServiceManagerDetached {
+		t.Fatalf("CurrentManager = %q, want %q", status.CurrentManager, ServiceManagerDetached)
+	}
+}
+
+// TestDetectAutostartTaskSchedulerIgnoresStaleState is the #808-D probe-first
+// guard for Windows: a state file that claims task_scheduler must not make
+// detect report a configured task when the task is missing on disk.
+func TestDetectAutostartTaskSchedulerIgnoresStaleState(t *testing.T) {
+	baseDir := t.TempDir()
+	statePath := defaultInstallStatePath(baseDir)
+
+	originalGOOS := serviceRuntimeGOOS
+	originalHome := serviceUserHomeDir
+	originalRunner := taskSchedulerRunner
+	serviceRuntimeGOOS = "windows"
+	serviceUserHomeDir = func() (string, error) { return baseDir, nil }
+	defer func() {
+		serviceRuntimeGOOS = originalGOOS
+		serviceUserHomeDir = originalHome
+		taskSchedulerRunner = originalRunner
+	}()
+	taskSchedulerRunner = func(_ context.Context, args ...string) (string, error) {
+		return "", os.ErrNotExist
+	}
+
+	state := InstallState{
+		BaseDir:           baseDir,
+		ConfigPath:        filepath.Join(baseDir, ".config", "codex-feishu-relay", "config.json"),
+		StatePath:         statePath,
+		CurrentBinaryPath: seedBinary(t, filepath.Join(baseDir, "bin", "codex-feishu-relay.exe"), "binary"),
+		ServiceManager:    ServiceManagerTaskSchedulerLogon,
+	}
+	ApplyStateMetadata(&state, StateMetadataOptions{
+		StatePath:      statePath,
+		BaseDir:        baseDir,
+		ServiceManager: state.ServiceManager,
+	})
+	if err := WriteState(statePath, state); err != nil {
+		t.Fatalf("WriteState: %v", err)
+	}
+
+	status, err := DetectAutostart(statePath)
+	if err != nil {
+		t.Fatalf("DetectAutostart: %v", err)
+	}
+	if status.Configured || status.Enabled {
+		t.Fatalf("expected not configured/disabled, got %#v", status)
+	}
+	if status.CurrentManager != ServiceManagerDetached {
+		t.Fatalf("CurrentManager = %q, want %q (state must not revive a removed task)", status.CurrentManager, ServiceManagerDetached)
+	}
+}

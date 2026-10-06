@@ -1,0 +1,399 @@
+name: Release
+
+on:
+  release:
+    types:
+      - published
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: Git ref to release from. Defaults to the ref that triggered this workflow.
+        required: false
+        default: ""
+        type: string
+      track:
+        description: Release track
+        required: true
+        default: production
+        type: choice
+        options:
+          - production
+          - beta
+          - alpha
+      version:
+        description: Explicit version to release, e.g. v1.0.0. Required for production; optional for beta/alpha.
+        required: false
+        default: ""
+        type: string
+      bump:
+        description: Version bump strategy when version is auto-calculated
+        required: true
+        default: auto
+        type: choice
+        options:
+          - auto
+          - patch
+          - minor
+          - major
+      draft:
+        description: Create the GitHub release as a draft
+        required: true
+        default: false
+        type: boolean
+  workflow_call:
+    inputs:
+      ref:
+        required: false
+        default: ""
+        type: string
+      track:
+        required: true
+        type: string
+      version:
+        required: false
+        default: ""
+        type: string
+      bump:
+        required: false
+        default: auto
+        type: string
+      draft:
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  build-release-assets:
+    runs-on: ubuntu-latest
+    outputs:
+      source_ref: ${{ steps.source_ref.outputs.ref }}
+      track: ${{ steps.version.outputs.track }}
+      version: ${{ steps.version.outputs.version }}
+      latest_tag: ${{ steps.version.outputs.latest_tag }}
+      prerelease: ${{ steps.version.outputs.prerelease }}
+      create_release: ${{ steps.version.outputs.create_release }}
+      upload_assets: ${{ steps.version.outputs.upload_assets }}
+      run_packaging: ${{ steps.version.outputs.run_packaging }}
+
+    steps:
+      - name: Resolve source ref
+        id: source_ref
+        run: |
+          if [[ '${{ github.event_name }}' == 'release' ]]; then
+            ref='${{ github.event.release.tag_name }}'
+          else
+            ref='${{ inputs.ref }}'
+            if [[ -z "${ref}" ]]; then
+              ref='${{ github.ref_name }}'
+            fi
+          fi
+          echo "ref=${ref}" >> "${GITHUB_OUTPUT}"
+
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+          ref: ${{ steps.source_ref.outputs.ref }}
+
+      - name: Resolve Go version spec
+        id: go_version
+        shell: bash
+        run: echo "version=$(bash scripts/ci/go-version-spec.sh)" >> "${GITHUB_OUTPUT}"
+
+      - name: Setup Go
+        uses: actions/setup-go@v6
+        with:
+          go-version: ${{ steps.go_version.outputs.version }}
+
+      - name: Fetch tags
+        run: git fetch --force --tags origin
+
+      - name: Resolve release metadata
+        id: version
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          event_name='${{ github.event_name }}'
+          create_release=false
+          upload_assets=false
+          run_packaging=false
+          latest_tag=''
+
+          if [[ "${event_name}" == "release" ]]; then
+            version='${{ github.event.release.tag_name }}'
+            if [[ ! "${version}" =~ ^v[0-9] ]]; then
+              echo "Release tag ${version} is invalid." >&2
+              exit 1
+            fi
+            case "${version}" in
+              v*.*.*-alpha.*)
+                track='alpha'
+                prerelease=true
+                ;;
+              v*.*.*-beta.*)
+                track='beta'
+                prerelease=true
+                ;;
+              v*.*.*)
+                track='production'
+                prerelease=false
+                ;;
+              *)
+                echo "Release tag ${version} does not match a supported track." >&2
+                exit 1
+                ;;
+            esac
+            asset_count="$(gh release view "${version}" --json assets --jq '.assets | length')"
+            if [[ "${asset_count}" == "0" ]]; then
+              upload_assets=true
+              run_packaging=true
+            fi
+          else
+            track='${{ inputs.track }}'
+            if [[ -n '${{ inputs.version }}' ]]; then
+              version='${{ inputs.version }}'
+            else
+              if [[ "${track}" == "production" ]]; then
+                echo "Production releases require an explicit version input." >&2
+                exit 1
+              fi
+              version="$(RELEASE_TRACK="${track}" BUMP_OVERRIDE='${{ inputs.bump }}' bash scripts/release/next-version.sh)"
+            fi
+            if [[ ! "${version}" =~ ^v[0-9] ]]; then
+              version="v${version}"
+            fi
+            case "${track}" in
+              production)
+                version_pattern='^v[0-9]+\.[0-9]+\.[0-9]+$'
+                prerelease=false
+                ;;
+              beta|alpha)
+                version_pattern="^v[0-9]+\.[0-9]+\.[0-9]+-${track}\\.[0-9]+$"
+                prerelease=true
+                ;;
+              *)
+                echo "Unsupported release track: ${track}" >&2
+                exit 1
+                ;;
+            esac
+            if ! [[ "${version}" =~ ${version_pattern} ]]; then
+              echo "Version ${version} does not match track ${track}." >&2
+              exit 1
+            fi
+            latest_tag="$(
+              git tag --list 'v*' --sort=-version:refname |
+                grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' |
+                grep -vx "${version}" |
+                head -n1 ||
+                true
+            )"
+            create_release=true
+            upload_assets=true
+            run_packaging=true
+          fi
+
+          echo "track=${track}" >> "${GITHUB_OUTPUT}"
+          echo "version=${version}" >> "${GITHUB_OUTPUT}"
+          echo "latest_tag=${latest_tag}" >> "${GITHUB_OUTPUT}"
+          echo "prerelease=${prerelease}" >> "${GITHUB_OUTPUT}"
+          echo "create_release=${create_release}" >> "${GITHUB_OUTPUT}"
+          echo "upload_assets=${upload_assets}" >> "${GITHUB_OUTPUT}"
+          echo "run_packaging=${run_packaging}" >> "${GITHUB_OUTPUT}"
+
+      - name: Install NSIS
+        if: ${{ steps.version.outputs.run_packaging == 'true' }}
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y nsis
+
+      - name: Skip Published Release With Existing Assets
+        if: ${{ steps.version.outputs.run_packaging != 'true' }}
+        run: |
+          echo "Published release ${{ steps.version.outputs.version }} already has assets; skipping rebuild/upload."
+
+      - name: Check public docs for machine-local paths
+        if: ${{ steps.version.outputs.run_packaging == 'true' }}
+        run: bash scripts/check/no-local-paths.sh
+
+      - name: Check legacy names are gone
+        if: ${{ steps.version.outputs.run_packaging == 'true' }}
+        run: bash scripts/check/no-legacy-names.sh
+
+      - name: Check formatting
+        if: ${{ steps.version.outputs.run_packaging == 'true' }}
+        run: |
+          files="$(find cmd internal testkit -name '*.go' | sort)"
+          output="$(gofmt -l ${files})"
+          if [[ -n "${output}" ]]; then
+            echo "${output}"
+            exit 1
+          fi
+
+      - name: Check release track versioning
+        if: ${{ steps.version.outputs.run_packaging == 'true' }}
+        run: bash scripts/check/release-track-version.sh
+
+      - name: Run tests
+        if: ${{ steps.version.outputs.run_packaging == 'true' }}
+        run: go test ./...
+
+      - name: Build artifacts
+        if: ${{ steps.version.outputs.run_packaging == 'true' }}
+        env:
+          CODEX_FEISHU_RELAY_BUILD_FLAVOR: ${{ steps.version.outputs.track == 'alpha' && 'alpha' || 'shipping' }}
+        run: bash scripts/release/build-artifacts.sh "${{ steps.version.outputs.version }}" dist --jobs 5
+
+      - name: Build Windows NSIS installer
+        if: ${{ steps.version.outputs.run_packaging == 'true' }}
+        run: |
+          bash scripts/release/build-windows-nsis.sh \
+            --version "${{ steps.version.outputs.version }}" \
+            --track "${{ steps.version.outputs.track }}" \
+            --dist-dir dist
+
+      - name: Smoke test WebSetup release installer
+        if: ${{ steps.version.outputs.run_packaging == 'true' }}
+        run: |
+          bash scripts/check/smoke-install-release.sh \
+            --version "${{ steps.version.outputs.version }}" \
+            --prod-dist-dir dist
+
+      - name: Upload base release dist
+        if: ${{ steps.version.outputs.run_packaging == 'true' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-base-dist
+          path: dist
+          if-no-files-found: error
+          compression-level: 0
+
+      - name: Upload macOS packaging input
+        if: ${{ steps.version.outputs.run_packaging == 'true' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-macos-input-dist
+          path: |
+            dist/codex-feishu-relay_*_darwin_amd64.tar.gz
+            dist/codex-feishu-relay_*_darwin_arm64.tar.gz
+          if-no-files-found: error
+          compression-level: 0
+
+  build-macos-packaged-installer:
+    needs: build-release-assets
+    if: ${{ needs.build-release-assets.outputs.run_packaging == 'true' }}
+    runs-on: macos-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ needs.build-release-assets.outputs.source_ref }}
+
+      - name: Download macOS packaging input
+        uses: actions/download-artifact@v4
+        with:
+          name: release-macos-input-dist
+          path: ${{ runner.temp }}/release-macos-dist
+
+      - name: Build macOS packaged installer
+        run: |
+          bash scripts/release/build-macos-packaged-installer.sh \
+            --version "${{ needs.build-release-assets.outputs.version }}" \
+            --track "${{ needs.build-release-assets.outputs.track }}" \
+            --dist-dir "${RUNNER_TEMP}/release-macos-dist"
+
+      - name: Upload macOS packaged installer
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-macos-packaged-installer
+          path: ${{ runner.temp }}/release-macos-dist/codex-feishu-relay_*_darwin_universal_installer.dmg
+          if-no-files-found: error
+          compression-level: 0
+
+  installer-lifecycle:
+    needs: build-release-assets
+    if: ${{ needs.build-release-assets.outputs.run_packaging == 'true' }}
+    uses: ./.github/workflows/installer-lifecycle.yml
+    with:
+      ref: ${{ needs.build-release-assets.outputs.source_ref }}
+      version: v0.0.0
+      upgrade_version: ${{ needs.build-release-assets.outputs.version }}
+      upgrade_track: ${{ needs.build-release-assets.outputs.track }}
+
+  publish-release-assets:
+    needs:
+      - build-release-assets
+      - build-macos-packaged-installer
+      - installer-lifecycle
+    if: ${{ needs.build-release-assets.outputs.upload_assets == 'true' }}
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+          ref: ${{ needs.build-release-assets.outputs.source_ref }}
+
+      - name: Fetch tags
+        if: ${{ needs.build-release-assets.outputs.create_release == 'true' }}
+        run: git fetch --force --tags origin
+
+      - name: Download base release dist
+        uses: actions/download-artifact@v4
+        with:
+          name: release-base-dist
+          path: dist
+
+      - name: Download macOS packaged installer
+        uses: actions/download-artifact@v4
+        with:
+          name: release-macos-packaged-installer
+          path: dist
+
+      - name: Refresh checksums after macOS packaged installer
+        run: bash scripts/release/write-checksums.sh dist
+
+      - name: Generate release notes
+        if: ${{ needs.build-release-assets.outputs.create_release == 'true' }}
+        run: |
+          RELEASE_TRACK="${{ needs.build-release-assets.outputs.track }}" \
+          VERSION="${{ needs.build-release-assets.outputs.version }}" \
+          LATEST_TAG="${{ needs.build-release-assets.outputs.latest_tag }}" \
+          bash scripts/release/release-notes.sh > release-notes.md
+
+      - name: Create GitHub release Metadata
+        if: ${{ needs.build-release-assets.outputs.create_release == 'true' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          flags=()
+          if [[ "${{ inputs.draft }}" == "true" ]]; then
+            flags+=(--draft)
+          fi
+          if [[ "${{ needs.build-release-assets.outputs.prerelease }}" == "true" ]]; then
+            flags+=(--prerelease)
+          fi
+          gh release create "${{ needs.build-release-assets.outputs.version }}" \
+            --title "${{ needs.build-release-assets.outputs.version }}" \
+            --notes-file release-notes.md \
+            --target "${{ needs.build-release-assets.outputs.source_ref }}" \
+            "${flags[@]}"
+
+      - name: Upload Release Assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release upload "${{ needs.build-release-assets.outputs.version }}" dist/* --clobber
+
+      - name: Verify Release Assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: bash scripts/release/verify-release-assets.sh "${{ needs.build-release-assets.outputs.version }}" dist
